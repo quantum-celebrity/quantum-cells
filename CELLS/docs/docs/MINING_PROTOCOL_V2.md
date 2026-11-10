@@ -1,0 +1,1951 @@
+# MINING_PROTOCOL_V2.md — CELLS v2 Mining Protocol (Canonical Spec)
+
+> **Status:** Normative. Shipped on `main`. Supersedes the three
+> historical fragments listed below.
+>
+> **Audience:** Validator operators, miner operators, protocol
+> implementers, security reviewers, and anyone trying to answer
+> the question *"what does v2 actually look like, and what part of
+> it is real today?"*.
+>
+> **Supersedes:**
+> [`MINING_PROTOCOL_V2_NVIDIA_LOCKED.md`](./MINING_PROTOCOL_V2_NVIDIA_LOCKED.md)
+> (the original Phase-1 design draft),
+> [`MINING_PROTOCOL_V2_RATIFICATION.md`](./MINING_PROTOCOL_V2_RATIFICATION.md)
+> (the 2026-04-24 owner sign-off recording the three OPEN_QUESTION
+> resolutions), and
+> [`MINING_PROTOCOL_V2_TIER3_SCOPE.md`](./MINING_PROTOCOL_V2_TIER3_SCOPE.md)
+> (the rolling shipped-vs-deferred status doc). Those files are
+> retained as thin redirect stubs so old links keep resolving.
+>
+> **Supersedes from v1:** `MINING_PROTOCOL.md §§1.1(2), 5, 6, 7` at
+> activation. The v1 spec stays in-tree as the testnet protocol-of-
+> record and is the reference for the legacy double-SHA256 PoW
+> path, which is preserved under `ComputeMixDigestV1` for audit and
+> replay (§10.5).
+>
+> **Does not supersede:** [`CELL_TOKENOMICS.md`](./CELL_TOKENOMICS.md)
+> (issuance schedule), [`NODE_ROLES.md`](./NODE_ROLES.md) (the
+> validator/miner split), or `nvidia_locked_CELLS_blockchain_architecture.md`
+> (high-level vision).
+>
+> **How to read this doc:** sections 0–4 are the normative spec.
+> Sections 5–9 are the current implementation contract — every
+> table here references a concrete Go file that you can `grep` the
+> repo for. Sections 10–13 are activation mechanics, the attacker
+> model, the deferred-work register, and the historical decision
+> record.
+
+---
+
+## Table of contents
+
+0. Executive summary
+1. What changes relative to v1
+2. What does NOT change
+3. Wire format
+4. Architecture checks
+5. Trust anchors
+6. Freshness window & nonce issuance
+7. Verifier
+8. On-chain enrollment & slashing
+9. Operator surface (HTTP, CLI, miner UX, observability, boot wiring)
+10. Activation mechanics — hard fork
+11. Attacker model
+12. Deferred work register
+13. Historical decision record
+14. Cross-references
+
+---
+
+## 0. Executive summary
+
+CELLS v2 is the production mining protocol. It locks mining to
+NVIDIA GPUs through **mandatory attestation** and adds an on-chain enrollment / slashing layer that makes the
+NVIDIA lock observable and enforceable without trusting any
+single validator.
+
+1. **Hard fork from v1.** Blocks before `FORK_V2_HEIGHT` follow
+   `MINING_PROTOCOL.md`. Blocks at or after `FORK_V2_HEIGHT`
+   follow this document. Because v2 launches via a chain reset
+   (§10.3), `FORK_V2_HEIGHT = 0`.
+2. **Mandatory attestation.** `Proof.Attestation` is now a
+   consensus-checked field. A proof with an empty, unparseable,
+   non-whitelisted, stale, or cryptographically-invalid
+   attestation is rejected at the verifier. v1's "transparency
+   signal, not a consensus rule" stance is gone.
+3. **Tiered trust anchor.**
+   - `nvidia-cc-v1` — datacenter Hopper / Blackwell GPUs,
+     verified via NVIDIA-signed AIK quote against a
+     genesis-pinned root. Implementation
+     [shipped](#5-trust-anchors) in `pkg/mining/attest/cc/`.
+   - `nvidia-hmac-v1` — consumer NVIDIA GPUs (Turing / Ampere /
+     Ada / Blackwell consumer), verified via HMAC over a
+     canonical-JSON bundle, bound to a stake-locked operator
+     entry in the on-chain registry. Implementation shipped in
+     `pkg/mining/attest/hmac/`.
+4. **Future changes.** Future protocol changes will be announced in the changelog.
+5. **On-chain enrollment.** Operators register
+   `(node_id, owner, gpu_uuid, hmac_key)` tuples by submitting a
+   signed `CELLS/enroll/v2` transaction that locks
+   `MIN_ENROLL_STAKE = 10 CELL` or selects deferred bond accrual.
+   Legacy `CELLS/enroll/v1` records remain replay-valid only below
+   `SignedContractActivationHeight`. Unenroll bonds the stake for `UnbondWindow`
+   (201,600 blocks (about 23 days at 10-second blocks)) and the `gpu_uuid` releases at maturity, so a
+   physical card can be re-enrolled by a fresh `node_id` after
+   the original record retires. Signed `CELLS/enroll/v2`
+   transactions can also retain the operator's ML-DSA public key
+   after `OperatorPublicKeyRetentionHeight`; that fork gate is
+   disabled by default for deterministic rollout. Operators schedule
+   retention with `[node] mining_operator_public_key_retention_height`
+   or `CELLS_MINING_OPERATOR_PUBLIC_KEY_RETENTION_HEIGHT`. Only after
+   enrolled records carry operator public keys should validators enable
+   `[node] require_mining_operator_signatures` /
+   `CELLS_REQUIRE_MINING_OPERATOR_SIGNATURES`; startup refuses that
+   enforcement flag without a non-zero retention height. Implementation
+   in `pkg/mining/enrollment/`.
+6. **On-chain slashing.** The `CELLS/slash/v1` transaction
+   surface, admission gate, receipts, and verifiers ship, but
+   production acceptance is fail-closed today. HMAC-dependent
+   `forged-attestation` and `double-mining` cannot attribute a
+   bundle while `EnrollmentRecord.HMACKey` is public symmetric
+   chain state and proofs do not yet carry an operator wallet
+   signature. `freshness-cheat` rejects through
+   `RejectAllWitness` until BFT finality supplies a real
+   inclusion witness. Slash attempts therefore produce rejection
+   receipts instead of draining stake. Implementation in
+   `pkg/mining/slashing/` and the chain-side applier in
+   `pkg/chain/slash_apply.go`.
+7. **Miner UX.** `cmd/CELLSminer-console` ships an opt-in v2 path
+   (`--protocol=v2`) that drives the full enrollment → challenge
+   → HMAC-bundle → submit loop, with a built-in setup wizard, a
+   live `v2 NVIDIA` panel row, and a background enrollment
+   poller.
+
+The rest of this document is the normative wire spec
+(§§1–4), the implementation contract (§§5–9), activation
+mechanics (§10), the attacker model (§11), and the deferred-work
++ decision register (§§12–13).
+
+---
+
+## 1. What changes relative to v1
+
+All references below are to v1 spec
+[`MINING_PROTOCOL.md`](./MINING_PROTOCOL.md) and to Go source
+paths under `CELLS/source/`.
+
+| Area | v1 (current) | v2 (this spec) |
+|---|---|---|
+| Goal §1.1(2) | "GPU-favored, NVIDIA-favored, NVIDIA-not-required. Portable OpenCL / Vulkan / CPU fallbacks MUST remain compilable and correct — they only lose economically." | **"NVIDIA-required."** Non-NVIDIA implementations of `ComputeMixDigest` remain compilable for protocol auditing, but proofs produced by them are unconditionally rejected at the attestation gate. |
+| `Proof.Attestation` field | Optional. An absent, stale, or unverifiable attestation MUST NOT cause rejection (`§6`). | **Mandatory.** Empty / unparseable / unknown-type / signature-invalid / stale → consensus reject. |
+| `Proof.Version` | `1` | `2` (`mining.ProtocolVersionV2`). |
+| `Attestation.Type` whitelist | `"ngc-v1"` (informational only). | `"nvidia-cc-v1"` (datacenter CC) and `"nvidia-hmac-v1"` (consumer GPUs). Whitelist enforced at the verifier dispatcher. |
+| Trust anchor | None — `Verifier.Verify` never reads `Attestation`. | Genesis-pinned NVIDIA CC root material + on-chain operator registry (HMAC path). See §5. |
+| PoW hash | Defined by the v1 spec and the reference implementation. | Unchanged in this spec. Future protocol changes will be announced in the changelog. |
+| Validator SLO | Verify any single proof in < 100 ms single-core, batch 1000 in < 2 s (`§1.1(4)`). | Unchanged. |
+| Attestation endpoint `/api/v1/monitoring/ngc-proof` | Monitoring-only sink, never feeds consensus. | Unchanged role. v2 attestations travel inline on the proof. The legacy ingest endpoint remains for dashboards; it is no longer the consensus path. |
+
+---
+
+## 2. What does NOT change
+
+1. Validators remain CPU-only. The NVIDIA lock is on the *miner*
+   side of the miner/validator split (see
+   [`NODE_ROLES.md`](./NODE_ROLES.md)). A validator never verifies
+   an NGC signature against a GPU it owns; it verifies against
+   genesis-pinned NVIDIA roots and the on-chain operator registry.
+2. Cell tokenomics ([`CELL_TOKENOMICS.md`](./CELL_TOKENOMICS.md))
+   are unchanged. The fork resets supply to zero at height 0
+   because the testnet has no real users (2026-04-24 owner
+   sign-off, §13.4); the issuance curve from that point is
+   identical to v1.
+3. PoE+BFT consensus among validators (`pkg/chain`,
+   `pkg/consensus`) is unchanged. v2 touches mining only.
+4. Proof-ID derivation (`pkg/mining/proof.go::ID`) still excludes
+   `Attestation` from the hash input. Two validly-signed proofs
+   with identical `(epoch, height, nonce, batch_root)` and
+   different attestation bundles share a proof-id; the verifier
+   rejects the second one for duplicate-proof reasons, not for
+   attestation reasons.
+5. The `apps/CELLS-nvidia-ngc/` sidecar keeps operating and keeps
+   pushing to `/api/v1/monitoring/ngc-proof`. That path is
+   dashboards and transparency surface; it does not feed
+   consensus.
+
+---
+
+## 3. Wire format
+
+### 3.1 `Attestation` struct (v2)
+
+```go
+// pkg/mining/proof.go (v2). Field order is normative per
+// MINING_PROTOCOL.md §4.1 canonical-JSON rules. Do NOT reorder.
+type Attestation struct {
+    Type                 string   `json:"type"`
+    BundleBase64         string   `json:"bundle"`
+    GPUArch              string   `json:"gpu_arch"`
+    ClaimedHashrateHPS   uint64   `json:"claimed_hashrate_hps"`
+
+    // Pinned outside Bundle so the verifier can deserialize
+    // enough metadata to dispatch to the right verify path
+    // without parsing a variable-schema nested document.
+    Nonce                [32]byte `json:"nonce"`     // server-issued freshness challenge, lowercase hex
+    IssuedAt             int64    `json:"issued_at"` // unix seconds; tolerance is FRESHNESS_WINDOW
+}
+```
+
+Canonical JSON wire order, nested in `Proof`:
+
+```json
+{
+  "version": 2,
+  "epoch":   "<uint64 as string>",
+  "height":  "<uint64 as string>",
+  "header_hash": "<hex 32B>",
+  "miner_addr":  "CELLS1...",
+  "batch_root":  "<hex 32B>",
+  "batch_count": <uint32>,
+  "nonce":       "<hex 16B>",
+  "mix_digest":  "<hex 32B>",
+  "attestation": {
+    "type": "nvidia-cc-v1" | "nvidia-hmac-v1",
+    "bundle": "<base64 blob; contents depend on type>",
+    "gpu_arch": "hopper" | "ada-lovelace" | "blackwell" | ...,
+    "claimed_hashrate_hps": "<uint64 as string>",
+    "nonce":     "<hex 32B>",
+    "issued_at": "<int64 as string>"
+  }
+}
+```
+
+Zero-value `Attestation{}` → `validateShape` → reject with
+`ErrAttestationRequired`. This is the hard invariant the verifier
+enforces above every other check.
+
+### 3.2 `Attestation.Bundle` payload — `nvidia-cc-v1`
+
+Used by Hopper / Blackwell datacenter GPUs running NVIDIA
+Confidential Computing. The bundle is a base64-encoded
+length-prefixed binary blob carrying:
+
+1. **NVIDIA device certificate chain** — the per-GPU attestation
+   certificate chain, rooted in a genesis-pinned NVIDIA issuing
+   CA public key (§5.1).
+2. **Quote** — an ECDSA signature from the GPU AIK
+   (Attestation Identity Key) over the canonical preimage:
+   ```
+   H( device_uuid
+   || challenge_nonce
+   || issued_at
+   || miner_addr
+   || batch_root
+   || mix_digest
+   || challenge_signer_id
+   || challenge_sig )
+   ```
+   `challenge_nonce == Attestation.Nonce`; the other fields
+   come from the enclosing `Proof`. `challenge_signer_id` /
+   `challenge_sig` mirror the consumer-GPU path (§3.3) — they
+   bind the bundle to a specific validator-issued challenge so
+   replay outside the freshness window is detectable in the
+   AIK preimage itself.
+3. **PCR-equivalent measurements** — current GPU firmware
+   version + driver version, recorded by the CC subsystem so a
+   downgrade-to-vulnerable-firmware attack is detectable.
+
+#### Verifier flow (9 steps, all enforced)
+
+```
+1. Parse the cert chain; verify it terminates in a
+   genesis-pinned NVIDIA CA public key.
+2. Verify the AIK Quote signature over the canonical preimage
+   above using the leaf cert's public key.
+3. Check challenge_nonce == Attestation.Nonce.
+4. Check Attestation.IssuedAt is within FRESHNESS_WINDOW of the
+   validator's wall clock and not future-dated past
+   AllowedFutureSkew.
+5. Verify (challenge_signer_id, challenge_sig) against the
+   registered ChallengeVerifier — same crypto the HMAC path
+   uses. (Skipped only if the operator deliberately wires
+   ChallengeVerifier=nil; production MUST set it.)
+6. Check PCR firmware/driver versions against the genesis-
+   pinned minimum floor for the claimed gpu_arch.
+7. Look up (device_uuid, challenge_nonce) in the replay cache;
+   reject if seen.
+8. Leaf cert `Subject.CommonName` ↔ `gpu_arch` consistency
+   per §4.6.5 — evidence-based, see that section for the
+   accept/reject table and the longest-pattern tie-breaker
+   rule. (Implemented as Step 9 in `cc/verifier.go`; this
+   spec lists it as #8 because the freshness + replay
+   sub-steps above are grouped.)
+9. If all pass → proof is attested. Else → reject with the
+   precise reason.
+```
+
+Reference implementation:
+[`pkg/mining/attest/cc/verifier.go`](../../source/pkg/mining/attest/cc/verifier.go),
+bundle parser
+[`pkg/mining/attest/cc/bundle.go`](../../source/pkg/mining/attest/cc/bundle.go).
+Production wiring: `attest.ProductionConfig.CCConfig`. When no
+NVIDIA root is pinned, the dispatcher falls through to
+[`cc.NewStubVerifier()`](../../source/pkg/mining/attest/cc/stub.go)
+which always rejects — fail-closed.
+
+Test coverage: 28 unit tests including 13 negative cases
+(tampered AIK signature, wrong root, expired leaf, nonce
+mismatch, issued_at mismatch, miner_addr/mix_digest preimage
+tamper, stale, future-dated, below firmware floor, below driver
+floor, replay through `NonceStore`, malformed base64, unknown
+JSON field, over-length cert chain). Test vectors are generated
+**deterministically in-process** by
+[`pkg/mining/attest/cc/testvectors.go`](../../source/pkg/mining/attest/cc/testvectors.go);
+no testdata files. The seam to swap in real `nvtrust` framing is
+a single `ParseBundle` reimplementation — verifier code does not
+change.
+
+### 3.3 `Attestation.Bundle` payload — `nvidia-hmac-v1`
+
+Used by consumer NVIDIA GPUs (Turing / Ampere / Ada / Blackwell
+consumer). The bundle is a base64-encoded canonical-JSON object:
+
+```json
+{
+  "node_id":              "<operator-registered handle, e.g. 'alice-rtx4090-01'>",
+  "gpu_uuid":             "<GPU instance UUID from nvidia-smi, hex>",
+  "gpu_name":             "NVIDIA GeForce RTX 4090",
+  "driver_ver":           "572.16",
+  "cuda_version":         "12.8",
+  "compute_cap":          "8.9",
+  "nonce":                "<same 32-byte hex as Attestation.Nonce>",
+  "issued_at":            <unix seconds>,
+  "challenge_bind":       "<hex H(miner_addr || batch_root || mix_digest)>",
+  "challenge_sig":        "<hex validator signature over (signer_id, issued_at, nonce)>",
+  "challenge_signer_id":  "<validator identity that issued this challenge>",
+  "hmac":                 "<hex HMAC-SHA256(operator_key, canonical_json_without_hmac_field)>"
+}
+```
+
+The shown order is human-reading order. **Canonical-form field
+order is alphabetical on the JSON key** — `challenge_sig` and
+`challenge_signer_id` land between `challenge_bind` and
+`compute_cap`. Reference implementation:
+[`pkg/mining/attest/hmac/bundle.go`](../../source/pkg/mining/attest/hmac/bundle.go)
++ [`pkg/mining/challenge/`](../../source/pkg/mining/challenge/).
+
+#### Verifier flow (9 steps)
+
+```
+1. Parse JSON.
+2. Recompute H(miner_addr || batch_root || mix_digest) from the
+   enclosing Proof; assert it matches bundle.challenge_bind.
+3. Look up bundle.node_id in the on-chain operator registry
+   (§5.2). If absent or revoked -> reject. Production also
+   asserts `Proof.MinerAddr == EnrollmentRecord.Owner`, so
+   accepted rewards route only to the enrolled owner.
+4. Fetch the HMAC key associated with that node_id from the
+   registry. Recompute HMAC-SHA256 over canonical-JSON minus
+   the hmac field. Reject on mismatch.
+5. Fetch the GPU UUID from the registry. Assert
+   bundle.gpu_uuid matches. Reject on mismatch.
+6a. Assert bundle.nonce == Attestation.Nonce and
+    bundle.issued_at == Attestation.IssuedAt.
+6b. Reconstruct challenge.Challenge{Nonce, IssuedAt, SignerID,
+    Signature} from bundle.{nonce, issued_at,
+    challenge_signer_id, challenge_sig}; verify the signature
+    using the SignerID's registered public key. Reject unknown
+    signer_id or bad signature.
+6c. Assert bundle.issued_at falls within FRESHNESS_WINDOW of
+    the validator's wall clock and ≤ AllowedFutureSkew ahead.
+6d. Check the nonce-replay cache; reject if (node_id, nonce)
+    already seen.
+7. Assert bundle.gpu_name does NOT contain any deny-list
+   substring (§5.3 — empty at genesis).
+8. Verify the proof's `gpu_arch` is on the closed-enum
+   allowlist AND the bundle's `gpu_name` is consistent with it
+   (`pkg/mining/attest/archcheck`). The arch enum check fires
+   in the outer verifier before this dispatcher; the
+   gpu_arch ↔ gpu_name cross-check fires here. See §4.6 for
+   the full rationale + table.
+9. If all pass → proof is attested. Else → reject.
+```
+
+Reference implementation:
+[`pkg/mining/attest/hmac/verifier.go`](../../source/pkg/mining/attest/hmac/verifier.go).
+Production wiring: `attest.ProductionConfig.HMACConfig`.
+
+#### HTTP challenge endpoint
+
+```
+GET /api/v1/mining/challenge
+
+Response 200:
+{
+  "nonce":     "<64 hex chars>",
+  "issued_at": <unix seconds>,
+  "signer_id": "<validator identity>",
+  "signature": "<hex signer output>"
+}
+
+Response headers:
+  Cache-Control: no-store    (required — a cached response would
+                              leak the same nonce to two miners)
+
+Response 503 + Retry-After: 5 when no ChallengeIssuer is wired in.
+Response 500 on issuer internal failure (PRNG exhausted, etc.).
+```
+
+Implementation:
+[`pkg/mining/challenge/`](../../source/pkg/mining/challenge/) +
+HTTP handler in
+[`pkg/api/handlers.go`](../../source/pkg/api/handlers.go).
+
+### 3.4 `Proof` struct total wire change
+
+```go
+// pkg/mining/proof.go — v2 layout. ProtocolVersion is the only
+// difference from v1 at the struct level; v2 adds two new
+// sub-fields inside Attestation (see §3.1).
+type Proof struct {
+    Version     uint32      // = 2 post-fork
+    Epoch       uint64
+    Height      uint64
+    HeaderHash  [32]byte
+    MinerAddr   string
+    BatchRoot   [32]byte
+    BatchCount  uint32
+    Nonce       [16]byte
+    MixDigest   [32]byte
+    Attestation Attestation  // mandatory
+}
+```
+
+---
+
+## 4. Architecture checks
+
+Future protocol changes will be announced in the changelog.
+
+### 4.6 Arch-spoof rejection (§3.3 step 8)
+
+Step 8 ("`mix_digest` consistent with claimed `gpu_arch`") is
+implemented today as **two cross-checks against the parts of
+the attestation surface a casual spoofer cannot freely swap**:
+
+#### 4.6.1 Closed-enum allowlist for `Attestation.GPUArch`
+
+`Attestation.GPUArch` MUST canonicalise to one of:
+
+| Canonical | Aliases | Compute capability | Family |
+|---|---|---|---|
+| `hopper` | — | SM 9.0 | Datacenter (H100, H200, H800) |
+| `blackwell` | — | SM 10.0 | Datacenter + consumer (B100, B200, GB200, RTX 50) |
+| `ada-lovelace` | `ada` | SM 8.9 | Consumer + workstation (RTX 40, L40, L40S, RTX 6000 Ada) |
+| `ampere` | — | SM 8.0 / 8.6 | Datacenter + consumer (A100, A40, A30, RTX 30, RTX A) |
+| `turing` | — | SM 7.5 | Consumer + workstation (RTX 20, GTX 16, T4, RTX 6000) |
+
+Older arches (Volta, Pascal, Maxwell, Kepler) are intentionally
+**off** the allowlist — their compute-capability and driver
+floors no longer satisfy the per-arch §5.1 minima reliably.
+The `ada` short form is accepted as an alias for backward
+compatibility with the CELLSminer-console output that predates
+the `ada-lovelace` long form; a future fork may tighten this.
+
+The allowlist is the closed enum in
+[`pkg/mining/attest/archcheck/archcheck.go`](../../source/pkg/mining/attest/archcheck/archcheck.go).
+Adding a new arch is consensus-affecting and lands as a single
+registry append plus the matching `gpu_name` patterns in the
+same package — an `init()` self-check panics at boot if the
+two halves disagree.
+
+This check fires in the OUTER verifier
+([`pkg/mining/verifier.go`](../../source/pkg/mining/verifier.go))
+**before** dispatching to the per-type cryptographic verifier,
+so a malformed / typo / future-arch-sneak proof costs a single
+map lookup and never pays the HMAC or X.509 work.
+
+#### 4.6.2 `gpu_arch` ↔ `bundle.gpu_name` consistency (HMAC path)
+
+For the HMAC path, the bundle's `gpu_name` field is HMAC-bound
+under the operator's enrollment-time secret (covered by
+`Bundle.CanonicalForMAC`). An attacker who has already forged
+a valid HMAC cannot **also** flip `gpu_name` post-hoc — they
+had to choose at sign time. So we cross-check the canonical
+arch against a substring-pattern table of real shipping NVIDIA
+product names:
+
+| Canonical arch | Accepted `gpu_name` substrings |
+|---|---|
+| `hopper` | `h100`, `h200`, `h800` |
+| `blackwell` | `b100`, `b200`, `gb200`, `rtx 50` |
+| `ada-lovelace` | `rtx 40`, `l4`, `l40`, `rtx 6000 ada`, `rtx 5000 ada`, `rtx 4500 ada`, `rtx 4000 ada`, `rtx 2000 ada` |
+| `ampere` | `a100`, `a40`, `a30`, `a16`, `a10`, `a2`, `rtx 30`, `rtx a` |
+| `turing` | `rtx 20`, `gtx 16`, `t4`, `quadro rtx`, `rtx 8000`, `rtx 6000` |
+
+Patterns are matched case-insensitively after whitespace
+collapse. A bundle whose `gpu_name` does not contain any of
+the patterns for its claimed arch is rejected with
+`ErrArchGPUNameMismatch` (wrapped in
+`mining.ErrAttestationSignatureInvalid` so the `attestation`
+reason metric still groups it).
+
+This catches the **lazy spoof** — an attacker who flips
+`gpu_arch=hopper` but forgot to also lie about the
+`nvidia-smi` name on their consumer Ada card. The
+**determined spoof** (operator colluding with a non-NVIDIA or
+wrong-arch card and lying about both fields) is still constrained
+by the on-chain registry's `(gpu_uuid, hmac_key)` pairing
+(§5.2) and economically by §5.4 stake bonding. HMAC-based
+slashing remains fail-closed until attestation becomes asymmetric,
+so this is a bond-and-rate-limit deterrent rather than an
+attributable slash today.
+
+This check fires in the HMAC verifier
+([`pkg/mining/attest/hmac/verifier.go`](../../source/pkg/mining/attest/hmac/verifier.go))
+as the long-deferred step 8 of the §3.3 acceptance flow,
+**after** the HMAC field check (step 4) and the deny-list
+check (step 7) — so a determined spoofer has to clear every
+upstream gate before being trapped here.
+
+#### 4.6.3 Hashrate-band plausibility
+
+`Attestation.ClaimedHashrateHPS` is operator-supplied and
+ungated by any cryptographic check — the miner can put any
+number they want there. It feeds the leaderboard / pool
+telemetry surface, not consensus, so the worst case is
+reputational manipulation rather than block-acceptance
+manipulation. Even so, an obviously-implausible value is a
+strong signal that the rest of the attestation is suspect:
+
+| Canonical arch | Min H/s | Max H/s | Reference cards |
+|---|---:|---:|---|
+| `turing` | 10 000 | 5 000 000 | T4 ~0.5 MH/s, GTX 16 lower |
+| `ampere` | 50 000 | 50 000 000 | RTX 30 ~1-2 MH/s, A100 ~5-10 MH/s |
+| `ada-lovelace` | 100 000 | 50 000 000 | RTX 40 ~3-5 MH/s, L40S ~6-8 MH/s |
+| `hopper` | 1 000 000 | 200 000 000 | H100 ~20-40 MH/s, H200 higher |
+| `blackwell` | 5 000 000 | 500 000 000 | B200 ~40-80 MH/s, GB200 NVL72 higher |
+
+Bounds are inclusive on both ends and intentionally **wide**
+(≈100x range per arch) so legitimate variation across a
+product family doesn't trip false positives. The check
+rejects only the obvious lies; subtler manipulation is left
+to off-chain analysis.
+
+`ClaimedHashrateHPS == 0` is treated as **"not asserted"**
+and passes through. This preserves backward compat with miners
+and test fixtures that don't populate the field. Tightening
+to require a non-zero value is a future fork concern.
+
+This check fires in the OUTER verifier (same site as §4.6.1
+allowlist), AFTER `ValidateOuterArch` succeeds and BEFORE
+dispatching to the per-type cryptographic verifier — so an
+implausible-hashrate proof never pays the HMAC or X.509
+work. Source:
+[`pkg/mining/attest/archcheck/archcheck.go::ValidateClaimedHashrate`](../../source/pkg/mining/attest/archcheck/archcheck.go).
+
+#### 4.6.4 Operator metrics
+
+Two Prometheus counter families surface the §4.6 rejection
+rate to dashboards and alerting:
+
+```
+CELLS_attest_archspoof_rejected_total{reason="unknown_arch" | "gpu_name_mismatch" | "cc_subject_mismatch"}
+CELLS_attest_hashrate_rejected_total{arch="hopper" | "blackwell" | "ada-lovelace" | "ampere" | "turing" | "unknown"}
+```
+
+Cardinality stays bounded (≤ 9 series total). Both counters
+are wired through the dependency-inverted
+`mining.SetMiningMetricsRecorder` registration pattern (see
+`pkg/mining/metrics.go` and `pkg/monitoring/mining_recorder.go`).
+
+#### 4.6.5 CC-path leaf cert subject ↔ arch consistency
+
+The CC path (`nvidia-cc-v1`) already binds the device
+certificate chain to a specific physical GPU at the
+cryptographic level (§3.2 step 1 cert-chain pin + §3.2 step 4
+AIK signature). On top of that, the verifier runs a Step 9
+**evidence-based** consistency check between
+`Attestation.GPUArch` and the leaf cert's
+`Subject.CommonName`:
+
+| Leaf CN content | Outcome |
+|---|---|
+| Contains a substring matching THIS arch's pattern table (e.g. `"NVIDIA H100 80GB HBM3"` with `gpu_arch=hopper`) | **accept** — positive evidence agrees with claim |
+| Contains a substring matching ANOTHER arch's pattern table (e.g. `"NVIDIA H100"` with `gpu_arch=ada-lovelace`) | **reject** with `archcheck.ErrArchCertSubjectMismatch` wrapped under `mining.ErrAttestationSignatureInvalid` |
+| Contains NO substring from any arch's pattern table (test fixtures, corporate AIK label like `"NVIDIA Confidential Computing AIK"`, OID-based model encoding) | **accept** — no evidence to evaluate; cert-chain pin + AIK signature are the locks |
+| `Attestation.GPUArch` is empty (standalone-call path, pre-fork bring-up vectors) | **accept** — Step 9 skipped |
+
+**Why "evidence-based, not strict".** Production NVIDIA CC
+chains have not yet been audited end-to-end for where they
+encode the GPU model — it could be the Subject CN, an OU
+field, a custom OID extension, or nowhere on the leaf at all
+(model only inferable from the issuing intermediate). A
+strict "must contain a known product string" rule would
+false-reject honest validators whose cert format hasn't
+landed in the codebase yet. The evidence-based rule rejects
+only positive contradictions and falls back on the
+cryptographic locks otherwise.
+
+**Pattern overlap resolution.** When the subject matches
+multiple arch patterns (e.g. `"RTX 6000 Ada Generation"`
+matches both `"rtx 6000 ada"` (Ada) and `"rtx 6000"`
+(Turing) as substrings), the **longest-pattern match wins**.
+The Ada attribution dominates and a `gpu_arch=turing` claim
+on that subject is rejected.
+
+**Source.**
+[`archcheck.ValidateBundleArchConsistencyCC`](../../source/pkg/mining/attest/archcheck/archcheck.go)
+implements the rule;
+[`pkg/mining/attest/cc/verifier.go`](../../source/pkg/mining/attest/cc/verifier.go)
+wires it as Step 9, after Step 8 (PCR floor). Rejection
+metric:
+`CELLS_attest_archspoof_rejected_total{reason="cc_subject_mismatch"}`.
+
+#### 4.6.6 Activation height
+
+This whole section is gated by `FORK_V2_HEIGHT` (the v2
+attestation flow). The arch-spoof checks are part of the
+attestation surface, so they are active wherever the
+attestation surface is active — which is from v2 launch
+onwards.
+
+---
+
+## 5. Trust anchors
+
+This section records what is **shipped today**, not what the
+draft recommended. The 2026-04-24 owner sign-off (§13) ratified
+the tiered model below; no other configuration is supported.
+
+### 5.1 CC path (datacenter Hopper / Blackwell)
+
+Genesis embeds:
+
+- The NVIDIA device-attestation CA root public key(s).
+- A list of accepted NVIDIA attestation-chain issuers.
+- A minimum firmware / driver floor per supported architecture
+  (Hopper SM90, Blackwell SM100).
+
+Live NGC HTTP attestation is **not used.** The validator SLO
+(`< 100 ms` per proof) does not tolerate a synchronous HTTPS
+round-trip to NVIDIA's attestation service per proof, and a
+chain halt caused by an NVIDIA service outage is unacceptable.
+Root rotation handled the same way every pinned-root system
+handles it: a governance-gated chain-config update committing
+the new root, activated at a future height.
+
+Deferred only insofar as **real-world `nvtrust` bundle framing**
+is concerned; see §12.1.
+
+### 5.2 Consumer GPU path — on-chain operator registry
+
+Schema (`pkg/mining/enrollment/types.go`):
+
+```
+node_id:     UTF-8 string, ≤ 64 bytes
+owner:       reward wallet address that receives mining rewards
+gpu_uuid:    exact UUID string from `nvidia-smi --query-gpu=uuid`
+operator_public_key:
+             ML-DSA public key from signed enrollment; retained
+             only after OperatorPublicKeyRetentionHeight
+hmac_key:    32 random bytes, shared secret operator↔registry
+stake_dust:  uint64; ≥ MinEnrollStakeDust at enrollment
+```
+
+Enrollment lifecycle:
+
+1. Operator generates an HMAC key locally (e.g. via
+   `CELLSminer-console --gen-hmac-key=PATH`).
+2. Operator submits a signed `CELLS/enroll/v2` transaction carrying
+   `(node_id, gpu_uuid, hmac_key)` and locking `MinEnrollStakeDust`
+   or selecting deferred bond accrual at the validator's
+   `EnrollmentApplier`. Mempool admission: stateless validation
+   via `enrollment.AdmissionChecker` in
+   [`pkg/mining/enrollment/admit.go`](../../source/pkg/mining/enrollment/admit.go);
+   chain-side state mutation in
+   [`pkg/chain.EnrollmentApplier`](../../source/pkg/chain/enrollment_apply.go).
+3. From then on, every proof the miner emits carries a
+   `nvidia-hmac-v1` bundle signed with that key.
+4. Operators or governance can revoke a `node_id` with a signed
+   `CELLS/enroll/v2` transaction carrying an `unenroll` payload. Stake
+   bonds for `UnbondWindow`
+   (201,600 blocks (about 23 days at 10-second blocks)); `BlockProducer.OnSealedBlock` auto-
+   sweeps matured records and releases the `gpu_uuid` so the
+   physical card can be re-enrolled by a fresh `node_id`.
+
+**Why this is not cryptographically airtight.** An operator with
+a legitimately-registered `(node_id, gpu_uuid, hmac_key)` tuple
+can lend their HMAC key to an accomplice whose hardware reports a
+fake `gpu_uuid`. The verifier cannot distinguish. For consumer
+cards this is an *economic* lock, not a *cryptographic* one: the
+stake-at-enrollment makes Sybil attacks expensive (10 CELL x N
+keys). HMAC-key misuse is not slashable today because public
+symmetric keys cannot attribute who produced a bundle. Signed
+enrollment public-key retention is the migration rail, but HMAC
+offences become safely slashable only after that gate is active
+and proof submissions carry operator wallet signatures.
+
+### 5.3 Deny-list
+
+Genesis embeds a deny-list of GPU name substrings that must not
+appear in any `nvidia-hmac-v1` bundle (`bundle.gpu_name`).
+Initially empty. Governance can append strings (e.g. a future
+revelation that a particular card model has a driver bypass
+attackers are abusing). Enforcement: §3.3 step 7.
+
+### 5.4 Stake-at-enrollment (anti-Sybil)
+
+`MinEnrollStakeDust = 10 * 100_000_000` dust = **10 CELL**.
+Ratified 2026-04-24 (§13.2). Governance may adjust post-launch
+via the chain-config delta mechanism. Enforced by
+[`pkg/mining/fork.go`](../../source/pkg/mining/fork.go) and the
+mempool admission gate; defended by
+[`pkg/chain/slash_apply.go`](../../source/pkg/chain/slash_apply.go)'s
+`SlashApplier.AutoRevokeMinStakeDust` which automatically
+revokes any record drained below the threshold.
+
+---
+
+## 6. Freshness window & nonce issuance
+
+### 6.1 The problem
+
+Without a freshness mechanism, a miner could record one valid
+attestation bundle and replay it forever. The attestation check
+would pass but the bundle conveys no evidence about the specific
+proof it's paired with.
+
+### 6.2 The solution
+
+`FRESHNESS_WINDOW = 60 s`. Ratified 2026-04-24 (§13.3).
+Validator nonce ring buffer retention: `2 × FRESHNESS_WINDOW =
+120 s`.
+
+1. Every validator exposes
+   `GET /api/v1/mining/challenge` (§3.3). Response: 32-byte
+   random nonce + issued-at timestamp + signature over both by
+   the validator's challenge signing key.
+2. A miner fetches a challenge before starting a round and
+   embeds the exact `(nonce, issued_at)` in its
+   `Attestation.Nonce` / `Attestation.IssuedAt`.
+3. A proof is stale if `issued_at + FRESHNESS_WINDOW < now`.
+4. A validator can verify a challenge it didn't issue by
+   checking the issuer's signature — any validator's challenge
+   is accepted as long as it's within the freshness window.
+   This prevents a single-validator DoS where the network stalls
+   because one validator's challenge service is down.
+
+### 6.3 Replay store
+
+Validators remember `(node_id, nonce)` (or `(device_uuid, nonce)`
+for the CC path) for `2 × FRESHNESS_WINDOW`. A proof reusing a
+nonce already seen → reject.
+
+---
+
+## 7. Verifier
+
+### 7.1 Acceptance flow
+
+```go
+// pkg/mining/verifier.go (v2). The attestation gate runs first
+// after validateShape so we reject bad attestations before
+// spending CPU on the DAG walk.
+func (v *Verifier) Verify(p Proof, …) error {
+    if err := p.validateShape(); err != nil { return err }
+
+    if p.Height >= ForkV2Height {
+        if err := v.verifyAttestation(p); err != nil {
+            return fmt.Errorf("v2 attestation: %w", err)
+        }
+    }
+    // existing DAG walk, target check, etc…
+    return nil
+}
+
+func (v *Verifier) verifyAttestation(p Proof) error {
+    a := p.Attestation
+    if a.Type == "" { return ErrAttestationRequired }
+    return v.dispatcher.Verify(p, a)
+}
+```
+
+Dispatcher: `pkg/mining/attest/dispatcher.go` — type-keyed
+registry mapping `Attestation.Type` to a concrete
+`AttestationVerifier`.
+
+### 7.2 Shipped packages
+
+| Package | Purpose | Status |
+|---|---|---|
+| [`pkg/mining/attest/cc/`](../../source/pkg/mining/attest/cc/) | NVIDIA CC cert-chain + AIK quote verification | **Shipped.** 28 unit tests, deterministic in-process test vectors. |
+| [`pkg/mining/attest/hmac/`](../../source/pkg/mining/attest/hmac/) | Consumer-GPU HMAC verification + registry lookup | **Shipped.** Wired through `attest.ProductionConfig.HMACConfig`. |
+| [`pkg/mining/attest/dispatcher.go`](../../source/pkg/mining/attest/dispatcher.go) | Type-keyed verifier registry | **Shipped.** |
+| [`pkg/mining/challenge/`](../../source/pkg/mining/challenge/) | Validator-issued nonce challenge crypto | **Shipped.** |
+| [`pkg/mining/enrollment/`](../../source/pkg/mining/enrollment/) | On-chain operator registry, admission gate, sweep | **Shipped.** |
+| [`pkg/mining/slashing/`](../../source/pkg/mining/slashing/) | Slashing data model + dispatcher + admission | **Shipped, fail-closed in production.** HMAC-dependent kinds refuse attribution through `pkg/mining/slashing/attribution.go`; `freshness-cheat` rejects through the production `RejectAllWitness` pending BFT finality (§12.3). |
+| [`pkg/governance/chainparams/`](../../source/pkg/governance/chainparams/) | `CELLS/gov/v1` parameter-tuning tx type, registry, ParamStore, admission | **Shipped.** Three tunables: `reward_bps`, `auto_revoke_min_stake_dust`, `fork_v2_tc_height`. See §9.4. |
+| [`pkg/chain/gov_apply.go`](../../source/pkg/chain/gov_apply.go) | Chain-side `GovApplier` adapter routing `CELLS/gov/v1` txs | **Shipped.** Stages → promotes via `SealedBlockHook`. |
+
+### 7.3 Test vectors
+
+Phase 2c-iv ships test vectors **inline, not as testdata files**
+— [`pkg/mining/attest/cc/testvectors.go`](../../source/pkg/mining/attest/cc/testvectors.go)
+is a deterministic in-process generator (seeded PRNG, fresh
+self-signed root + AIK leaf per call) so CI runs on machines
+without GPU hardware. Coverage:
+
+- 1 happy path
+- 13 negative cases: tampered AIK signature, wrong root, expired
+  leaf, nonce mismatch, issued_at mismatch, miner_addr/mix_digest
+  preimage tamper, stale, future-dated, below firmware floor,
+  below driver floor, replay through `NonceStore`, malformed
+  base64, unknown JSON field, over-length cert chain.
+
+When NVIDIA-issued real-world H100 / B100 bundles become
+available, the swap is a single `ParseBundle` reimplementation
+— the verifier code does not change.
+
+---
+
+## 8. On-chain enrollment & slashing
+
+The §3 attestation gate is the *consensus* rule. To make the
+NVIDIA lock observable and enforceable, v2 adds an on-chain
+registry (enrollment) and a punishment surface (slashing) that
+let any node that *witnesses* a forged proof drain the offender's
+stake without trusting any single validator.
+
+### 8.1 Enrollment
+
+Wire types in
+[`pkg/mining/enrollment/types.go`](../../source/pkg/mining/enrollment/types.go):
+
+```go
+type EnrollPayload struct {
+    Kind      PayloadKind
+    NodeID    string
+    GPUUUID   string
+    HMACKey   []byte // 32 random bytes
+    StakeDust uint64 // ≥ MinEnrollStakeDust, or 0 for deferred bond
+    BondMode  BondMode
+    WorkNonce uint64 // required for deferred bond
+    Memo      string
+    ContractID = "CELLS/enroll/v2"
+}
+
+type UnenrollPayload struct {
+    Kind   PayloadKind
+    NodeID string
+    Reason string
+    ContractID = "CELLS/enroll/v2"
+}
+
+type EnrollmentRecord struct {
+    NodeID, GPUUUID, Owner string
+    OperatorPublicKey      string // ML-DSA, retained after fork gate
+    HMACKey                []byte
+    StakeDust              uint64
+    BondMode               BondMode
+    RequiredStakeDust      uint64
+    EnrolledAtHeight       uint64
+    RevokedAtHeight        uint64 // 0 == active
+    UnbondMaturesAtHeight  uint64 // 0 == active
+    Memo                   string
+}
+```
+
+Stateless mempool admission:
+[`pkg/mining/enrollment/admit.go`](../../source/pkg/mining/enrollment/admit.go)
+(`AdmissionChecker`).
+
+Stateful chain-side applier:
+[`pkg/chain/enrollment_apply.go`](../../source/pkg/chain/enrollment_apply.go)
+(`EnrollmentApplier`), composed via
+[`pkg/chain/enrollment_aware_applier.go`](../../source/pkg/chain/enrollment_aware_applier.go)
+(`EnrollmentAwareApplier`) into the block producer's state
+transition pipeline.
+
+Auto-sweep at unbond maturity:
+`BlockProducer.OnSealedBlock = SealedBlockHook(...)`. Matured
+`UnbondMaturesAtHeight ≤ height` records release stake to the
+operator's account and free the `gpu_uuid` binding for fresh
+re-enrollment.
+
+### 8.2 Slashing
+
+The slashing transaction path is implemented, observable, and
+receipt-producing, but no slash kind is accepted by production
+consensus today. This is intentional. HMAC-based evidence cannot
+prove who produced a bundle while the enrolled key is public
+chain state, and freshness-cheat still needs a BFT-backed
+inclusion witness. Until those two dependencies land, slash
+submissions are expected to reject without draining miner stake.
+
+Wire types in
+[`pkg/mining/slashing/types.go`](../../source/pkg/mining/slashing/types.go):
+
+```go
+const ContractID = "CELLS/slash/v1"
+
+type EvidenceKind string
+
+const (
+    EvidenceKindForgedAttestation EvidenceKind = "forged-attestation"
+    EvidenceKindDoubleMining      EvidenceKind = "double-mining"
+    EvidenceKindFreshnessCheat    EvidenceKind = "freshness-cheat"
+)
+
+type SlashPayload struct {
+    Offender, Slasher string
+    Kind              EvidenceKind
+    EvidenceBlob      []byte
+    SlashAmountDust   uint64
+    Memo              string
+}
+```
+
+Concrete `EvidenceVerifier` implementations:
+
+| Kind | Detects | Status |
+|---|---|---|
+| `forged-attestation` | An HMAC bundle whose MAC fails verification, whose `gpu_uuid` mismatches the enrolled record, whose `challenge_bind` mismatches the proof, or whose `gpu_name` matches the deny-list. | **Verifier shipped; production slash acceptance disabled.** The verifier returns `ErrAttestationUnattributable` through `pkg/mining/slashing/attribution.go` because public HMAC keys cannot attribute the producer. |
+| `double-mining` | Two distinct accepted proofs from the same `(node_id, epoch, height)`, both crypto-valid under the registered HMAC key. | **Verifier shipped; production slash acceptance disabled.** The encoder canonicalises proof order, but the verifier still refuses attribution until signed enrollment public-key retention is active and proof submissions carry a wallet signature checkable against that key. |
+| `freshness-cheat` | A proof whose `bundle.issued_at` is older than `FRESHNESS_WINDOW + grace` (default 60 s + 30 s) when measured against the chain block-time of the inclusion height, i.e. retroactive evidence of validator collusion or clock skew. | **Shipped** in [`pkg/mining/slashing/freshnesscheat`](../../source/pkg/mining/slashing/freshnesscheat/). The verifier is fully implemented; on-chain acceptance is gated on the injected `BlockInclusionWitness`. Production binaries ship `RejectAllWitness` (every slash rejected with a kind-specific `ErrEvidenceVerification`), pending the BFT-finality dependency in §12.3. Testnets MAY wire `TrustingTestWitness` to exercise the path end-to-end. |
+
+Production dispatcher:
+[`pkg/mining/slashing/production.go`](../../source/pkg/mining/slashing/production.go).
+
+#### Chain-side applier
+
+[`pkg/chain/slash_apply.go`](../../source/pkg/chain/slash_apply.go)
+(`SlashApplier`):
+
+1. Decodes `SlashPayload` and dispatches to the matching
+   `EvidenceVerifier`.
+2. Fingerprints the evidence (`(node_id, evidence_hash)`) and
+   rejects duplicates → per-fingerprint replay protection.
+3. Drains `min(SlashAmountDust, record.StakeDust)` from the
+   offender's bonded stake.
+4. Pays a configurable `RewardBPS` fraction (capped at
+   `SlashRewardCap = 5000` bps = 50%) to the slasher; burns the
+   rest.
+5. **Auto-revoke under-bonded records:** if the post-slash stake
+   is `< AutoRevokeMinStakeDust` (default `MinEnrollStakeDust`),
+   `enrollment.InMemoryState.RevokeIfUnderBonded` retires the
+   record at the standard unbond window. This closes the
+   "slash-to-zero, keep mining for free" loophole. Set to 0 to
+   disable.
+
+End-to-end coverage:
+[`pkg/chain/slash_forgedattest_e2e_test.go`](../../source/pkg/chain/slash_forgedattest_e2e_test.go),
+[`pkg/chain/slash_doublemining_e2e_test.go`](../../source/pkg/chain/slash_doublemining_e2e_test.go),
+[`pkg/chain/slash_apply_autorevoke_test.go`](../../source/pkg/chain/slash_apply_autorevoke_test.go).
+
+---
+
+## 9. Operator surface
+
+### 9.1 HTTP
+
+| Endpoint | Method | Purpose | Source |
+|---|---|---|---|
+| `/api/v1/mining/challenge` | GET | Issue a fresh nonce challenge for §3.3 / §6. | `pkg/api/handlers_challenge.go` |
+| `/api/v1/mining/enroll` | POST | Submit a signed `CELLS/enroll/v2` transaction with an `enroll` payload (202 when admitted). | `pkg/api/handlers_enrollment.go` |
+| `/api/v1/mining/unenroll` | POST | Submit a signed `CELLS/enroll/v2` transaction with an `unenroll` payload (202 when admitted). | `pkg/api/handlers_enrollment.go` |
+| `/api/v1/mining/slash` | POST | Submit `CELLS/slash/v1` transaction. | `pkg/api/handlers_slashing.go` |
+| `/api/v1/mining/slash/{tx_id}` | GET | Read sanitised slash receipt (FIFO-bounded in-memory store). | `pkg/api/handlers_slash_query.go` |
+| `/api/v1/mining/enrollment/{node_id}` | GET | Read sanitised enrollment view (`phase`, `slashable`; HMAC key never leaks). | `pkg/api/handlers_enrollment_query.go` |
+| `/api/v1/mining/enrollments?cursor=&limit=&phase=` | GET | Paginated list of enrollments, lexicographic by node_id, with `Phase` filter. | `pkg/api/handlers_enrollment_list.go` |
+
+All endpoints wired in
+[`internal/v2wiring/v2wiring.go`](../../source/internal/v2wiring/v2wiring.go)
+(see §9.5). Each endpoint returns 503 until its `Set*` is called,
+so a misconfigured boot fails loudly rather than silently
+degrading.
+
+### 9.2 CLI — `CELLScli`
+
+Source: [`cmd/CELLScli/`](../../source/cmd/CELLScli/). Subcommands:
+
+| Subcommand | Purpose |
+|---|---|
+| `CELLScli enroll` | Build, sign and submit a `CELLS/enroll/v2` enroll transaction. |
+| `CELLScli unenroll` | Build, sign and submit a `CELLS/enroll/v2` unenroll transaction. |
+| `CELLScli slash` | Build + submit `CELLS/slash/v1` (consumes evidence-bundle bytes). |
+| `CELLScli enrollment-status` | Query `/api/v1/mining/enrollment/{node_id}`. |
+| `CELLScli enrollments` | Paginated list, with `--phase`, `--limit`, `--cursor`, `--all` flags. |
+| `CELLScli slash-receipt` | Query `/api/v1/mining/slash/{tx_id}`. |
+| `CELLScli slash-helper {forged-attestation,double-mining,inspect}` | Offline evidence-bundle assembly (see §9.3). |
+| `CELLScli watch enrollments [--phase --node-id --interval --json --once --include-existing]` | Stream phase-change / stake-delta events. Polling-only, no key required. Single-node and list modes. Emits `new`/`transition`/`stake_delta`/`dropped`/`error` events on stdout (human or JSON-Lines). See [`MINER_QUICKSTART.md` "Streaming phase-change events"](./MINER_QUICKSTART.md#streaming-phase-change-events-with-CELLScli-watch). |
+| `CELLScli watch slashes [--tx-id --tx-ids-file --interval --json --once --include-pending --exit-on-resolved]` | Stream slash-receipt resolution events for a caller-supplied set of slash tx ids. Polling-only, no key required. Emits `slash_resolved`/`slash_pending`/`slash_evicted`/`slash_outcome_change`/`error` events. Default first-poll behaviour emits only already-resolved receipts; `--include-pending` echoes every still-pending tx each cycle; `--exit-on-resolved` terminates once every tracked tx has reached a terminal outcome (good for CI / cron). See [`MINER_QUICKSTART.md` "Streaming slash-receipt events"](./MINER_QUICKSTART.md#streaming-slash-receipt-events-with-CELLScli-watch-slashes). |
+| `CELLScli watch params [--param --interval --json --once --include-existing]` | Stream governance-parameter staging / activation events. Polls `GET /api/v1/governance/params` and diffs successive snapshots. Polling-only, no key required. Emits `param_staged`/`param_superseded`/`param_activated`/`param_removed`/`param_authorities_changed`/`error` events on stdout (human or JSON-Lines). `--param=NAME` narrows the stream to a single registered param; `--include-existing` synthesises a `param_staged` event for every pending change visible at the first poll. Authorities and the off-chain multisig surface live in §9.4. |
+
+The CLI builds canonical payloads through `pkg/mining/{enrollment,
+slashing}` so it shares the exact codec the mempool admission
+gate validates against — no parallel hand-rolled JSON path.
+
+### 9.3 Slash-helper — offline evidence-bundle assembly
+
+[`cmd/CELLScli/slash_helper.go`](../../source/cmd/CELLScli/slash_helper.go)
++ [`cmd/CELLScli/slash_helper_test.go`](../../source/cmd/CELLScli/slash_helper_test.go).
+Three subcommands produce / decode the canonical `EvidenceBlob`
+bytes the chain-side `forgedattest` / `doublemining` decoders
+consume:
+
+```
+CELLScli slash-helper forged-attestation --proof=PATH \
+                                        [--fault-class=KIND] \
+                                        [--memo=STR] [--node-id=ID] \
+                                        [--out=PATH] [--print-cmd]
+
+CELLScli slash-helper double-mining --proof-a=PATH --proof-b=PATH \
+                                   [--memo=STR] [--node-id=ID] \
+                                   [--out=PATH] [--print-cmd]
+
+CELLScli slash-helper inspect --kind=KIND \
+                             (--evidence-file=PATH | --evidence-hex=HEX)
+```
+
+Pre-flight checks reject obviously-broken evidence locally
+(saves a tx fee on guaranteed `verifier_failed`):
+
+| Check | `forged-attestation` | `double-mining` |
+|---|---|---|
+| Proof carries `Version=2` | ✓ | ✓ (both) |
+| Attestation bundle non-empty | ✓ | — |
+| `node_id` matches across inputs | ✓ (--node-id) | ✓ (a vs b) |
+| Same `(Epoch, Height)` | — | ✓ |
+| Distinct canonical bytes | — | ✓ |
+
+Output defaults to stdout (raw bytes; pipe directly into
+`CELLScli slash --evidence-file=-`). `--out=PATH` writes to a
+0o600 file. `--print-cmd` emits a copy-pasteable
+`CELLScli slash …` snippet on **stderr** (never stdout — keeps
+the bytes pipe clean). Encoder ordering is canonicalised in
+`double-mining` so two slashers observing the same equivocation
+produce byte-identical evidence, preserving chain-side
+per-fingerprint replay protection. 21 unit tests cover happy
+paths, stdout-write, stderr-only `--print-cmd`, every pre-flight
+rejection, encoder round-trip, and `inspect` against
+forged-attestation + double-mining blobs supplied as either
+`--evidence-file` or `--evidence-hex`.
+
+### 9.4 Governance — runtime parameter tuning (`CELLS/gov/v1`)
+
+Source:
+[`pkg/governance/chainparams/`](../../source/pkg/governance/chainparams/)
++ [`pkg/chain/gov_apply.go`](../../source/pkg/chain/gov_apply.go)
++ [`cmd/CELLScli/gov_helper.go`](../../source/cmd/CELLScli/gov_helper.go).
+
+Two protocol-economy parameters that previously lived as
+construction-time arguments to `chain.SlashApplier` are now
+governance-tunable at runtime:
+
+| Param name (wire) | Reader | Bounds | Genesis default |
+|---|---|---|---|
+| `reward_bps` | `SlashApplier.activeRewardBPS()` | `[0, 5000]` (clamped at `chain.SlashRewardCap`) | `cfg.SlashRewardBPS` (binary-supplied) |
+| `auto_revoke_min_stake_dust` | `SlashApplier.activeAutoRevokeMinStakeDust()` | `[1·CELL, MIN_ENROLL_STAKE]` | `MIN_ENROLL_STAKE` |
+| `fork_v2_tc_height` | runtime `pkg/mining.ForkV2TCHeight()`, repinned by `v2wiring`'s `SealedBlockHook` after each `Promote` | `[0, math.MaxUint64]` | `cfg.ForkV2TCHeight` (binary-supplied; `nil` = `MaxUint64` = TC disabled) |
+
+Tunable parameters are an explicit whitelist
+(`chainparams.Registry`); anything else requires a binary
+upgrade. Adding a new tunable lands as a single registry append
+plus a chain-side reader — every other layer (admission,
+applier, ParamStore, CLI help, metrics labels) auto-discovers
+the addition.
+
+#### Wire format
+
+`CELLS/gov/v1` `ParamSetPayload`, canonical JSON, encoded into
+`mempool.Tx.Payload`:
+
+```json
+{
+  "kind": "param-set",
+  "param": "reward_bps",
+  "value": 2500,
+  "effective_height": 12345,
+  "memo": "post-mortem #14: lower reward share"
+}
+```
+
+`memo` is bounded at 256 bytes. `DisallowUnknownFields` is set
+so wire drift is rejected loudly.
+
+#### Authority model
+
+`chain.GovApplier` is constructed with
+`v2wiring.Config.GovernanceAuthorities []string` — a set of
+addresses authorised to submit `CELLS/gov/v1` txs. Empty slice
+**disables** on-chain governance entirely (every gov tx
+rejects with `chainparams.ErrGovernanceNotConfigured`); this
+is the genesis posture for chains that have not yet bootstrapped
+a governance authority. The genesis list is binary-baked, but
+the live AuthorityList is now itself rotatable via the
+**M-of-N gated `authority-set` payload kind** described
+in §9.4.7 — a captured authority cannot unilaterally change
+membership.
+
+The off-chain `pkg/governance/{voting,multisig}` package
+remains useful for off-chain proposal coordination, but on-
+chain rotations no longer require a binary redeploy: each
+authority submits a vote tx and the chain stages the
+rotation once threshold votes accumulate.
+
+#### Activation
+
+The tx field `effective_height` MUST satisfy:
+
+```
+currentHeight ≤ effective_height ≤ currentHeight + MaxActivationDelay
+```
+
+with `MaxActivationDelay = 86,400 blocks (~3 days at 3-second
+block time)`. The applier stages the change in a per-param
+"pending" slot; the `SealedBlockHook` calls
+`GovApplier.PromotePending(blockHeight)` after each block,
+which atomically promotes any pending changes whose
+`effective_height` has been reached. Promotion order is
+deterministic across nodes (by `effective_height` ascending,
+then by name ascending). Setting
+`effective_height == currentHeight` is the "apply at the next
+block" knob.
+
+One pending change per parameter at a time; subsequent
+submissions for the same parameter SUPERSEDE the prior pending
+entry (with a `param-superseded` event for audit trails).
+
+#### Mempool admission
+
+`chainparams.AdmissionChecker` is layered above the slashing
+admission gate, mirroring the slashing > enrollment > base
+stack:
+
+```go
+pool.SetAdmissionChecker(
+    chainparams.AdmissionChecker(
+        slashing.AdmissionChecker(
+            enrollment.AdmissionChecker(baseAdmit))))
+```
+
+Admission performs every stateless check: kind tag, registry
+membership, bounds, memo cap, fee floor. Stateful checks
+(authority list, height window) live in the applier where
+`AccountStore` and `currentHeight` are available.
+
+#### Observability
+
+Four Prometheus counters / gauges, all exported by
+`pkg/monitoring/gov_metrics.go`:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `CELLS_gov_param_staged_total` | counter | `param` | `CELLS/gov/v1` param-set txs accepted, by parameter. |
+| `CELLS_gov_param_activated_total` | counter | `param` | Staged changes promoted to active by `Promote()`, by parameter. |
+| `CELLS_gov_param_value` | gauge | `param` | Currently-active value for each governance-tunable parameter. |
+| `CELLS_gov_param_rejected_total` | counter | `reason` | Param-set txs rejected before staging, by reason (decode, unauthorized, height_in_past, height_too_far, fee_invalid, …). |
+
+Plus four `GovParamEvent` flavours emitted on the
+`GovEventPublisher` interface (a separate publisher from
+`ChainEventPublisher` so existing slash / enrollment subscribers
+do not have to grow a no-op handler):
+
+| Kind | When it fires |
+|---|---|
+| `param-staged` | once per accepted gov tx |
+| `param-superseded` | when the staged change overwrites a prior pending entry for the same parameter |
+| `param-activated` | when `Promote(height)` flips pending → active |
+| `param-rejected` | once per pre-mutation rejection, with `RejectReason` matching the metrics enum |
+
+#### HTTP read API
+
+Operators, dashboards, and `CELLScli watch params` consume two
+read-only endpoints, both registered unconditionally and
+returning **503 Service Unavailable** until
+`api.SetGovernanceProvider(...)` is called by `internal/v2wiring`
+at boot:
+
+| Method + path | Returns | Notes |
+|---|---|---|
+| `GET /api/v1/governance/params` | `GovernanceParamsView` | Full snapshot: `active` (param→value), `pending[]` sorted by `(effective_height ASC, param ASC)`, `registry[]` sorted by `name`, `authorities[]` sorted ASC, `governance_enabled` bool. Empty slices/maps are normalised to `[]` / `{}` so diff-driven consumers don't branch on null. |
+| `GET /api/v1/governance/params/{name}` | `GovernanceParamView` | Single-param view: `active_value`, optional `pending` (omitted when no staged change), `registry` entry. **400** when name is empty or > 64 bytes; **404** when the name is not in the registry. |
+
+Both endpoints are **READ-only**. Submitting a parameter change
+goes through the same signed-tx envelope as every other
+`CELLS/...` ContractID via `POST /api/v1/transactions`, with
+payload constructed by `CELLScli gov-helper propose-param`.
+
+#### CLI — `CELLScli gov-helper`
+
+[`cmd/CELLScli/gov_helper.go`](../../source/cmd/CELLScli/gov_helper.go)
+ships an offline assembly tool symmetric to `slash-helper`:
+
+```
+CELLScli gov-helper propose-param --param=NAME --value=N \
+                                  --effective-height=H \
+                                  [--memo=STR] [--out=PATH] [--print-cmd]
+CELLScli gov-helper params [--json] [--remote]
+CELLScli gov-helper inspect (--payload-file=PATH | --payload-hex=HEX)
+```
+
+`propose-param` builds a canonical `ParamSetPayload` and writes
+the encoded JSON; pre-flight checks mirror the chain-side
+admission so an authority sees out-of-bounds / unknown-param
+rejections locally before submitting. The produced bytes are
+consumed by whatever signing pipeline the authority has
+(multisig orchestrator, hardware wallet, etc.) and submitted
+via `CELLScli tx … --contract-id=CELLS/gov/v1 --payload-file=…`.
+
+`params` lists the registered tunables with bounds and defaults
+(table or `--json`). With `--remote`, the offline registry is
+merged with the validator's live `/api/v1/governance/params`
+snapshot — the table grows `ACTIVE` and `PENDING` columns
+(`PENDING` collapses to `value@H+effective_height` when a change
+is staged) and a stderr footer reports `governance_enabled`
+plus the authority list, so an authority can confirm "yes, my
+key is on the list, my proposal will admit" before they
+build a payload. `--remote` is best-effort: a 503 / network
+error degrades gracefully to the offline view with a stderr
+warning.
+
+`inspect` decodes a previously-built payload and pretty-prints
+it with the matched registry entry.
+
+#### CLI — `CELLScli watch params`
+
+Polling-only event streamer parallel to `watch enrollments` /
+`watch slashes`. Hits `GET /api/v1/governance/params` once per
+cycle and diffs successive snapshots; emits one event per
+parameter per cycle plus a single `param_authorities_changed`
+event per cycle when the validator's authority list shifts.
+Same `--interval` / `--once` / `--json` / `--include-existing`
+flag surface as the other watchers, plus a `--param=NAME`
+filter that narrows the stream to a single registered param.
+Event kinds:
+
+| Kind | When it fires |
+|---|---|
+| `param_staged` | a pending change appeared where none existed (or, with `--include-existing`, on the first poll for every pre-existing pending change) |
+| `param_superseded` | a pending entry was replaced by a different pending entry without activating — the "another authority overrode my proposal" lifecycle |
+| `param_activated` | an active value changed across two snapshots — the canonical "your proposal landed" signal |
+| `param_removed` | a pending entry vanished without activation (defensive; today the chain has no path that produces this, so emitting it loudly surfaces unexpected store churn) |
+| `param_authorities_changed` | the validator's reported authority list differs across snapshots (today binary-baked, so this should never fire under normal operation) |
+| `error` | a poll cycle failed (network / HTTP / decode); always emitted on stderr in human mode |
+
+Same exit semantics as the other watchers: SIGINT/SIGTERM
+returns 0, only initial-snapshot failure exits non-zero.
+
+#### Migration posture
+
+Binaries that have not yet wired `GovernanceAuthorities` keep
+the old construction-time-only behaviour: `SlashApplier` reads
+from a default-seeded `InMemoryParamStore` (so the read path
+is uniform) but the values never change because no
+`CELLS/gov/v1` tx is ever accepted. Activating governance is a
+one-line config edit (populate `GovernanceAuthorities`) and
+takes effect at the next boot.
+
+#### Persistence — `GovParamStorePath`
+
+The on-chain `ParamStore` interface (`pkg/governance/chainparams.ParamStore`)
+mandates that production implementations persist `active` +
+`pending` state across node restarts. The reference
+`InMemoryParamStore` is non-persistent on its own; the
+`pkg/governance/chainparams/persist.go` companion ships
+free functions (`SaveSnapshot`, `LoadOrNew`) that the host
+orchestrates from a natural commit boundary.
+
+`internal/v2wiring.Config.GovParamStorePath` is that
+orchestration. When set:
+
+- **Boot**: `Wire()` calls `chainparams.LoadOrNew(path)`. The
+  file is parsed and replayed into a fresh
+  `InMemoryParamStore`; `active` values for unknown params and
+  out-of-bounds values are silently dropped (forward/backward
+  compat). A version mismatch or malformed JSON returns a
+  hard error so the operator notices state corruption rather
+  than silently downgrading.
+- **Per sealed block**: the `SealedBlockHook` calls
+  `chainparams.SaveSnapshot(govStore, path)` AFTER
+  `GovApplier.PromotePending` runs. So a snapshot always
+  reflects every promotion the chain committed up to and
+  including the just-sealed block.
+- **Atomic write**: `SaveSnapshot` writes to `<path>.tmp`
+  then atomically renames over `<path>` (with a `Remove`
+  beforehand on Windows). A crash between Remove and Rename
+  leaves `<path>` missing; the next boot's `LoadOrNew`
+  treats that as a first-boot scenario, and an operator can
+  hand-recover by renaming `<path>.tmp`.
+- **Save errors**: surfaced via `Config.LogSnapshotError`;
+  the chain continues. Persistence drift on a single block
+  recovers on the next save.
+
+When `GovParamStorePath` is empty (default) the store is
+in-memory only. That's fine for ephemeral testnets but NOT
+acceptable for production: a validator restart loses every
+pending change and resets `active` values to the registry
+defaults, which is a consensus-divergence risk on multi-node
+networks.
+
+Snapshot format (JSON, version-tagged):
+
+```json
+{
+  "version": 2,
+  "saved_at": "2026-04-28T16:20:00Z",
+  "active": {"reward_bps": 2500, "auto_revoke_min_stake_dust": 1000000000},
+  "pending": [
+    {"param":"reward_bps","value":3000,"effective_height":12345,
+     "submitted_at_height":12000,"authority":"alice","memo":"…"}
+  ],
+  "authority_proposals": [
+    {"op":"add","address":"CELLS1new","effective_height":15000,
+     "voters":[{"voter":"alice","submitted_at_height":14800}],
+     "crossed":false}
+  ]
+}
+```
+
+The current writer always emits `version=2`. The reader
+accepts `version` ∈ {1, 2} so v2 binaries replay v1 snapshots
+cleanly (the `authority_proposals` field is absent — vote
+store boots empty); a v1 binary reading a v2 snapshot is
+correctly refused (silently dropping in-flight rotations
+across a downgrade is the wrong default). Future bumps
+extend the supported range or hard-cut: the load path
+refuses unknown versions rather than silently downgrading.
+
+#### 9.4.7 Authority rotation — `authority-set` payload kind
+
+The `CELLS/gov/v1` ContractID carries TWO payload kinds —
+`param-set` (§9.4.1–9.4.6 above) and `authority-set` (this
+subsection). The kind tag is the dispatch discriminator for
+both the admission gate
+(`chainparams.AdmissionChecker.PeekKind`) and the chain
+applier (`chain.GovApplier.ApplyGovTx`).
+
+**Wire format**:
+
+```json
+{
+  "kind": "authority-set",
+  "op":   "add",
+  "address": "CELLS1new-authority",
+  "effective_height": 15000,
+  "memo": "onboarding dave per board resolution 2026-04"
+}
+```
+
+`op ∈ {add, remove}`. `address` is bounded at
+`MaxAuthorityAddressLen=128` ASCII-printable bytes (no
+whitespace, no control bytes — addresses are compared as
+exact strings, so a sloppy trailing newline must reject).
+`effective_height` follows the same window as `param-set`:
+`[currentHeight, currentHeight + MaxActivationDelay]`.
+
+**M-of-N tally**:
+
+Each tx is one authority's VOTE on a proposal tuple
+`(op, address, effective_height)`. Different effective
+heights name different proposals, even for the same
+address. The chain accumulates votes in
+`pkg/governance/chainparams.AuthorityVoteStore`; the
+threshold computed at vote-application time is
+
+```
+threshold = max(1, N/2 + 1)
+```
+
+where `N` is the live AuthorityList size. So:
+
+| N | threshold | comment |
+|---|-----------|---------|
+| 1 | 1 | bootstrap: a single authority can act unilaterally |
+| 2 | 2 | unanimity |
+| 3 | 2 | simple majority |
+| 4 | 3 | strict majority |
+| 5 | 3 | strict majority |
+
+A captured single authority is no worse than the prior
+posture (they could already grief the chain). Past `N=1`,
+the strictly-greater-than-half rule keeps a captured
+minority from rotating themselves into majority.
+
+**Activation**:
+
+When the Mth vote crosses the threshold, the proposal is
+flagged `Crossed=true` (sticky — never un-crosses on
+subsequent votes). The post-seal `PromotePending(height)`
+hook then activates every Crossed proposal whose
+`effective_height` has been reached:
+
+- `add` → inserts the address into the live AuthorityList
+  under `authorityMu`. A subsequent param-set or
+  authority-set tx from the new authority is now eligible.
+- `remove` → drops the address from the AuthorityList.
+  ALSO drops every still-OPEN proposal's vote cast by the
+  removed authority; if a proposal loses its last voter
+  it is abandoned (an `authority-abandoned` event records
+  it). Then `RecomputeCrossed` re-evaluates open
+  proposals against the new (smaller) threshold — a
+  proposal that was one vote short under the old `N` may
+  now satisfy the smaller `N`.
+- `remove` that would empty the AuthorityList → REFUSED at
+  promotion. An `authority-rejected` event with reason
+  `authority_would_empty` is emitted; governance cannot
+  rotate itself into the disabled posture from on-chain.
+
+**Stateless validation** (admit gate):
+
+- `kind == authority-set`
+- `op ∈ {add, remove}`
+- `address` non-empty, ≤128 bytes, ASCII-printable
+- `effective_height > 0`
+- `len(memo) ≤ 256`
+- `Fee > 0` (nonce accounting)
+
+**Stateful validation** (applier):
+
+- `tx.Sender ∈ AuthorityList` (otherwise `ErrUnauthorized`)
+- `effective_height ∈ [currentHeight, currentHeight + MaxActivationDelay]`
+- For `op=add`: target NOT already on AuthorityList
+  (`ErrAuthorityAlreadyPresent`)
+- For `op=remove`: target IS on AuthorityList
+  (`ErrAuthorityNotPresent`)
+- `tx.Sender` has not voted on this proposal tuple before
+  (`ErrDuplicateVote`)
+
+**Events** (`chain.GovEventPublisher.PublishGovAuthority`):
+
+| Kind | When |
+|---|---|
+| `authority-voted` | fires once per accepted vote tx |
+| `authority-staged` | fires exactly once per proposal that crosses threshold |
+| `authority-activated` | fires when Promote applies the rotation |
+| `authority-abandoned` | fires when an open proposal loses its last voter |
+| `authority-rejected` | fires on every pre-mutation rejection |
+
+**Metrics** (`pkg/monitoring/gov_metrics.go`):
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `CELLS_gov_authority_voted_total` | counter | `op` | accepted vote txs per op |
+| `CELLS_gov_authority_crossed_total` | counter | `op` | threshold crossings per op |
+| `CELLS_gov_authority_activated_total` | counter | `op` | Promote-driven activations per op |
+| `CELLS_gov_authority_count` | gauge | — | current AuthorityList size |
+| `CELLS_gov_authority_rejected_total` | counter | `reason` | rejections by reason (already_present, not_present, would_empty, duplicate_vote, vote_rejected) |
+
+**Persistence**:
+
+Authority proposals + their voter sets ride along in the
+`pkg/governance/chainparams` snapshot file at
+`Config.GovParamStorePath` (snapshot version 2 — see
+the snapshot format above). A node crash between
+threshold-crossing and activation replays correctly: the
+restored proposal still carries `Crossed=true` and
+activates at its original `effective_height`.
+
+**CLI**:
+
+```
+CELLScli gov-helper propose-authority \
+    --op=add --address=CELLS1new \
+    --effective-height=15000 \
+    --memo="onboarding dave"
+```
+
+Emits the canonical-JSON `AuthoritySetPayload` to stdout
+(or `--out=PATH`); each authority runs this independently
+to produce their vote, then signs + submits via the
+operator's normal `CELLScli tx --contract-id=CELLS/gov/v1`
+pipeline. `CELLScli gov-helper inspect` decodes either
+payload kind transparently — it dispatches on the
+on-disk `kind` tag.
+
+### 9.5 Production boot wiring (`internal/v2wiring`)
+
+[`internal/v2wiring/v2wiring.go`](../../source/internal/v2wiring/v2wiring.go)
+constructs the entire v2 surface in one call ordered before
+`chain.NewBlockProducer`:
+
+- `enrollment.NewInMemoryState()` — registry source-of-truth.
+- `chain.NewEnrollmentApplier`, `chain.NewEnrollmentAwareApplier`.
+- `doublemining.NewProductionSlashingDispatcher`,
+  `chain.NewSlashApplier`, `aware.SetSlashApplier(...)` —
+  failure here is a hard boot error.
+- `monitoring.SetEnrollmentStateProvider(...)` — populates
+  the four `CELLS_enrollment_*` gauges.
+- `pool.SetAdmissionChecker(slashing.AdmissionChecker(
+  enrollment.AdmissionChecker(prev)))` — the stacked mempool
+  gate. Layer order: slashing > enrollment > base.
+- All HTTP `Set*` hooks (mempool, query registry, lister,
+  receipt store).
+
+Post-construction `Wired.AttachToProducer(bp)` closes the knot
+by setting `SetHeightFn` and `OnSealedBlock = SealedBlockHook(...)`.
+
+The 14-test suite in
+[`internal/v2wiring/v2wiring_test.go`](../../source/internal/v2wiring/v2wiring_test.go)
+is the contract `cmd/CELLS/main.go` must honour. Any drift
+between `Wire` and the production boot sequence is caught here,
+not on mainnet.
+
+### 9.6 Reference miner — `cmd/CELLSminer-console`
+
+Source: [`cmd/CELLSminer-console/`](../../source/cmd/CELLSminer-console/).
+This binary is the reference miner with the v2 attestation path
+(`--protocol=v2`). CELLS Hive bundles and drives it.
+
+Operational flow with `--protocol=v2`:
+
+1. `--gen-hmac-key=PATH` — produces a 0o600 hex key file and
+   prints the matching `CELLScli enroll …` snippet.
+2. `--setup` — opt-in v2 sub-wizard that drives operators
+   end-to-end through key generation → field collection → bond
+   command emission.
+3. `runLoop` fetches a fresh `/api/v1/mining/challenge`, builds
+   an `nvidia-hmac-v1` bundle via `pkg/mining/v2client`, and
+   submits a `Version=2` proof.
+4. The live console panel shows a `v2 NVIDIA` row carrying
+   `node`, `arch`, `attestations`, and `challenge=Ns ago` so
+   operators can spot freshness-window drift.
+5. A background `EnrollmentPoller` (default 30 s,
+   `--enrollment-poll`) queries
+   `/api/v1/mining/enrollment/{node_id}` and emits
+   `EvEnrollment` events; the panel paints `phase` / `stake` /
+   `slashable` and surfaces phase-transition events.
+6. A challenge-endpoint outage produces a clear `EvError` and
+   refuses to fall back to v1, preventing accidental v1
+   submissions to a forked validator.
+
+Coverage gated by `TestIntegration_RunLoop_v2_EndToEnd`.
+
+### 9.7 Observability
+
+The slashing applier and the enrollment applier emit two
+parallel observability streams, **both wired through a
+dependency-inverted seam (`chain.MetricsRecorder`,
+`chain.ChainEventPublisher`) so `pkg/chain` does not import
+`pkg/monitoring`** — that import cycle is what historically kept
+slashing observability under-instrumented. The seam is
+populated automatically when `pkg/monitoring` is loaded into a
+binary (`init()` in `pkg/monitoring/chain_recorder.go`); a
+binary that does not import `pkg/monitoring` falls back to
+`noopRecorder{}` and `NoopEventPublisher{}` and pays no
+overhead.
+
+#### 9.6.1 Prometheus metrics
+
+Exposed by `pkg/monitoring/prometheus_scrape.go` on
+`/api/metrics/prometheus`. Single-counter convention; deltas are
+the operator's responsibility.
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `CELLS_slash_applied_total` | counter | `kind` | Successful slash transitions per evidence kind. |
+| `CELLS_slash_drained_dust_total` | counter | `kind` | Dust drained from offenders. |
+| `CELLS_slash_rewarded_dust_total` | counter | — | Dust paid to slashers across all kinds. |
+| `CELLS_slash_burned_dust_total` | counter | — | Dust burned (not rewarded). |
+| `CELLS_slash_rejected_total` | counter | `reason` (`verifier_failed`, `evidence_replayed`, `node_not_enrolled`, `decode_failed`, `fee_invalid`, `wrong_contract`, `state_lookup_failed`, `stake_mutation_failed`, `other`) | Per-reason rejection. |
+| `CELLS_slash_auto_revoked_total` | counter | `reason` (`fully_drained`, `under_bonded`) | Auto-revokes (§8.2). |
+| `CELLS_enrollment_applied_total` | counter | — | Successful enroll txs. |
+| `CELLS_unenrollment_applied_total` | counter | — | Successful unenroll txs. |
+| `CELLS_enrollment_rejected_total` | counter | `reason` | Per-reason enroll rejection. |
+| `CELLS_unenrollment_rejected_total` | counter | `reason` (incl. `not_enrolled`) | Per-reason unenroll rejection. |
+| `CELLS_enrollment_unbond_swept_total` | counter | — | Matured unbond windows. |
+| `CELLS_enrollment_active_count` | gauge | — | Records where `Active() == true`. |
+| `CELLS_enrollment_bonded_dust` | gauge | — | Sum of `StakeDust` across active records. |
+| `CELLS_enrollment_pending_unbond_count` | gauge | — | Revoked records whose unbond window has not yet matured. |
+| `CELLS_enrollment_pending_unbond_dust` | gauge | — | Dust still locked in pending-unbond records. |
+
+Gauges are callback-driven via
+`monitoring.SetEnrollmentStateProvider(...)` — one mutex
+acquisition per scrape, O(n) in active miners. Without
+enrollment, the provider is unset and the gauges read 0.
+
+Alert rules: `deploy/observability/CELLS-mining-rules.yml`
+(checked by `promtool` in CI).
+
+#### 9.6.2 Structured events
+
+[`pkg/chain/events.go`](../../source/pkg/chain/events.go) defines
+`MiningSlashEvent` and `EnrollmentEvent`. Both are published via
+`ChainEventPublisher`; default is `NoopEventPublisher{}`.
+Production deployments attach a publisher (Kafka, NATS, on-chain
+log emitter, audit sink) at construction.
+`CompositePublisher` lets multiple sinks subscribe.
+
+Both layers share the same canonical reason-tag string set
+(`SlashRejectReason*`, `EnrollRejectReason*`) so a metric spike
+on `CELLS_slash_rejected_total{reason="evidence_replayed"}` maps
+1:1 onto the corresponding `MiningSlashEvent` records in the
+audit sink.
+
+---
+
+## 10. Activation mechanics — hard fork
+
+### 10.1 Summary
+
+Testnet reset at a coordinated wall-clock moment. Block 0 of v2
+is a fresh genesis committing: the v2 protocol version, the
+NVIDIA CC root material, the initial operator registry (empty),
+the deny-list (empty), and `MinEnrollStakeDust`.
+
+### 10.2 Genesis file extension
+
+`cmd/genesis-ceremony/main.go::Bundle` adds (at the end of the
+struct, so v1 fixtures deserialise zero-valued):
+
+```go
+SchemaVersion        int                     `json:"schema_version"`
+NvidiaCCRoots        []string                `json:"nvidia_cc_roots_pem"`
+NvidiaCCMinFirmware  map[string]string       `json:"nvidia_cc_min_fw"`
+OperatorRegistry     []RegistryEntry         `json:"operator_registry"`
+GPUDenyList          []string                `json:"gpu_deny_list"`
+MinEnrollStake       uint64                  `json:"min_enroll_stake_dust"`
+ForkV2Params         ForkV2Params            `json:"fork_v2_params"`
+```
+
+`SchemaVersion` goes from `1` (implicit) to `2`. `VerifyBundle`
+rejects a `SchemaVersion=2` bundle with zero-length
+`NvidiaCCRoots`.
+
+### 10.3 Pre-fork state disposition
+
+All pre-fork state is discarded. The v2 genesis block is height
+0. Pre-fork wallets are invalidated. Consistent with the
+2026-04-24 owner sign-off (§13.4) that the testnet has no real
+users.
+
+### 10.4 Miner binaries
+
+`cmd/CELLSminer-console` is the reference miner (§9.6). Future protocol changes will be announced in the changelog.
+
+---
+
+## 11. Attacker model
+
+### 11.1 In-scope threats
+
+1. **CPU-only miner.** Rejected by the attestation gate.
+2. **Non-NVIDIA hardware with forged `nvidia-smi` output.** The
+   verifier does not trust `nvidia-smi` output directly; it
+   checks a bundle bound to an enrolled `(node_id, gpu_uuid)`.
+   In the current HMAC path the key is public chain state, so
+   the HMAC is an enrollment/routing check, not proof of a
+   secret. Rewards still route to the enrolled owner, and one
+   node_id can only submit one accepted proof per block. This is
+   not slashable until asymmetric enrollment gives each miner a
+   private signing key and validators store only the public key.
+3. **Nonce replay.** Prevented by `FRESHNESS_WINDOW` and the
+   validator's nonce ring buffer (§6).
+4. **Stale proof.** Same mitigation.
+5. **Rogue validator accepting unattested proofs.** Such a
+   validator is in consensus minority if >50% honest, so its
+   proposed blocks lose in the PoE+BFT commit round. If it is
+   the honest majority, the chain has a bigger problem than the
+   attestation rule.
+6. **Sybil enrollment.** `MinEnrollStakeDust` puts a Cell cost
+   on creating many fake `node_id`s.
+7. **HMAC key leak / rental.** The key is already public through
+   chain state, so leak/rental is not the right security model.
+   The current protection is reward routing plus rate limits.
+   Signed enrollment can retain the operator public key behind a
+   fork gate. That gate is configured with
+   `mining_operator_public_key_retention_height` /
+   `CELLS_MINING_OPERATOR_PUBLIC_KEY_RETENTION_HEIGHT`. Proof
+   signature enforcement is configured separately with
+   `require_mining_operator_signatures` /
+   `CELLS_REQUIRE_MINING_OPERATOR_SIGNATURES` and must only be enabled
+   after validator operators agree on the retention height.
+
+### 11.2 Out-of-scope threats
+
+1. **NVIDIA CA compromise.** If NVIDIA's attestation root is
+   compromised, every NVIDIA-CC-based chain world-wide has a
+   problem. Mitigation: governance-driven root rotation via
+   chain-config delta.
+2. **Operator leaks their HMAC key publicly.** Revocable
+   on-chain. Before revocation clears, the attacker mines from
+   the operator's identity; the operator loses reputation and
+   staked Cell. The attacker cannot redirect rewards in
+   production because the verifier also requires
+   `miner_addr == EnrollmentRecord.Owner`; `miner_addr` being
+   HMAC-bound only prevents post-signature substitution.
+3. **Side-channel attack on an operator's TPM / key storage.**
+   Out of scope for consensus; same issue as every PoS chain's
+   validator key.
+
+---
+
+## 12. Deferred work register
+
+Work that v2 reserves wire-room for but does not yet ship.
+None of it blocks v2 activation; all of it is upgradable
+behind feature gates.
+
+### 12.1 Real-world `nvtrust` bundle framing for `nvidia-cc-v1`
+
+`pkg/mining/attest/cc/` ships a Go-native `cc.Bundle` shape
+that mirrors what an `nvtrust` quote contains (cert chain +
+AIK signature over the spec preimage + PCR-equivalent
+versions). The verifier flow (§3.2) is consensus-complete.
+What's deferred:
+
+- **NVIDIA-issued real-world test vectors.** Determinism in
+  `cc/testvectors.go` is enough for CI and protocol regression
+  testing, but a real H100 / B100 produces an AIK quote whose
+  on-the-wire framing is NVIDIA-proprietary. The seam to swap
+  in real `nvtrust` framing is a single `ParseBundle`
+  reimplementation; the verifier code does NOT change.
+- **Genesis-pinned NVIDIA root rotation.** `VerifierConfig.PinnedRoots`
+  is plumbed end-to-end; ratifying the actual NVIDIA-issued
+  Hopper/Blackwell root cert at v2 fork-time is a separate
+  governance decision.
+- **CC bundles from the miner.** Today only
+  `cmd/CELLSminer-console` produces v2 attestations, and it
+  produces `nvidia-hmac-v1` only.
+
+Hard external dependencies: NVIDIA NGC Attestation Service
+contract; physical Hopper / Blackwell GPU for swap-in
+test vectors. Estimated remaining work post-hardware: **~5
+days** (down from the original ~8 — verifier pipeline is
+already done).
+
+### 12.2 Proof-of-work changes
+
+Future protocol changes will be announced in the changelog.
+
+### 12.3 `freshness-cheat` slasher — verifier shipped, witness deferred
+
+Detects a proof whose `bundle.issued_at` is older than
+`FRESHNESS_WINDOW + grace` measured against the chain
+block-time of the inclusion height (i.e. retroactive evidence
+of validator collusion or clock skew). The verifier itself is
+**shipped** in
+[`pkg/mining/slashing/freshnesscheat`](../../source/pkg/mining/slashing/freshnesscheat/),
+along with a `CELLScli slash-helper freshness-cheat`
+subcommand that constructs evidence locally with full
+client-side validation.
+
+What is still deferred is the `BlockInclusionWitness`
+collaborator that authenticates the slasher's claimed
+`(height, block_time, proof_id)` tuple. Without BFT finality
+(or an equivalent quorum-attested block-header feed) there is
+no chain-internal way to certify such a tuple, so production
+binaries wire `freshnesscheat.RejectAllWitness{}`: the verifier
+runs all of its structural / staleness / registry-binding
+checks, then rejects the slash with a kind-specific
+`ErrEvidenceVerification` ("witness layer not configured").
+End-user behaviour matches the previous `StubVerifier` posture
+but with materially better diagnostics, and the path is fully
+exercised on testnets that wire
+`freshnesscheat.TrustingTestWitness{}`.
+
+Once BFT finality lands, a real `quorum.HeaderWitness` (or
+similar) implementation plugs into the same interface and
+freshness-cheat starts slashing for real with no other code
+changes.
+
+Estimated remaining work: **~2 days** to wire the
+quorum-header witness once the BFT pipeline exposes finalised
+headers.
+
+### 12.4 ~~`CELLS/gov/v1` runtime tuning hook~~ — SHIPPED
+
+`SlashApplier.RewardBPS` and `AutoRevokeMinStakeDust` are now
+governance-tunable at runtime via the `CELLS/gov/v1` transaction
+type. See §10 for the complete specification. A binary upgrade
+is no longer required to retune these economic parameters; an
+authority address on the configured `AuthorityList` submits a
+single signed gov tx and the change activates at a chosen
+future block height. The operator-facing HTTP read-API surface
+(`GET /api/v1/governance/params`,
+`GET /api/v1/governance/params/{name}`),
+the `CELLScli gov-helper params --remote` live-table render,
+and the `CELLScli watch params` event streamer are also
+**SHIPPED** — see §9.4 for the full surface.
+
+### 12.5 ~~Multisig-gated authority rotation~~ — SHIPPED
+
+The `CELLS/gov/v1` ContractID's `authority-set` payload kind
+ships as a second variant alongside `param-set`. Authorities
+rotate via on-chain M-of-N votes (threshold = `N/2 + 1`,
+minimum 1) on `(op, address, effective_height)` tuples;
+crossed proposals stage and activate at the chosen height,
+with full persistence across snapshots (snapshot version 2,
+backwards-compatible with v1) and a `CELLScli gov-helper
+propose-authority` CLI surface. See §9.4.7 for the full
+specification.
+
+---
+
+## 13. Historical decision record
+
+### 13.1 Trust-anchor model — RATIFIED
+
+> Tiered. NVIDIA-CC-pinned for Hopper / Blackwell Confidential
+> Computing GPUs, plus Registered-operator HMAC for consumer RTX
+> cards.
+
+Ratified 2026-04-24, project owner, in-chat decision. Spec
+revision: `6826bc4` of `MINING_PROTOCOL_V2_NVIDIA_LOCKED.md`
+(now superseded by this doc).
+
+Rationale:
+
+- Keeps consumer NVIDIA GPUs (Turing / Ampere / Ada) eligible to
+  mine. Without a consumer path the chain is effectively a
+  datacenter-only product.
+- Gives CC-capable datacenter GPUs a strictly stronger crypto
+  guarantee than the HMAC path. Operators who have paid for CC
+  hardware get the attestation value they paid for.
+- Implementation cost is manageable — both paths compose with
+  existing code (the HMAC path extends
+  `pkg/monitoring/nvidia_hmac.go`; the CC path uses `crypto/x509`
+  plus a pinned-root genesis extension).
+
+Two `Attestation.Type` values land: `nvidia-cc-v1` and
+`nvidia-hmac-v1`. Verifier dispatches on `Attestation.Type`.
+
+### 13.2 `MIN_ENROLL_STAKE` — RATIFIED
+
+> Initial enrollment stake required to register a
+> `(node_id, gpu_uuid, hmac_key)` tuple in the
+> `nvidia-hmac-v1` operator registry. Signed v2 enrollment can
+> additionally retain the operator ML-DSA public key behind its
+> fork gate.
+
+Ratified 2026-04-24: **10 CELL.** Encoded as
+`MinEnrollStake = 10 * 10^8` dust in the v2 genesis ceremony
+bundle.
+
+Rationale:
+
+- Low enough that a miner with roughly one day of pre-mining can
+  self-fund enrollment, which keeps onboarding accessible.
+- High enough that thousand-GPU Sybil enrollments cost
+  10,000 CELL locked for the unbonding window — comparable to the cost of
+  the GPUs themselves, so not a free attack.
+
+### 13.3 `FRESHNESS_WINDOW` — RATIFIED
+
+> Maximum age of an attestation nonce / issued-at timestamp
+> before a proof carrying it becomes stale.
+
+Ratified 2026-04-24: **60 seconds.**
+
+Rationale:
+
+- Short enough that a replayed bundle becomes invalid within one
+  block-production cycle.
+- Long enough that a miner on a slow residential link has time
+  to fetch a challenge, compute a proof, and submit it without
+  false-positive rejection.
+- Symmetric around the validator nonce ring-buffer retention
+  (`2 × FRESHNESS_WINDOW = 120 s`) which the spec defines for
+  same-challenge double-spend protection.
+
+### 13.4 Chain reset — RATIFIED
+
+The original spec deferred `FORK_V2_HEIGHT` to Phase 4. The
+2026-04-24 owner sign-off resolved it via the chain-reset path:
+v2 launches via genesis, so `FORK_V2_HEIGHT = 0`. Justification:
+the testnet has no real users, so resetting Cell balances has no
+custodial impact. Pre-fork wallets are invalidated.
+
+Future protocol changes will be announced in the changelog.
+
+### 13.5 Revocation
+
+These ratifications can be revisited at any time by a new
+sign-off recorded as an additional section here. Changing a
+ratified parameter after Phase 2 code has shipped may require
+corresponding code changes and should be coordinated with the
+existing activation plan.
+
+---
+
+## 14. Cross-references
+
+### 14.1 Source-of-truth Go files
+
+- Wire format + verifier:
+  - [`pkg/mining/proof.go`](../../source/pkg/mining/proof.go),
+    [`pkg/mining/verifier.go`](../../source/pkg/mining/verifier.go),
+    [`pkg/mining/fork.go`](../../source/pkg/mining/fork.go).
+- Attestation:
+  - [`pkg/mining/attest/dispatcher.go`](../../source/pkg/mining/attest/dispatcher.go).
+  - CC: [`pkg/mining/attest/cc/`](../../source/pkg/mining/attest/cc/)
+    (`bundle.go`, `verifier.go`, `testvectors.go`, `stub.go`).
+  - HMAC: [`pkg/mining/attest/hmac/`](../../source/pkg/mining/attest/hmac/)
+    (`bundle.go`, `verifier.go`).
+  - Challenge crypto: [`pkg/mining/challenge/`](../../source/pkg/mining/challenge/).
+- Enrollment:
+  - [`pkg/mining/enrollment/`](../../source/pkg/mining/enrollment/)
+    (`types.go`, `registry.go`, `admit.go`, `stats_test.go`,
+    `revoke_underbonded_test.go`).
+  - Chain-side applier: [`pkg/chain/enrollment_apply.go`](../../source/pkg/chain/enrollment_apply.go),
+    [`pkg/chain/enrollment_aware_applier.go`](../../source/pkg/chain/enrollment_aware_applier.go).
+- Slashing:
+  - Data model: [`pkg/mining/slashing/types.go`](../../source/pkg/mining/slashing/types.go).
+  - Concrete verifiers:
+    [`pkg/mining/slashing/forgedattest/`](../../source/pkg/mining/slashing/forgedattest/),
+    [`pkg/mining/slashing/doublemining/`](../../source/pkg/mining/slashing/doublemining/).
+  - Production dispatcher:
+    [`pkg/mining/slashing/production.go`](../../source/pkg/mining/slashing/production.go).
+  - Mempool admission:
+    [`pkg/mining/slashing/admit.go`](../../source/pkg/mining/slashing/admit.go).
+  - Chain-side applier:
+    [`pkg/chain/slash_apply.go`](../../source/pkg/chain/slash_apply.go),
+    [`pkg/chain/slash_receipts.go`](../../source/pkg/chain/slash_receipts.go).
+- HTTP:
+  - [`pkg/api/handlers.go`](../../source/pkg/api/handlers.go),
+    [`pkg/api/handlers_enrollment.go`](../../source/pkg/api/handlers_enrollment.go),
+    [`pkg/api/handlers_slashing.go`](../../source/pkg/api/handlers_slashing.go),
+    [`pkg/api/handlers_slash_query.go`](../../source/pkg/api/handlers_slash_query.go),
+    [`pkg/api/handlers_enrollment_query.go`](../../source/pkg/api/handlers_enrollment_query.go),
+    [`pkg/api/handlers_enrollment_list.go`](../../source/pkg/api/handlers_enrollment_list.go).
+- CLI: [`cmd/CELLScli/`](../../source/cmd/CELLScli/)
+  (`mining.go`, `slash_helper.go`, `slash_helper_test.go`).
+- Reference miner:
+  [`cmd/CELLSminer-console/`](../../source/cmd/CELLSminer-console/)
+  (`v2.go`, `enrollment_poller.go`, `v2_integration_test.go`).
+- Production wiring:
+  [`internal/v2wiring/`](../../source/internal/v2wiring/)
+  (`v2wiring.go`, `v2wiring_test.go`); consumed by
+  [`cmd/CELLS/main.go`](../../source/cmd/CELLS/main.go).
+- Observability:
+  [`pkg/chain/events.go`](../../source/pkg/chain/events.go),
+  [`pkg/monitoring/chain_recorder.go`](../../source/pkg/monitoring/chain_recorder.go),
+  [`pkg/monitoring/slashing_metrics.go`](../../source/pkg/monitoring/slashing_metrics.go),
+  [`pkg/monitoring/enrollment_metrics.go`](../../source/pkg/monitoring/enrollment_metrics.go),
+  [`pkg/monitoring/enrollment_state_provider.go`](../../source/pkg/monitoring/enrollment_state_provider.go),
+  [`pkg/monitoring/prometheus_scrape.go`](../../source/pkg/monitoring/prometheus_scrape.go).
+
+### 14.2 Other docs
+
+- v1 spec: [`MINING_PROTOCOL.md`](./MINING_PROTOCOL.md) (frozen).
+- Miner quick start:
+  [`MINER_QUICKSTART.md`](./MINER_QUICKSTART.md).
+- Validator quick start:
+  [`VALIDATOR_QUICKSTART.md`](./VALIDATOR_QUICKSTART.md).
+- Node roles: [`NODE_ROLES.md`](./NODE_ROLES.md).
+- Cell tokenomics:
+  [`CELL_TOKENOMICS.md`](./CELL_TOKENOMICS.md).
+- NVIDIA-lock consensus scope:
+  [`NVIDIA_LOCK_CONSENSUS_SCOPE.md`](./NVIDIA_LOCK_CONSENSUS_SCOPE.md).
+- Phase 0 retirement decision: commit `19e756a`.
+
+### 14.3 Superseded predecessors (kept as redirect stubs)
+
+- [`MINING_PROTOCOL_V2_NVIDIA_LOCKED.md`](./MINING_PROTOCOL_V2_NVIDIA_LOCKED.md)
+  — original Phase-1 design draft.
+- [`MINING_PROTOCOL_V2_RATIFICATION.md`](./MINING_PROTOCOL_V2_RATIFICATION.md)
+  — 2026-04-24 owner sign-off (now §13 here).
+- [`MINING_PROTOCOL_V2_TIER3_SCOPE.md`](./MINING_PROTOCOL_V2_TIER3_SCOPE.md)
+  — rolling shipped-vs-deferred status doc (now folded into
+  §§5–12 here).

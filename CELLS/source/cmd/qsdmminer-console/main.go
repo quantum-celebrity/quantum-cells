@@ -1,0 +1,2011 @@
+// Command CELLSminer-console is the miner-friendly console front-end for
+// the CELLS / Cell CPU reference miner. It is a sibling of cmd/CELLSminer,
+// not a replacement: CELLSminer is intentionally minimal so it can be
+// audited line-by-line against MINING_PROTOCOL.md, while this binary
+// layers a live stats panel, an interactive first-run wizard, and
+// persistent config on top of the same pkg/mining primitives.
+//
+// Usage overview:
+//
+//	CELLSminer-console               # runs wizard on first use, then mines
+//	CELLSminer-console --setup       # forces the wizard even with a saved
+//	                                # config
+//	CELLSminer-console --plain       # disables the live panel; emits a
+//	                                # plain log line per event (useful in
+//	                                # systemd / journalctl / CI)
+//	CELLSminer-console --self-test   # in-memory solve-and-verify; exits 0
+//	                                # on success, same gate as
+//	                                # CELLSminer --self-test
+//
+// Config is persisted to:
+//
+//	Linux/macOS: ~/.CELLS/miner.toml
+//	Windows:     %USERPROFILE%\.CELLS\miner.toml
+//
+// Flags override the config file for the current run without rewriting
+// it. The file is written 0o600 on POSIX because it contains a reward
+// address — not a secret, but still linkable to the operator.
+//
+// This binary does NOT do anything the protocol would consider new. It
+// fetches /api/v1/mining/work, solves with pkg/mining.Solve, and POSTs
+// /api/v1/mining/submit — exactly the cmd/CELLSminer flow. The difference
+// is ergonomics: a user who runs `CELLSminer-console` with no flags gets
+// a setup wizard instead of a cryptic "--address is required" error.
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"math/big"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/blackbeardONE/CELLS/pkg/api"
+	"github.com/blackbeardONE/CELLS/pkg/branding"
+	"github.com/blackbeardONE/CELLS/pkg/buildinfo"
+	"github.com/blackbeardONE/CELLS/pkg/mining"
+	"github.com/blackbeardONE/CELLS/pkg/mining/preflight"
+	"github.com/blackbeardONE/CELLS/pkg/mining/v2client"
+	"golang.org/x/term"
+)
+
+// binaryName is the exec name we advertise via --version. See
+// pkg/buildinfo.String for the full format. Kept const so a renamed
+// binary still identifies itself consistently in bug reports.
+const binaryName = "CELLSminer-console"
+
+// -----------------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------------
+
+// Config is persisted to ~/.CELLS/miner.toml. Every field is optional
+// for forward-compatibility — an older binary reading a newer file
+// must not refuse to start, and a newer binary reading an older file
+// must fall back to sensible defaults. Add new fields with a
+// `toml:",omitempty"` tag only if their zero value is a valid choice;
+// otherwise supply an explicit default in loadConfig.
+type Config struct {
+	ValidatorURL string `toml:"validator_url"`
+	RewardAddr   string `toml:"reward_address"`
+	BatchCount   uint32 `toml:"batch_count"`
+	PollInterval string `toml:"poll_interval"`
+	Plain        bool   `toml:"plain"`
+	// ComputeBackend controls proof search. "cuda" requires the companion
+	// CELLS-miner-cuda-solver; "cpu" retains the audit/reference path; "auto"
+	// selects CUDA when the helper is installed and otherwise uses CPU.
+	ComputeBackend string `toml:"compute_backend,omitempty"`
+	CUDASolverPath string `toml:"cuda_solver_path,omitempty"`
+	CUDABatchSize  uint64 `toml:"cuda_batch_size,omitempty"`
+
+	// ChallengeURLs, when non-empty, replaces the default
+	// "fetch from validator_url only" challenge-fetch policy
+	// with a round-robin / failover sweep across this list.
+	// Each entry is a base URL (no trailing slash) of either
+	// the validator itself or a peer attester (cmd/CELLS-attester).
+	// validator_url is automatically prepended to the list at
+	// runtime — operators only need to specify the EXTRA peer
+	// attesters they want the miner to use, not the validator
+	// itself. Empty (or omitted) preserves pre-existing
+	// behaviour: pull challenges only from validator_url.
+	ChallengeURLs []string `toml:"challenge_urls,omitempty"`
+
+	// v2 NVIDIA-locked protocol fields. All ignored unless
+	// Protocol is exactly "v2" (case-insensitive). See v2.go
+	// for the full resolution + validation logic. Fields are
+	// ,omitempty so miner.toml files written by the v1 wizard
+	// stay clean — only operators who have already enrolled
+	// and edited the file ever see these keys.
+	Protocol               string `toml:"protocol,omitempty"`
+	NodeID                 string `toml:"node_id,omitempty"`
+	GPUUUID                string `toml:"gpu_uuid,omitempty"`
+	GPUName                string `toml:"gpu_name,omitempty"`
+	GPUArch                string `toml:"gpu_arch,omitempty"`
+	ComputeCap             string `toml:"compute_cap,omitempty"`
+	CUDAVersion            string `toml:"cuda_version,omitempty"`
+	DriverVer              string `toml:"driver_ver,omitempty"`
+	HMACKeyPath            string `toml:"hmac_key_path,omitempty"`
+	OperatorKeystorePath   string `toml:"operator_keystore_path,omitempty"`
+	OperatorPassphraseFile string `toml:"operator_passphrase_file,omitempty"`
+
+	// AllowV1 lets the operator opt-OUT of the preflight gate that
+	// otherwise refuses to start a v1 miner against a v2-active
+	// validator. The intended use is a local devnet or audit chain
+	// that wired SetForkV2Height(math.MaxUint64) on purpose; on a
+	// production validator (e.g. api.CELLS.tech) every submitted
+	// v1 proof is rejected at the verifier with ReasonBadVersion,
+	// so this override is operator-shoot-foot territory.
+	//
+	// Defaults to false — the safest posture is to refuse rather
+	// than spin wheels on guaranteed-reject proofs. Set explicitly
+	// to true via miner.toml or pass --allow-v1 on the CLI.
+	AllowV1 bool `toml:"allow_v1,omitempty"`
+}
+
+// v2Config is the subset of Config that LoadV2Context needs.
+// Factored so the v2 helper can be unit-tested without a full
+// miner.toml fixture.
+func (c Config) v2Config() V2Config {
+	return V2Config{
+		Protocol:               c.Protocol,
+		NodeID:                 c.NodeID,
+		GPUUUID:                c.GPUUUID,
+		GPUName:                c.GPUName,
+		GPUArch:                c.GPUArch,
+		ComputeCap:             c.ComputeCap,
+		CUDAVersion:            c.CUDAVersion,
+		DriverVer:              c.DriverVer,
+		HMACKeyPath:            c.HMACKeyPath,
+		OperatorKeystorePath:   c.OperatorKeystorePath,
+		OperatorPassphraseFile: c.OperatorPassphraseFile,
+	}
+}
+
+func (c Config) pollDuration() time.Duration {
+	if c.PollInterval == "" {
+		return 2 * time.Second
+	}
+	d, err := time.ParseDuration(c.PollInterval)
+	if err != nil || d <= 0 {
+		return 2 * time.Second
+	}
+	return d
+}
+
+func defaultConfigPath() string {
+	// UserHomeDir is honored cross-platform by the stdlib. On Windows
+	// this resolves to %USERPROFILE%\.CELLS\miner.toml which is where
+	// other tooling (nvidia sidecar log dir, etc.) already expects CELLS
+	// operator state to live.
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		// Fallback to CWD so the binary still runs on systems with a
+		// weird HOME (e.g. locked-down Windows service accounts).
+		return ".CELLS-miner.toml"
+	}
+	return filepath.Join(home, ".CELLS", "miner.toml")
+}
+
+func loadConfig(path string) (Config, error) {
+	var c Config
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return c, nil
+	}
+	if err != nil {
+		return c, fmt.Errorf("read %s: %w", path, err)
+	}
+	if _, err := toml.Decode(string(b), &c); err != nil {
+		return c, fmt.Errorf("decode %s: %w", path, err)
+	}
+	return c, nil
+}
+
+func saveConfig(path string, c Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "# %s console miner config — saved %s\n", branding.Name, time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintln(&buf, "# Edit by hand or re-run `CELLSminer-console --setup` to replace.")
+	if err := toml.NewEncoder(&buf).Encode(c); err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+	// 0o600 on POSIX; Windows ignores the perms but the restrictive
+	// mode also documents intent to future readers.
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Events — the mining loop emits one Event per state change; the
+// renderer consumes them and updates either the live panel (console
+// mode) or a plain log line (--plain mode or non-TTY stdout).
+// Decoupling the loop from the output lets us test each side in
+// isolation.
+// -----------------------------------------------------------------------------
+
+type EventKind int
+
+const (
+	EvConnecting EventKind = iota
+	EvConnected
+	EvEpochChanged
+	EvDAGReady
+	EvProofAccepted
+	EvProofRejected
+	EvError
+	EvInfo
+	EvShutdown
+
+	// EvV2ChallengeOK is emitted by runLoop after a successful
+	// v2 challenge fetch + HMAC bundle build, immediately before
+	// the proof is submitted. Carries the challenge issue time
+	// in IssuedAt so the dashboard can show how fresh the bundle
+	// is. Only emitted when V2Context.IsEnabled() is true.
+	EvV2ChallengeOK
+
+	// EvEnrollment is emitted by the EnrollmentPoller after
+	// every successful poll cycle (Phase populated) AND on phase
+	// transitions detected between cycles. Only emitted when
+	// V2Context.IsEnabled() is true and the operator hasn't
+	// disabled the poller via --enrollment-poll=0. The Enrollment
+	// field carries the freshly-polled status; the Message field
+	// carries a human-readable summary suitable for plain-mode
+	// log lines.
+	EvEnrollment
+
+	// EvIdlePaused is emitted by the runLoop when --idle-only
+	// detects the GPU is busy and gates a mining iteration. The
+	// Message field carries a short reason ("GPU busy at 73%")
+	// that the dashboard surfaces in the "Status" row. Mirrored
+	// by EvIdleResumed when the GPU goes back below the
+	// threshold for the configured grace period.
+	EvIdlePaused
+
+	// EvIdleResumed is emitted by the runLoop after a paused
+	// state transitions back to "GPU idle, mining will resume on
+	// the next iteration." Used so the dashboard / plain log
+	// can clearly mark the bracketing of an idle window without
+	// the operator having to diff GPU% snapshots.
+	EvIdleResumed
+)
+
+type Event struct {
+	Kind    EventKind
+	At      time.Time
+	Message string
+
+	// Populated for EvEpochChanged / EvDAGReady.
+	Epoch   uint64
+	DAGSize uint32
+
+	// Populated for EvProofAccepted / EvProofRejected.
+	Height   uint64
+	Attempts uint64
+	ProofID  string
+	Reason   string // rejection reason or HTTP error detail
+
+	// Populated for EvV2ChallengeOK.
+	// IssuedAt is the validator-reported challenge issue time
+	// (Unix seconds). The dashboard uses (now - IssuedAt) to
+	// display "challenge age" as a sanity check that we're
+	// staying inside mining.FreshnessWindow.
+	IssuedAt int64
+
+	// Populated for EvEnrollment. Carries the most recent
+	// EnrollmentStatus from the poller. Other event kinds
+	// leave this as the zero value.
+	Enrollment EnrollmentStatus
+}
+
+// -----------------------------------------------------------------------------
+// Dashboard state — the source of truth that the renderer paints from.
+// applyEvent is the only mutation path and is covered by tests.
+// -----------------------------------------------------------------------------
+
+type Dashboard struct {
+	StartedAt    time.Time
+	Validator    string
+	Address      string
+	Status       string // connecting, connected, error
+	StatusDetail string
+	Epoch        uint64
+	DAGReady     bool
+	DAGSize      uint32
+	Accepted     uint64
+	Rejected     uint64
+	LastEvent    string
+	LastEventAt  time.Time
+
+	// v2 NVIDIA-locked fields, populated only when the runtime
+	// V2Context is enabled. Zero values render as "—" so the
+	// v1 path's panel layout is unchanged. V2NodeID is set once
+	// at boot from V2Context; the rest mutate as the loop runs.
+	V2Enabled            bool
+	V2NodeID             string
+	V2GPUArch            string
+	V2LastChallengeAt    time.Time // wall time we built the bundle
+	V2LastChallengeIssue int64     // validator-reported issued_at
+	V2Attestations       uint64    // count of successful v2 prepares
+
+	// V2Enrollment* fields are populated by EvEnrollment events
+	// from the background EnrollmentPoller. Zero values render
+	// as "—" so a panel with the poller disabled (e.g.
+	// --enrollment-poll=0) still paints cleanly.
+	V2EnrollmentPhase     EnrollmentPhase
+	V2EnrollmentStakeDust uint64
+	V2EnrollmentSlashable bool
+	V2EnrollmentLastPoll  time.Time
+	V2EnrollmentError     string
+
+	// IdlePaused reflects --idle-only state: true when the most
+	// recent gating decision was "GPU busy, sit this one out".
+	// IdleReason carries the human string the panel surfaces
+	// (e.g. "GPU busy at 73%, waiting for 60s of idle"). Zero
+	// values render as the unchanged operator-friendly status
+	// when --idle-only isn't enabled.
+	IdlePaused bool
+	IdleReason string
+}
+
+func (d *Dashboard) applyEvent(e Event) {
+	d.LastEvent = e.Message
+	d.LastEventAt = e.At
+	switch e.Kind {
+	case EvConnecting:
+		d.Status = "connecting"
+		d.StatusDetail = e.Message
+	case EvConnected:
+		d.Status = "connected"
+		d.StatusDetail = ""
+	case EvEpochChanged:
+		d.Epoch = e.Epoch
+		d.DAGSize = e.DAGSize
+		d.DAGReady = false
+	case EvDAGReady:
+		d.DAGReady = true
+	case EvProofAccepted:
+		d.Accepted++
+	case EvProofRejected:
+		d.Rejected++
+	case EvError:
+		d.Status = "error"
+		d.StatusDetail = e.Message
+	case EvV2ChallengeOK:
+		// Wall-clock-driven so the panel can show "12s ago"
+		// without depending on the validator's clock; the
+		// IssuedAt field is the validator-side check.
+		d.V2LastChallengeAt = e.At
+		d.V2LastChallengeIssue = e.IssuedAt
+		d.V2Attestations++
+	case EvEnrollment:
+		// One-shot copy of the polled status — the renderer
+		// reads these fields directly so it never has to call
+		// back into the poller. LastPolledAt comes from the
+		// poller's wall clock (the moment the cycle finished),
+		// which the dashboard surfaces verbatim.
+		d.V2EnrollmentPhase = e.Enrollment.Phase
+		d.V2EnrollmentStakeDust = e.Enrollment.StakeDust
+		d.V2EnrollmentSlashable = e.Enrollment.Slashable
+		d.V2EnrollmentLastPoll = e.Enrollment.LastPolledAt
+		d.V2EnrollmentError = e.Enrollment.LastError
+	case EvIdlePaused:
+		d.IdlePaused = true
+		d.IdleReason = e.Message
+	case EvIdleResumed:
+		d.IdlePaused = false
+		d.IdleReason = ""
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Formatting helpers — kept pure so they're trivially unit-testable.
+// -----------------------------------------------------------------------------
+
+// formatHashrate picks a human-friendly unit. A reference CPU miner
+// rarely exceeds 10–20 H/s, so we only ladder up to KH/s for safety
+// on unusually fast hardware; anything higher is already out of
+// scope for a CPU reference implementation.
+func formatHashrate(hps float64) string {
+	switch {
+	case hps >= 1_000_000:
+		return fmt.Sprintf("%.2f MH/s", hps/1_000_000)
+	case hps >= 1_000:
+		return fmt.Sprintf("%.2f KH/s", hps/1_000)
+	default:
+		return fmt.Sprintf("%.2f  H/s", hps)
+	}
+}
+
+// formatDuration renders uptime as HH:MM:SS; >= 1 day adds a "Nd"
+// prefix. Keep this monotonic so the rightmost digits never widen
+// the panel mid-session (important because the renderer does not
+// repaint the full frame — it overwrites lines in place).
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	days := int(d / (24 * time.Hour))
+	d -= time.Duration(days) * 24 * time.Hour
+	h := int(d / time.Hour)
+	d -= time.Duration(h) * time.Hour
+	m := int(d / time.Minute)
+	d -= time.Duration(m) * time.Minute
+	s := int(d / time.Second)
+	if days > 0 {
+		return fmt.Sprintf("%dd %02d:%02d:%02d", days, h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+// truncateAddr keeps the wallet prefix and last 4 chars visible,
+// collapsing the middle with a single-char ellipsis. Miners glance at
+// this field to confirm they're crediting the right address; an
+// untruncated 50-char string would wrap the panel on narrow terminals.
+func truncateAddr(a string) string {
+	const keepHead = 8
+	const keepTail = 4
+	if len(a) <= keepHead+keepTail+1 {
+		return a
+	}
+	return a[:keepHead] + "\u2026" + a[len(a)-keepTail:]
+}
+
+// -----------------------------------------------------------------------------
+// Renderer — console (TTY) and plain (log) modes share the same Event
+// stream. The console renderer uses ANSI escapes and rewrites the last
+// N lines in place; this is deliberately simpler and more portable
+// than full ncurses / tcell and degrades gracefully under `tee` /
+// `journalctl`.
+// -----------------------------------------------------------------------------
+
+type renderer interface {
+	Render(d *Dashboard, hps float64)
+	Event(e Event)
+	Close()
+}
+
+// plainRenderer just prints a timestamped line per Event. Suitable
+// for --plain, CI, and systemd journal redirection.
+type plainRenderer struct{ w io.Writer }
+
+func (p *plainRenderer) Render(_ *Dashboard, _ float64) {}
+func (p *plainRenderer) Event(e Event) {
+	fmt.Fprintf(p.w, "%s %s %s\n",
+		e.At.UTC().Format("15:04:05"), kindLabel(e.Kind), e.Message)
+}
+func (p *plainRenderer) Close() {}
+
+func kindLabel(k EventKind) string {
+	switch k {
+	case EvConnecting:
+		return "[conn]"
+	case EvConnected:
+		return "[ok]  "
+	case EvEpochChanged:
+		return "[epoch]"
+	case EvDAGReady:
+		return "[dag] "
+	case EvProofAccepted:
+		return "[PASS]"
+	case EvProofRejected:
+		return "[FAIL]"
+	case EvError:
+		return "[err] "
+	case EvShutdown:
+		return "[bye] "
+	case EvV2ChallengeOK:
+		return "[v2]  "
+	case EvEnrollment:
+		return "[enrl]"
+	case EvIdlePaused:
+		return "[idle]"
+	case EvIdleResumed:
+		return "[mine]"
+	default:
+		return "[info]"
+	}
+}
+
+// consoleRenderer maintains a 14-line panel at the bottom of the
+// terminal. Each Render call rewrites those 14 lines using
+// "\x1b[14A\r" (cursor up 14, carriage return) and "\x1b[K" (clear to
+// end of line) per row. The first render prints 14 blank lines to
+// reserve the space, so the cursor-up is always well-defined.
+type consoleRenderer struct {
+	w           io.Writer
+	firstRender bool
+	lines       int // number of lines the panel occupies
+	v2          bool
+}
+
+func newConsoleRenderer(w io.Writer) *consoleRenderer {
+	return &consoleRenderer{w: w, firstRender: true, lines: 14}
+}
+
+// newConsoleRendererV2 reserves three extra lines for the v2
+// status rows (NVIDIA + enrollment) + a single spacer.
+// Choosing the line count once at construction (rather than
+// re-flowing per Render) keeps the "cursor up N, repaint N"
+// idiom intact — variable-height panels would race against
+// any concurrent scroll, e.g. a stderr deprecation banner
+// appearing mid-run.
+func newConsoleRendererV2(w io.Writer) *consoleRenderer {
+	return &consoleRenderer{w: w, firstRender: true, lines: 17, v2: true}
+}
+
+const (
+	ansiReset  = "\x1b[0m"
+	ansiBold   = "\x1b[1m"
+	ansiDim    = "\x1b[2m"
+	ansiGreen  = "\x1b[32m"
+	ansiYellow = "\x1b[33m"
+	ansiRed    = "\x1b[31m"
+	ansiCyan   = "\x1b[36m"
+	ansiClrEol = "\x1b[K"
+)
+
+func (c *consoleRenderer) Render(d *Dashboard, hps float64) {
+	var buf bytes.Buffer
+	if c.firstRender {
+		// Reserve the vertical real estate for the panel.
+		for i := 0; i < c.lines; i++ {
+			buf.WriteByte('\n')
+		}
+		c.firstRender = false
+	}
+	// Move cursor up to the top of the panel.
+	fmt.Fprintf(&buf, "\x1b[%dA\r", c.lines)
+
+	writeLine := func(s string) {
+		buf.WriteString(s)
+		buf.WriteString(ansiClrEol)
+		buf.WriteByte('\n')
+	}
+
+	statusColor := ansiYellow
+	statusLabel := d.Status
+	switch d.Status {
+	case "connected":
+		statusColor = ansiGreen
+	case "error":
+		statusColor = ansiRed
+	}
+	// --idle-only takes visual priority over the protocol
+	// status: a paused miner that says "[connected]" misleads
+	// the operator into thinking proofs are flowing when they
+	// aren't. The pause is benign so the row is shown in cyan
+	// (informational), not red (error).
+	if d.IdlePaused {
+		statusColor = ansiCyan
+		statusLabel = "paused (GPU busy)"
+	}
+
+	uptime := formatDuration(time.Since(d.StartedAt))
+	dagLabel := "building…"
+	if d.DAGReady {
+		dagLabel = fmt.Sprintf("ready · N=%d", d.DAGSize)
+	}
+
+	writeLine(ansiBold + "  " + branding.Name + " miner console " + ansiReset + ansiDim + "· protocol v" + itoa(mining.ProtocolVersion) + ansiReset)
+	writeLine(ansiDim + "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500" + ansiReset)
+	writeLine(fmt.Sprintf("  %-16s %s", "Reward address", truncateAddr(d.Address)))
+	writeLine(fmt.Sprintf("  %-16s %s  %s%s%s", "Validator", d.Validator, statusColor, "["+statusLabel+"]", ansiReset))
+	switch {
+	case d.IdlePaused && d.IdleReason != "":
+		writeLine(fmt.Sprintf("  %-16s %s%s%s", "", ansiDim, d.IdleReason, ansiReset))
+	case d.StatusDetail != "":
+		writeLine(fmt.Sprintf("  %-16s %s%s%s", "", ansiDim, d.StatusDetail, ansiReset))
+	default:
+		writeLine("")
+	}
+	writeLine(fmt.Sprintf("  %-16s %d  (DAG %s)", "Epoch", d.Epoch, dagLabel))
+	writeLine("")
+	writeLine(fmt.Sprintf("  %-16s %s", "Hashrate", formatHashrate(hps)))
+	writeLine(fmt.Sprintf("  %-16s %s%d%s accepted, %s%d%s rejected",
+		"Proofs",
+		ansiGreen, d.Accepted, ansiReset,
+		ansiYellow, d.Rejected, ansiReset))
+	writeLine(fmt.Sprintf("  %-16s %s", "Uptime", uptime))
+	writeLine("")
+	lastEvtAge := ""
+	if !d.LastEventAt.IsZero() {
+		lastEvtAge = fmt.Sprintf(" (%s ago)", shortAge(time.Since(d.LastEventAt)))
+	}
+	writeLine(fmt.Sprintf("  %-16s %s%s", "Last event", truncateForLine(d.LastEvent, 80), lastEvtAge))
+	if c.v2 {
+		v2Line := formatV2Line(d)
+		writeLine(fmt.Sprintf("  %-16s %s%s%s", "v2 NVIDIA", ansiCyan, v2Line, ansiReset))
+		enrollColor, enrollLine := formatV2EnrollLine(d)
+		writeLine(fmt.Sprintf("  %-16s %s%s%s", "v2 enroll", enrollColor, enrollLine, ansiReset))
+		writeLine("")
+	}
+	writeLine("")
+	writeLine(ansiDim + "  Ctrl-C to stop. Config: " + ansiReset + ansiCyan + os.Getenv("CELLS_MINER_CONFIG_DISPLAY") + ansiReset)
+	_, _ = c.w.Write(buf.Bytes())
+}
+
+// formatV2Line renders the single-row v2 summary that the
+// console panel paints. Pure helper, easy to unit-test:
+//
+//	"node=alice-rtx4090-01 arch=ada attestations=42 challenge=12s ago"
+//
+// When no challenge has been built yet the age column reads
+// "—" so the operator can spot a v2-enabled miner that's
+// stuck before the first prepare.
+func formatV2Line(d *Dashboard) string {
+	node := d.V2NodeID
+	if node == "" {
+		node = "—"
+	}
+	arch := d.V2GPUArch
+	if arch == "" {
+		arch = "—"
+	}
+	age := "—"
+	if !d.V2LastChallengeAt.IsZero() {
+		age = shortAge(time.Since(d.V2LastChallengeAt)) + " ago"
+	}
+	return fmt.Sprintf("node=%s arch=%s attestations=%d challenge=%s",
+		node, arch, d.V2Attestations, age)
+}
+
+// formatV2EnrollLine renders the single-row enrollment summary
+// the console panel paints beneath formatV2Line. Returns the
+// ANSI color prefix the row should be drawn in plus the body
+// text — colored separately so a "revoked" state pops in red
+// without forcing the whole row through string concatenation
+// at the call site.
+//
+// Layout:
+//
+//	"phase=active stake=10.000 CELL slashable=yes polled=12s ago"
+//
+// Pre-first-poll the line shows "phase=— polled=—" so the
+// operator can tell the poller hasn't ticked yet vs polled-but-
+// got-error.
+//
+// LastError is appended in dim grey when set, so a "validator
+// unreachable" state stays visible without dominating the row.
+func formatV2EnrollLine(d *Dashboard) (string, string) {
+	color := ansiCyan
+	phase := string(d.V2EnrollmentPhase)
+	if phase == "" {
+		phase = "—"
+	}
+	switch d.V2EnrollmentPhase {
+	case PhaseActive:
+		color = ansiGreen
+	case PhasePending:
+		color = ansiYellow
+	case PhaseRevoked, PhaseNotFound:
+		color = ansiRed
+	}
+	stake := "—"
+	if d.V2EnrollmentLastPoll.IsZero() {
+		stake = "—"
+	} else {
+		stake = formatStakeDust(d.V2EnrollmentStakeDust)
+	}
+	slashable := "—"
+	if !d.V2EnrollmentLastPoll.IsZero() {
+		if d.V2EnrollmentSlashable {
+			slashable = "yes"
+		} else {
+			slashable = "no"
+		}
+	}
+	polled := "—"
+	if !d.V2EnrollmentLastPoll.IsZero() {
+		polled = shortAge(time.Since(d.V2EnrollmentLastPoll)) + " ago"
+	}
+	body := fmt.Sprintf("phase=%s stake=%s slashable=%s polled=%s",
+		phase, stake, slashable, polled)
+	if d.V2EnrollmentError != "" {
+		// Dim the trailing error so the operator's eye stays
+		// on the structured fields. The truncate cap (60) is
+		// the same width budget the "Last event" row uses;
+		// going wider would push the panel past 80 cols on
+		// narrow terminals.
+		body += " " + ansiDim + "(" + truncateForLine(d.V2EnrollmentError, 60) + ")" + ansiReset
+	}
+	return color, body
+}
+
+// formatStakeDust renders a CELL stake amount from raw dust.
+// 1 CELL = 1e9 dust per pkg/chain/units.go. Three decimals are
+// enough granularity for the dashboard — operators who want
+// exact dust can read it from `CELLScli enrollment-status`.
+//
+// We avoid pulling pkg/chain/units into the miner binary just
+// for one constant; instead the divisor is duplicated as a
+// const here with a comment pointing back to the source of
+// truth. If the chain ever changes the dust scale this miner
+// would print a stale unit, but the test suite asserts on the
+// formatted string so a regression there fires CI.
+func formatStakeDust(dust uint64) string {
+	const cellPerDust = 1_000_000_000.0
+	cells := float64(dust) / cellPerDust
+	return fmt.Sprintf("%.3f CELL", cells)
+}
+
+func (c *consoleRenderer) Event(_ Event) {
+	// Event stream is applied into Dashboard state by the owner and
+	// then Render is called; nothing extra to print here.
+}
+
+func (c *consoleRenderer) Close() {
+	// Drop a newline so the shell prompt lands cleanly below the panel.
+	fmt.Fprintln(c.w)
+}
+
+// Short uint-to-string helper so the renderer can splice
+// mining.ProtocolVersion (a uint32) into the panel banner without
+// pulling strconv.
+func itoa(n uint32) string { return fmt.Sprintf("%d", n) }
+
+// shortAge renders "3s", "12m", "4h" etc. so "Last event" line stays
+// narrow enough to fit on the right side of the panel.
+func shortAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d/time.Second))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	default:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	}
+}
+
+func defaultValidatorURL() string {
+	for _, key := range []string{"CELLS_MINER_DEFAULT_VALIDATOR_URL", "CELLS_PUBLIC_API_BASE_URL"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return strings.TrimRight(value, "/")
+		}
+	}
+	return "https://api.CELLS.tech"
+}
+
+func truncateForLine(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max < 4 {
+		return s[:max]
+	}
+	return s[:max-1] + "\u2026"
+}
+
+// -----------------------------------------------------------------------------
+// Setup wizard
+// -----------------------------------------------------------------------------
+
+// runSetup is the interactive first-run flow. It asks for the reward
+// address and validator URL, pre-filling from any existing config so a
+// repeated --setup just bumps the values. The wizard is stdin-only —
+// no TUI framework, no readline — so it works equally well on a
+// headless VPS, a Windows console host, and a CI stdin pipe.
+func runSetup(path string, cur Config) (Config, error) {
+	fmt.Printf("%s — setting up %s console miner\n", branding.Name, branding.CoinName)
+	fmt.Println("Answers are saved to", path)
+	fmt.Println("Press Enter to accept the [default] shown in brackets.")
+	fmt.Println()
+
+	validator := prompt("Validator URL",
+		orDefault(cur.ValidatorURL, defaultValidatorURL()))
+	validator = strings.TrimRight(strings.TrimSpace(validator), "/")
+
+	addr := prompt("Reward address ("+branding.CoinSymbol+")",
+		cur.RewardAddr)
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return cur, errors.New("reward address must not be empty")
+	}
+
+	batch := promptUint("Batch count per proof", uint32OrDefault(cur.BatchCount, 1))
+	poll := prompt("Poll interval (e.g. 2s, 500ms)",
+		orDefault(cur.PollInterval, "2s"))
+
+	newCfg := Config{
+		ValidatorURL: validator,
+		RewardAddr:   addr,
+		BatchCount:   batch,
+		PollInterval: poll,
+		Plain:        cur.Plain,
+
+		// Carry forward the v2 fields untouched. The v2 sub-
+		// wizard below (opt-in) is the only path that mutates
+		// them, so an operator re-running --setup just to bump
+		// the validator URL doesn't lose their existing v2
+		// configuration.
+		Protocol:               cur.Protocol,
+		NodeID:                 cur.NodeID,
+		GPUUUID:                cur.GPUUUID,
+		GPUName:                cur.GPUName,
+		GPUArch:                cur.GPUArch,
+		ComputeCap:             cur.ComputeCap,
+		CUDAVersion:            cur.CUDAVersion,
+		DriverVer:              cur.DriverVer,
+		HMACKeyPath:            cur.HMACKeyPath,
+		OperatorKeystorePath:   cur.OperatorKeystorePath,
+		OperatorPassphraseFile: cur.OperatorPassphraseFile,
+	}
+
+	// Optional v2 sub-wizard. We ask up-front because the
+	// protocol mode shapes everything else (key file, node id,
+	// gpu metadata) and operators who skip it cleanly drop into
+	// the unchanged v1 path. Default is "no" so a returning v1
+	// user just hits Enter and gets the legacy flow.
+	defaultV2 := "no"
+	if strings.EqualFold(cur.Protocol, "v2") {
+		defaultV2 = "yes"
+	}
+	wantV2 := strings.EqualFold(strings.TrimSpace(prompt(
+		"Enable v2 NVIDIA-locked protocol? (yes/no)", defaultV2)), "yes")
+	if wantV2 {
+		updated, err := runV2SetupSubwizard(filepath.Dir(path), newCfg)
+		if err != nil {
+			return cur, fmt.Errorf("v2 setup: %w", err)
+		}
+		newCfg = updated
+	} else if strings.EqualFold(cur.Protocol, "v2") {
+		// Operator explicitly opted out of v2 in this re-run;
+		// scrub the protocol so the next start runs v1.
+		newCfg.Protocol = ""
+	}
+
+	if err := saveConfig(path, newCfg); err != nil {
+		return cur, err
+	}
+	fmt.Printf("\nSaved %s\n", path)
+	if strings.EqualFold(newCfg.Protocol, "v2") {
+		printEnrollHint(newCfg)
+	}
+	return newCfg, nil
+}
+
+// runV2SetupSubwizard prompts the operator for the v2-only
+// fields, generating a fresh HMAC key on disk if one isn't
+// already configured. Defaults are pre-filled from the
+// (possibly v1-only) Config we were called with so a re-run
+// of --setup converges idempotently.
+//
+// The wizard MUST NOT abort on missing nvidia-smi or other
+// host introspection; we deliberately ask the operator to
+// type the GPU UUID rather than calling out to the binary.
+// nvidia-smi may not be in PATH on a fresh host, and shelling
+// out from the wizard would force a CGO-or-exec dependency
+// just for "save four strings to a TOML file".
+//
+// Default key location is <configDir>/hmac.key — same dir as
+// the config so backups copy them atomically.
+func runV2SetupSubwizard(configDir string, cur Config) (Config, error) {
+	defaultKeyPath := filepath.Join(configDir, "hmac.key")
+	keyPath := strings.TrimSpace(prompt(
+		"HMAC key file path",
+		orDefault(cur.HMACKeyPath, defaultKeyPath)))
+	if keyPath == "" {
+		return cur, errors.New("HMAC key path must not be empty")
+	}
+
+	// Auto-generate the file if it doesn't exist. We don't ask
+	// "do you want to generate?" because the only operators who
+	// hit "no" here are those who already wrote a key elsewhere,
+	// and they would have typed that other path at the prompt.
+	if _, err := os.Stat(keyPath); errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("  no key at %s — generating a fresh 32-byte HMAC key…\n", keyPath)
+		if _, err := GenerateHMACKeyFile(keyPath); err != nil {
+			return cur, fmt.Errorf("generate hmac key: %w", err)
+		}
+		fmt.Printf("  wrote %s (0o600)\n", keyPath)
+	} else if err != nil {
+		return cur, fmt.Errorf("stat hmac key: %w", err)
+	} else {
+		fmt.Printf("  reusing existing key at %s (will not overwrite)\n", keyPath)
+	}
+
+	nodeID := strings.TrimSpace(prompt("NodeID (operator-chosen tag)",
+		orDefault(cur.NodeID, "")))
+	if nodeID == "" {
+		return cur, errors.New("NodeID must not be empty")
+	}
+	gpuUUID := strings.TrimSpace(prompt("GPU UUID (`nvidia-smi -L`)", cur.GPUUUID))
+	if gpuUUID == "" {
+		return cur, errors.New("GPU UUID must not be empty")
+	}
+	gpuArch := strings.ToLower(strings.TrimSpace(prompt(
+		"GPU arch (ada/ampere/hopper/blackwell)",
+		orDefault(cur.GPUArch, "ada"))))
+	gpuName := strings.TrimSpace(prompt(
+		"GPU human-readable name", cur.GPUName))
+	computeCap := strings.TrimSpace(prompt(
+		"CUDA compute capability (optional, e.g. 8.9)", cur.ComputeCap))
+	cudaVersion := strings.TrimSpace(prompt(
+		"CUDA toolkit/runtime version (optional, e.g. 12.8)", cur.CUDAVersion))
+	driverVer := strings.TrimSpace(prompt(
+		"NVIDIA driver version (optional, e.g. 572.16)", cur.DriverVer))
+	operatorKeystorePath := strings.TrimSpace(prompt(
+		"Operator keystore for signed proofs (optional)", cur.OperatorKeystorePath))
+	operatorPassphraseFile := strings.TrimSpace(prompt(
+		"Operator passphrase file for signed proofs (optional)", cur.OperatorPassphraseFile))
+	if operatorKeystorePath != "" && operatorPassphraseFile == "" {
+		return cur, errors.New("operator passphrase file is required when operator keystore is set")
+	}
+
+	cur.Protocol = "v2"
+	cur.NodeID = nodeID
+	cur.GPUUUID = gpuUUID
+	cur.GPUArch = gpuArch
+	cur.GPUName = gpuName
+	cur.ComputeCap = computeCap
+	cur.CUDAVersion = cudaVersion
+	cur.DriverVer = driverVer
+	cur.HMACKeyPath = keyPath
+	cur.OperatorKeystorePath = operatorKeystorePath
+	cur.OperatorPassphraseFile = operatorPassphraseFile
+	return cur, nil
+}
+
+// printEnrollHint prints a copy-pasteable `CELLScli enroll`
+// command for the operator to run once their reward address
+// has 10 CELL on-chain. The HMAC key bytes are read fresh
+// from disk so the snippet is always in sync with what the
+// miner will sign with.
+//
+// We deliberately do NOT submit the enroll transaction
+// automatically. Bonding 10 CELL is a real on-chain side
+// effect; making it a manual step keeps the wizard
+// idempotent and lets ops review the snippet against any
+// internal change-control process.
+func printEnrollHint(cfg Config) {
+	keyHex := ""
+	if raw, err := os.ReadFile(cfg.HMACKeyPath); err == nil {
+		keyHex = strings.TrimSpace(string(raw))
+	}
+	fmt.Println()
+	fmt.Println("v2 mining is enabled in the config. To bond your key on-chain, run:")
+	fmt.Println()
+	fmt.Printf("  CELLScli enroll \\\n")
+	fmt.Printf("    --validator %s \\\n", cfg.ValidatorURL)
+	fmt.Printf("    --sender   %s \\\n", cfg.RewardAddr)
+	if cfg.OperatorKeystorePath != "" {
+		fmt.Printf("    --in       %s \\\n", cfg.OperatorKeystorePath)
+	}
+	if cfg.OperatorPassphraseFile != "" {
+		fmt.Printf("    --passphrase-file %s \\\n", cfg.OperatorPassphraseFile)
+	}
+	fmt.Printf("    --node-id  %s \\\n", cfg.NodeID)
+	fmt.Printf("    --gpu-uuid %s \\\n", cfg.GPUUUID)
+	if keyHex != "" {
+		fmt.Printf("    --hmac-key %s\n", keyHex)
+	} else {
+		fmt.Printf("    --hmac-key <hex from %s>\n", cfg.HMACKeyPath)
+	}
+	fmt.Println()
+	fmt.Println("After the enroll tx is mined, restart `CELLSminer-console` to begin v2 mining.")
+}
+
+func prompt(label, def string) string {
+	if def != "" {
+		fmt.Printf("  %s [%s]: ", label, def)
+	} else {
+		fmt.Printf("  %s: ", label)
+	}
+	var line string
+	if _, err := fmt.Scanln(&line); err != nil {
+		// Scanln returns io.EOF on an empty line — treat as "accept
+		// default". Any other error (e.g. pipe closed) is also
+		// treated as an empty answer so the wizard doesn't crash on
+		// a detached stdin.
+		line = ""
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return def
+	}
+	return line
+}
+
+func promptUint(label string, def uint32) uint32 {
+	s := prompt(label, fmt.Sprintf("%d", def))
+	var v uint32
+	_, err := fmt.Sscanf(s, "%d", &v)
+	if err != nil || v == 0 {
+		return def
+	}
+	return v
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func uint32OrDefault(v, def uint32) uint32 {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
+// printNvidiaLockDeprecationBanner emits a one-time notice to the
+// given writer warning operators that the CPU reference miner will
+// be retired when the NVIDIA-locked v2 protocol activates. The
+// design is documented in nvidia_locked_CELLS_blockchain_architecture.md
+// at the repo root.
+//
+// Writes go to stderr (not stdout) so piping the miner's stdout to
+// a log-aggregator stays clean. The banner is deliberately framed
+// as informational, not as a fatal precondition — the binary still
+// works end-to-end against pre-v2 validators, which is what the
+// testnet currently runs.
+func printNvidiaLockDeprecationBanner(w io.Writer) {
+	fmt.Fprintln(w, "┌─────────────────────────────────────────────────────────────────────┐")
+	fmt.Fprintln(w, "│  CELLSminer-console: NVIDIA-lock pivot in progress                   │")
+	fmt.Fprintln(w, "│                                                                     │")
+	fmt.Fprintln(w, "│  CELLS is moving to a GPU-only protocol (see                         │")
+	fmt.Fprintln(w, "│  nvidia_locked_CELLS_blockchain_architecture.md). Once the       │")
+	fmt.Fprintln(w, "│  v2 hard fork activates, CPU proofs will NOT be accepted on         │")
+	fmt.Fprintln(w, "│  mainnet. This binary is kept for testnet replay + reference.       │")
+	fmt.Fprintln(w, "│  Plan your deployment around an NVIDIA CUDA GPU.                    │")
+	fmt.Fprintln(w, "└─────────────────────────────────────────────────────────────────────┘")
+}
+
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
+
+// main is the kernel-facing entrypoint. On non-Windows platforms it
+// is a thin wrapper that calls realMain with a background context.
+// On Windows, when launched by the Service Control Manager, main
+// hands control to the SCM dispatcher (see service_windows.go) which
+// in turn calls realMain with a context that is cancelled on
+// SCM-stop. This split lets the entire mining loop's shutdown path
+// stay unchanged: it always sees a single context that ends on
+// either Ctrl-C, SIGTERM, or SCM Stop/Shutdown.
+func main() {
+	if handled, code := runWindowsServiceIfNeeded(realMain); handled {
+		os.Exit(code)
+	}
+	if handled, code := handoffWindowsServiceIfNeeded(os.Args[1:]); handled {
+		os.Exit(code)
+	}
+	os.Exit(realMain(context.Background()))
+}
+
+// realMain is the former contents of main, restructured to take an
+// ancestor context (so a Windows-service supervisor can cancel it)
+// and to return an exit code instead of os.Exit'ing. Every
+// "fmt.Fprintf(os.Stderr, ...) + os.Exit(N)" pair has been turned
+// into "fmt.Fprintf + return N", which is mechanically equivalent
+// for the interactive path and lets the service path observe a
+// real exit code rather than a process death.
+func realMain(parentCtx context.Context) int {
+	var (
+		configPath     = flag.String("config", defaultConfigPath(), "path to the miner config file")
+		validatorURL   = flag.String("validator", "", "override config: validator base URL")
+		rewardAddr     = flag.String("address", "", "override config: reward address")
+		setup          = flag.Bool("setup", false, "force the interactive setup wizard then exit (or continue mining after)")
+		plain          = flag.Bool("plain", false, "disable the live console panel; log one line per event instead")
+		selfTest       = flag.Bool("self-test", false, "run an in-memory solve-and-verify and exit 0 on success")
+		batchCount     = flag.Uint("batch-count", 0, "override config: batches claimed per proof (0 = use config)")
+		pollInterval   = flag.Duration("poll", 0, "override config: work-poll interval (0 = use config)")
+		httpTimeout    = flag.Duration("http-timeout", 30*time.Second, "per-request HTTP timeout")
+		showVersion    = flag.Bool("version", false, "print build metadata (release tag, git SHA, build date, runtime) and exit")
+		computeBackend = flag.String("compute-backend", "", "proof solver: cuda, cpu, or auto (default uses config, then auto)")
+		cudaSolverPath = flag.String("cuda-solver", "", "path to CELLS-miner-cuda-solver (default: beside this executable)")
+		cudaBatchSize  = flag.Uint64("cuda-batch-size", 0, "CUDA nonce attempts per kernel launch (default 65536)")
+
+		// v2 NVIDIA-locked protocol flags. See v2.go. All empty
+		// by default; passing --protocol=v2 activates the path
+		// and makes the remaining fields required. Kept in a
+		// separate group in --help output via the comment so
+		// operators who aren't on v2 yet aren't confused.
+		protocol               = flag.String("protocol", "", "override config: 'v2' enables NVIDIA-locked attestation, default (empty) keeps v1")
+		nodeID                 = flag.String("node-id", "", "v2 only: enrolled node_id (matches pkg/mining/enrollment record)")
+		gpuUUID                = flag.String("gpu-uuid", "", "v2 only: nvidia-smi GPU UUID matching the enrollment record")
+		gpuName                = flag.String("gpu-name", "", "v2 only: human-readable GPU name (e.g. 'NVIDIA GeForce RTX 4090')")
+		gpuArch                = flag.String("gpu-arch", "", "v2 only: GPU arch tag (ada/ampere/hopper/blackwell)")
+		computeCap             = flag.String("compute-cap", "", "v2 only: CUDA compute capability (e.g. '8.9')")
+		cudaVersion            = flag.String("cuda-version", "", "v2 only: CUDA toolkit/runtime version (e.g. '12.8')")
+		driverVer              = flag.String("driver-ver", "", "v2 only: NVIDIA driver version (e.g. '572.16')")
+		hmacKeyPath            = flag.String("hmac-key-path", "", "v2 only: path to a file containing the operator HMAC key as a single line of hex")
+		operatorKeystorePath   = flag.String("operator-keystore", "", "v2 only: CELLS keystore used to add operator signatures (default: ~/.CELLS/wallet.json when passphrase file is set)")
+		operatorPassphraseFile = flag.String("operator-passphrase-file", "", "v2 only: file containing the operator keystore passphrase for unattended proof signing")
+		genHMACKey             = flag.String("gen-hmac-key", "", "generate a fresh 32-byte HMAC key, write it as hex to this path (0o600), print the matching CELLScli enroll snippet, and exit")
+		enrollPoll             = flag.Duration("enrollment-poll", DefaultEnrollmentPollInterval, "v2 only: cadence the background poller re-fetches the on-chain enrollment record (set to 0 to disable; <5s rounded up to 5s)")
+
+		// --allow-v1 is the operator override for the preflight
+		// gate. We expose it via flag and via the persistent
+		// miner.toml field AllowV1 — the OR of the two wins. The
+		// flag's primary use case is one-off audit / replay runs
+		// where the operator does not want to touch their saved
+		// config. See preflight package for the gate semantics.
+		allowV1 = flag.Bool("allow-v1", false, "override preflight: run v1 even if the validator reports v2 active (devnet / replay only — every proof will be rejected on a v2 chain)")
+	)
+	// Consumer-grade flags: --idle-only, --service, --log-file.
+	// Registered through service.go so the existing operator-flag
+	// block above stays focused on protocol / mining knobs and
+	// the new consumer surface is reviewable as one block.
+	consumer := &ConsumerFlags{}
+	RegisterConsumerFlags(flag.CommandLine, consumer)
+
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintf(out, "%s — friendly console miner (MINING_PROTOCOL.md v%d)\n\n", branding.FullTitle(), mining.ProtocolVersion)
+		fmt.Fprintf(out, "Run with no flags to use the saved config. First run opens a setup wizard.\n\n")
+		fmt.Fprintf(out, "Usage: %s [flags]\n\nFlags:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	// --apply-staged-update is an explicit one-shot operator
+	// command and must beat every other short-circuit (--version,
+	// --self-test, --gen-hmac-key) — those flags interrogate the
+	// CURRENT binary, but if the operator typed
+	// --apply-staged-update they want the NEW binary to do
+	// whatever else they asked for. ApplyStaged either re-execs
+	// (control never returns) or os.Exits with an explanatory
+	// stderr line; we treat any returned error as fatal.
+	if consumer.ApplyStaged {
+		if _, err := applyStagedUpdateAtStartup(consumer); err != nil {
+			fmt.Fprintf(os.Stderr, "CELLSminer: apply staged update: %v\n", err)
+			return 1
+		}
+	}
+
+	// --version is handled before config load / wizard / any side
+	// effect, so it's usable on a fresh host that doesn't yet have a
+	// miner.toml. Same contract as cmd/CELLSminer and cmd/trustcheck.
+	if *showVersion {
+		fmt.Println(buildinfo.String(binaryName))
+		return 0
+	}
+
+	if *selfTest {
+		if err := runSelfTest(); err != nil {
+			fmt.Fprintf(os.Stderr, "self-test FAILED: %v\n", err)
+			return 1
+		}
+		fmt.Println("self-test OK: proof solved and verified end-to-end via pkg/mining")
+		return 0
+	}
+
+	// --gen-hmac-key path runs before any config / wizard side
+	// effect so it works on a fresh host. The flag value is the
+	// destination file for the new key. The exit-on-success keeps
+	// the command machine-friendly: a script that wants to
+	// generate, enroll, then start mining can chain the calls.
+	if *genHMACKey != "" {
+		key, err := GenerateHMACKeyFile(*genHMACKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gen-hmac-key: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Wrote 32-byte HMAC key (hex) to %s\n", *genHMACKey)
+		fmt.Println("Permissions: 0o600 (POSIX) / restrict via NTFS ACLs on Windows.")
+		fmt.Println()
+		fmt.Println("Next: bond the key on-chain so validators will accept your v2 proofs.")
+		fmt.Println("Example (replace placeholders):")
+		fmt.Printf("  CELLScli enroll \\\n")
+		fmt.Printf("    --validator %s \\\n", defaultValidatorURL())
+		fmt.Printf("    --sender   <YOUR_REWARD_ADDRESS> \\\n")
+		fmt.Printf("    --node-id  <NODE_ID>          \\\n")
+		fmt.Printf("    --gpu-uuid <GPU_UUID>         \\\n")
+		fmt.Printf("    --hmac-key %s\n", hex.EncodeToString(key))
+		fmt.Println()
+		fmt.Println("Then start mining with:")
+		fmt.Printf("  CELLSminer-console --protocol=v2 --hmac-key-path=%s \\\n", *genHMACKey)
+		fmt.Println("    --node-id=<NODE_ID> --gpu-uuid=<GPU_UUID> --gpu-arch=<ada|ampere|hopper|blackwell>")
+		return 0
+	}
+
+	// Implicit auto-update apply hook: when --auto-update is on
+	// (so the operator has opted into the update flow) AND a
+	// staged update is sitting next to us, we re-exec into the
+	// new binary now and never reach the rest of main(). The new
+	// process picks up its own config, opens its own log files,
+	// and prints its own banner — leaving us free to do all
+	// of those things normally if no swap was needed.
+	//
+	// This runs AFTER the --version / --self-test / --gen-hmac-key
+	// short-circuits because those are deliberate one-shot
+	// commands; surprising a `--version` invocation with a binary
+	// swap would be the wrong UX. The explicit
+	// --apply-staged-update path above DOES win over those
+	// short-circuits — that is the operator's "I want the swap
+	// even though I also typed --version" override.
+	if !consumer.ApplyStaged {
+		if _, err := applyStagedUpdateAtStartup(consumer); err != nil {
+			fmt.Fprintf(os.Stderr, "CELLSminer: apply staged update: %v\n", err)
+			return 1
+		}
+	}
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+		return 1
+	}
+
+	// --service / --log-file rewires stdout+stderr to a
+	// rotating log file BEFORE any banner / status text is
+	// printed, so a service operator's log file starts with
+	// the deprecation banner rather than a missing one.
+	plainOverride, logCloser, err := applyServiceMode(consumer, &cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "service log: %v\n", err)
+		return 1
+	}
+	defer logCloser.Close()
+
+	// Deprecation banner — printed on every real mining run
+	// EXCEPT under --service. In service mode the operator has
+	// opted into a long-running unattended process and a 10-line
+	// box-drawing banner per restart adds noise to the log
+	// rotation budget. --version / --self-test stay banner-free
+	// so they remain machine-parseable for CI / docker inspect.
+	if !consumer.Service {
+		printNvidiaLockDeprecationBanner(os.Stderr)
+	}
+
+	// The setup wizard runs when: the user explicitly asked; OR the
+	// config lacks the two minimum fields AND no CLI override has
+	// supplied them. This avoids pushing a wizard at someone who is
+	// scripting the miner via flags.
+	needSetup := *setup || (cfg.RewardAddr == "" && *rewardAddr == "")
+	if needSetup {
+		newCfg, err := runSetup(*configPath, cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "setup: %v\n", err)
+			return 1
+		}
+		cfg = newCfg
+		if *setup && !cliWantsContinue() {
+			return 0
+		}
+	}
+
+	// CLI flags win over config so an operator can temporarily point
+	// at a different validator without editing miner.toml.
+	if *validatorURL != "" {
+		cfg.ValidatorURL = strings.TrimRight(*validatorURL, "/")
+	}
+	if *rewardAddr != "" {
+		cfg.RewardAddr = *rewardAddr
+	}
+	if *batchCount > 0 {
+		cfg.BatchCount = uint32(*batchCount)
+	}
+	if *pollInterval > 0 {
+		cfg.PollInterval = pollInterval.String()
+	}
+	if *computeBackend != "" {
+		cfg.ComputeBackend = strings.ToLower(strings.TrimSpace(*computeBackend))
+	}
+	if *cudaSolverPath != "" {
+		cfg.CUDASolverPath = strings.TrimSpace(*cudaSolverPath)
+	}
+	if *cudaBatchSize > 0 {
+		cfg.CUDABatchSize = *cudaBatchSize
+	}
+	if cfg.BatchCount == 0 {
+		cfg.BatchCount = 1
+	}
+	if cfg.ComputeBackend == "" {
+		cfg.ComputeBackend = "auto"
+	}
+	if cfg.CUDABatchSize == 0 {
+		cfg.CUDABatchSize = defaultCUDABatchSize
+	}
+
+	// v2 overrides: CLI wins over config file, same as v1. We
+	// deliberately overwrite empty flags too — keep passing
+	// --node-id="" means "clear the config-file node_id" which
+	// is a legal way to scrub a stale value without editing
+	// miner.toml by hand. Only non-zero flags actually
+	// overwrite; see flag.Visit check below.
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "protocol":
+			cfg.Protocol = *protocol
+		case "node-id":
+			cfg.NodeID = *nodeID
+		case "gpu-uuid":
+			cfg.GPUUUID = *gpuUUID
+		case "gpu-name":
+			cfg.GPUName = *gpuName
+		case "gpu-arch":
+			cfg.GPUArch = *gpuArch
+		case "compute-cap":
+			cfg.ComputeCap = *computeCap
+		case "cuda-version":
+			cfg.CUDAVersion = *cudaVersion
+		case "driver-ver":
+			cfg.DriverVer = *driverVer
+		case "hmac-key-path":
+			cfg.HMACKeyPath = *hmacKeyPath
+		case "operator-keystore":
+			cfg.OperatorKeystorePath = *operatorKeystorePath
+		case "operator-passphrase-file":
+			cfg.OperatorPassphraseFile = *operatorPassphraseFile
+		}
+	})
+
+	// Build the v2 context exactly once, at startup, so any
+	// misconfiguration aborts before we start burning cycles
+	// on a doomed mining loop. When Protocol != "v2" this
+	// returns a disabled context (no error) and the miner runs
+	// the v1 path unchanged.
+	v2ctx, err := LoadV2Context(cfg.v2Config())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "v2 protocol config: %v\n", err)
+		return 2
+	}
+	if v2ctx.IsEnabled() {
+		fmt.Fprintln(os.Stderr, "CELLSminer-console: v2 NVIDIA-locked protocol ENABLED (--protocol=v2)")
+		fmt.Fprintf(os.Stderr, "  node_id  = %s\n", v2ctx.NodeID)
+		fmt.Fprintf(os.Stderr, "  gpu_uuid = %s\n", v2ctx.GPUUUID)
+		if v2ctx.GPUName != "" {
+			fmt.Fprintf(os.Stderr, "  gpu_name = %s\n", v2ctx.GPUName)
+		}
+		if v2ctx.GPUArch != "" {
+			fmt.Fprintf(os.Stderr, "  gpu_arch = %s\n", v2ctx.GPUArch)
+		}
+		if v2ctx.OperatorSigner != nil {
+			fmt.Fprintf(os.Stderr, "  operator_signature = enabled (%s)\n", v2ctx.OperatorSigner.Address)
+		}
+	}
+
+	if cfg.ValidatorURL == "" {
+		fmt.Fprintln(os.Stderr, "no validator_url set — run `CELLSminer-console --setup` first")
+		return 2
+	}
+	if cfg.RewardAddr == "" {
+		fmt.Fprintln(os.Stderr, "no reward_address set — run `CELLSminer-console --setup` first")
+		return 2
+	}
+
+	// Preflight check against the configured validator. The point
+	// of this gate is to catch the most common operator footgun
+	// observed in v0.3.1: a fresh install runs `CELLSminer-console`
+	// without --protocol=v2 against api.CELLS.tech, spends CPU
+	// cycles producing v1 proofs, and gets every submission
+	// rejected with ReasonBadVersion. We refuse to even start the
+	// loop in that case unless --allow-v1 is set.
+	//
+	// On a probe failure (network, parse error) the function
+	// returns DecisionProceedV{1,2} with a descriptive ProbeErr
+	// so a degraded /api/v1/status doesn't lock out local devnet
+	// usage — see preflight.decisionWhenProbeFailed.
+	{
+		preflightHTTPTimeout := 10 * time.Second
+		if *httpTimeout > 0 && *httpTimeout < preflightHTTPTimeout {
+			preflightHTTPTimeout = *httpTimeout
+		}
+		preflightCtx, preflightCancel := context.WithTimeout(parentCtx, preflightHTTPTimeout)
+		preflightClient := &http.Client{Timeout: preflightHTTPTimeout}
+		decision := preflight.Check(preflightCtx, preflightClient, cfg.ValidatorURL, v2ctx.IsEnabled())
+		preflightCancel()
+		fmt.Fprintln(os.Stderr, preflight.FormatDecision(decision, cfg.AllowV1 || *allowV1))
+		if decision.Decision == preflight.DecisionRefuseV1 && !(cfg.AllowV1 || *allowV1) {
+			fmt.Fprintln(os.Stderr, "Pass --allow-v1 to override (intended for local audit / devnet only), or pass --protocol=v2 with an enrolled NVIDIA GPU.")
+			return 3
+		}
+	}
+
+	// Renderer choice: --plain forces plain; --service / --log-file
+	// also forces plain because their target stdout is a rotating
+	// log file, not a terminal. Otherwise we autodetect via the
+	// stdlib TTY check — piping to `tee` / `journalctl` should
+	// never emit ANSI escapes.
+	usePanel := !*plain && !cfg.Plain && !plainOverride && term.IsTerminal(int(os.Stdout.Fd()))
+
+	// Stash the config path so the panel footer can display it.
+	// Using an env var keeps the renderer free of config-path
+	// plumbing; tests that don't set the env see an empty footer.
+	_ = os.Setenv("CELLS_MINER_CONFIG_DISPLAY", *configPath)
+
+	// Compose the master shutdown context. The interactive caller
+	// passes context.Background() and gets the classic Ctrl-C +
+	// SIGTERM behaviour. The Windows SCM dispatcher passes a ctx
+	// that's also cancelled on SCM Stop/Shutdown, so a `Stop-Service
+	// CELLSMiner` is exactly equivalent to Ctrl-C here.
+	ctx, cancel := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	var cudaBackend *cudaSolver
+	selectedBackend := strings.ToLower(strings.TrimSpace(cfg.ComputeBackend))
+	if selectedBackend != "cpu" && selectedBackend != "cuda" && selectedBackend != "auto" {
+		fmt.Fprintf(os.Stderr, "invalid compute_backend %q; expected cuda, cpu, or auto\n", cfg.ComputeBackend)
+		return 2
+	}
+	if selectedBackend == "cuda" || selectedBackend == "auto" {
+		helperPath, helperErr := resolveCUDASolverPath(cfg.CUDASolverPath)
+		if helperErr == nil {
+			cudaBackend, helperErr = startCUDASolver(ctx, helperPath)
+		}
+		if helperErr != nil && selectedBackend == "cuda" {
+			fmt.Fprintf(os.Stderr, "CUDA proof solver required: %v\n", helperErr)
+			return 4
+		}
+		if helperErr != nil {
+			fmt.Fprintf(os.Stderr, "CELLSminer-console: CUDA unavailable; using explicit CPU reference fallback: %v\n", helperErr)
+		}
+	}
+	if cudaBackend != nil {
+		defer cudaBackend.Close()
+		fmt.Fprintf(os.Stderr, "  compute_backend = cuda-sha3\n")
+		fmt.Fprintf(os.Stderr, "  cuda_device = %s (compute capability %s)\n", cudaBackend.DeviceName(), cudaBackend.ComputeCapability())
+		fmt.Fprintf(os.Stderr, "  cuda_batch_size = %d nonce attempts\n", cfg.CUDABatchSize)
+	} else {
+		fmt.Fprintln(os.Stderr, "  compute_backend = cpu-reference")
+	}
+
+	var rend renderer
+	if usePanel {
+		if v2ctx.IsEnabled() {
+			rend = newConsoleRendererV2(os.Stdout)
+		} else {
+			rend = newConsoleRenderer(os.Stdout)
+		}
+	} else {
+		rend = &plainRenderer{w: os.Stdout}
+	}
+	defer rend.Close()
+
+	dash := &Dashboard{
+		StartedAt: time.Now(),
+		Validator: cfg.ValidatorURL,
+		Address:   cfg.RewardAddr,
+		Status:    "connecting",
+		V2Enabled: v2ctx.IsEnabled(),
+		V2NodeID:  v2ctx.NodeID,
+		V2GPUArch: v2ctx.GPUArch,
+	}
+	events := make(chan Event, 32)
+	var attempts uint64
+
+	// Renderer goroutine: draw at 2 Hz in panel mode, passive in plain
+	// mode. Keeping this out of the mining loop means a stuck HTTP
+	// request doesn't freeze the panel.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		// Rolling-window hashrate: keep last-known cumulative and
+		// timestamp, derive rate as Δcount/Δt. 10-second window is
+		// the same cadence CELLSminer uses; it prevents the displayed
+		// rate from jittering between 0 and peak every redraw.
+		const window = 10 * time.Second
+		type sample struct {
+			at    time.Time
+			count uint64
+		}
+		var samples []sample
+		currentHPS := 0.0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-events:
+				if !ok {
+					return
+				}
+				dash.applyEvent(ev)
+				rend.Event(ev)
+			case now := <-ticker.C:
+				cur := atomic.LoadUint64(&attempts)
+				samples = append(samples, sample{at: now, count: cur})
+				cutoff := now.Add(-window)
+				for len(samples) > 1 && samples[0].at.Before(cutoff) {
+					samples = samples[1:]
+				}
+				if len(samples) >= 2 {
+					first := samples[0]
+					last := samples[len(samples)-1]
+					dt := last.at.Sub(first.at).Seconds()
+					if dt > 0 {
+						currentHPS = float64(last.count-first.count) / dt
+					}
+				}
+				rend.Render(dash, currentHPS)
+			}
+		}
+	}()
+
+	client := &http.Client{Timeout: *httpTimeout}
+
+	// Build the multi-URL challenge fetcher. The validator's
+	// own /api/v1/mining/challenge is always the first
+	// candidate; any additional peer-attester URLs configured
+	// in miner.toml's challenge_urls are appended in order.
+	// The MultiFetcher round-robins on each call AND falls
+	// through to the next URL on any per-endpoint error, so
+	// the mining loop survives a transient outage at any one
+	// endpoint.
+	challengeFetcher, fetcherErr := v2client.NewMultiFetcher(
+		client,
+		append([]string{cfg.ValidatorURL}, cfg.ChallengeURLs...),
+	)
+	if fetcherErr != nil {
+		fmt.Fprintf(os.Stderr, "challenge fetcher: %v\n", fetcherErr)
+		return 2
+	}
+
+	// --idle-only background sampler. Built only when the
+	// operator opted in; nil otherwise so the runLoop's gate
+	// check is a single nil-compare. The probe runs on its own
+	// goroutine and shutdown is implicit via ctx cancellation.
+	idleProbe := buildIdleProbe(consumer)
+	idleGateInstance := buildIdleGate(idleProbe)
+	if idleProbe != nil {
+		fmt.Fprintf(os.Stderr,
+			"CELLSminer-console: --idle-only enabled (threshold=%d%% grace=%s poll=%s)\n",
+			consumer.IdleThreshold, consumer.IdleGrace, consumer.IdlePoll)
+		go idleProbe.Run(ctx)
+	}
+
+	// --auto-update background poller. No-ops when the operator
+	// hasn't set --auto-update; otherwise lives on its own
+	// goroutine, hits CELLS.tech every N, stages the new binary
+	// when one is published. The next service-manager restart
+	// (or operator-issued `--apply-staged-update`) atomically
+	// rolls forward to the new version.
+	runAutoUpdater(ctx, consumer)
+
+	// Background enrollment poller: only spun up when v2 is
+	// enabled AND the operator hasn't disabled it via
+	// --enrollment-poll=0. Lives on a dedicated goroutine so a
+	// stuck validator on the read path can't block the mining
+	// loop's HTTP traffic. Uses the same events channel as the
+	// loop so phase transitions repaint the dashboard at the
+	// same cadence (2 Hz) as everything else.
+	var pollerWG sync.WaitGroup
+	if v2ctx.IsEnabled() && *enrollPoll > 0 {
+		poller, err := NewEnrollmentPoller(client, cfg.ValidatorURL, v2ctx.NodeID, *enrollPoll)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "enrollment poller: %v\n", err)
+			return 2
+		}
+		// emitEvent posts onto the shared events channel,
+		// honouring ctx so a shutdown mid-poll doesn't leak.
+		emitEvent := func(e Event) {
+			e.At = time.Now()
+			select {
+			case events <- e:
+			case <-ctx.Done():
+			}
+		}
+		poller.OnStatus = func(st EnrollmentStatus) {
+			emitEvent(Event{
+				Kind:       EvEnrollment,
+				Enrollment: st,
+				Message:    fmt.Sprintf("enrollment phase=%s stake=%d slashable=%v", st.Phase, st.StakeDust, st.Slashable),
+			})
+		}
+		poller.OnPhaseChange = func(prev, next EnrollmentStatus) {
+			sev := SeverityForTransition(prev.Phase, next.Phase)
+			kind := EvInfo
+			if sev != SeverityInfo {
+				kind = EvError
+			}
+			emitEvent(Event{
+				Kind: kind,
+				Message: fmt.Sprintf("enrollment phase changed: %s → %s (stake=%d slashable=%v)",
+					prev.Phase, next.Phase, next.StakeDust, next.Slashable),
+			})
+		}
+		poller.LogError = func(err error) {
+			// Errors are already surfaced via OnStatus's
+			// LastError field which paints into the v2 enroll
+			// row. We deliberately do NOT push them through
+			// emitEvent: a flapping validator would otherwise
+			// fill the "Last event" panel and bury more
+			// important loop events. The poller itself
+			// guarantees forward progress on the next tick.
+			_ = err
+		}
+		pollerWG.Add(1)
+		go func() {
+			defer pollerWG.Done()
+			poller.Run(ctx)
+		}()
+	}
+
+	runLoop(ctx, client, challengeFetcher, cfg, v2ctx, idleGateInstance, cudaBackend, events, &attempts)
+	pollerWG.Wait()
+
+	events <- Event{Kind: EvShutdown, At: time.Now(), Message: "shutting down"}
+	close(events)
+	wg.Wait()
+	return 0
+}
+
+// cliWantsContinue returns true if the user asked --setup but *also*
+// supplied enough flags to keep mining after the wizard exits.
+// Today we pick the explicit behaviour: --setup by itself exits;
+// --setup together with --address or --validator keeps mining. This
+// avoids surprising scripts that re-run the wizard in a cron job.
+func cliWantsContinue() bool {
+	var seen bool
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "address" || f.Name == "validator" {
+			seen = true
+		}
+	})
+	return seen
+}
+
+// -----------------------------------------------------------------------------
+// Mining loop — same flow as cmd/CELLSminer, adapted to emit Events
+// instead of printing directly. Keeping the two loops independent
+// preserves the cmd/CELLSminer invariant that it remains a single
+// readable file mappable 1-to-1 against MINING_PROTOCOL.md, while
+// this binary can freely evolve its UX.
+// -----------------------------------------------------------------------------
+
+func runLoop(ctx context.Context, client *http.Client, fetcher v2client.ChallengeFetcher, cfg Config, v2ctx *V2Context, gate *idleGate, cudaBackend *cudaSolver, events chan<- Event, attempts *uint64) {
+	var (
+		currentEpoch uint64 = ^uint64(0)
+		currentDAG   mining.DAG
+	)
+	poll := cfg.pollDuration()
+	send := func(e Event) {
+		e.At = time.Now()
+		select {
+		case events <- e:
+		case <-ctx.Done():
+		}
+	}
+
+	send(Event{Kind: EvConnecting, Message: "contacting " + cfg.ValidatorURL})
+
+	wasPaused := false
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		// --idle-only gate. If the GPU is busy, sleep in
+		// 1-second slices and re-check; we don't burn Solve
+		// cycles while the user is gaming. The first time we
+		// pause we emit EvIdlePaused; on resume we emit
+		// EvIdleResumed so the dashboard / log clearly
+		// brackets the idle window.
+		if gate != nil {
+			busy, reason := gate.shouldPause()
+			if busy {
+				if !wasPaused {
+					send(Event{Kind: EvIdlePaused, Message: reason})
+					wasPaused = true
+				}
+				sleepOrCancel(ctx, time.Second)
+				continue
+			}
+			if wasPaused {
+				send(Event{Kind: EvIdleResumed, Message: "GPU idle, resuming mining"})
+				wasPaused = false
+			}
+		}
+		work, err := fetchWork(ctx, client, cfg.ValidatorURL)
+		if err != nil {
+			send(Event{Kind: EvError, Message: "fetch work: " + err.Error()})
+			sleepOrCancel(ctx, poll)
+			continue
+		}
+		send(Event{Kind: EvConnected, Message: fmt.Sprintf("work received: height=%d", work.Height)})
+
+		batchCount := cfg.BatchCount
+		if work.BatchCountMaximum > 0 && batchCount > work.BatchCountMaximum {
+			send(Event{Kind: EvInfo, Message: fmt.Sprintf("clamping batch_count %d → %d (server max)", batchCount, work.BatchCountMaximum)})
+			batchCount = work.BatchCountMaximum
+		}
+		ws, hdr, diff, err := api.WorkToMiningCore(work)
+		if err != nil {
+			send(Event{Kind: EvError, Message: "decode work: " + err.Error()})
+			sleepOrCancel(ctx, poll)
+			continue
+		}
+		ws.Canonicalize()
+		batchRoot, err := ws.PrefixRoot(batchCount)
+		if err != nil {
+			send(Event{Kind: EvError, Message: "prefix root: " + err.Error()})
+			sleepOrCancel(ctx, poll)
+			continue
+		}
+		target, err := mining.TargetFromDifficulty(diff)
+		if err != nil {
+			send(Event{Kind: EvError, Message: "target: " + err.Error()})
+			sleepOrCancel(ctx, poll)
+			continue
+		}
+		if work.Epoch != currentEpoch {
+			send(Event{Kind: EvEpochChanged, Epoch: work.Epoch, DAGSize: work.DAGSize,
+				Message: fmt.Sprintf("new mining epoch %d (N=%d)", work.Epoch, work.DAGSize)})
+			start := time.Now()
+			if cudaBackend != nil {
+				if err := cudaBackend.InitDAG(ctx, work.Epoch, ws.Root(), work.DAGSize); err != nil {
+					send(Event{Kind: EvError, Message: "initialize CUDA DAG: " + err.Error()})
+					return
+				}
+				currentDAG = nil
+			} else {
+				dag, err := mining.NewInMemoryDAG(work.Epoch, ws.Root(), work.DAGSize)
+				if err != nil {
+					send(Event{Kind: EvError, Message: "build DAG: " + err.Error()})
+					sleepOrCancel(ctx, poll)
+					continue
+				}
+				currentDAG = dag
+			}
+			send(Event{Kind: EvDAGReady, Epoch: work.Epoch, DAGSize: work.DAGSize,
+				Message: fmt.Sprintf("DAG loaded by %s in %s", map[bool]string{true: "CUDA", false: "CPU"}[cudaBackend != nil], time.Since(start).Round(time.Millisecond))})
+			currentEpoch = work.Epoch
+		}
+
+		sctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		solverParams := mining.SolverParams{
+			Epoch:      work.Epoch,
+			Height:     work.Height,
+			HeaderHash: hdr,
+			MinerAddr:  cfg.RewardAddr,
+			BatchRoot:  batchRoot,
+			BatchCount: batchCount,
+			Target:     target,
+			DAG:        currentDAG,
+		}
+		var res *mining.SolveResult
+		if cudaBackend != nil {
+			res, err = cudaBackend.Solve(sctx, solverParams, nil, cfg.CUDABatchSize, attempts)
+		} else {
+			res, err = mining.Solve(sctx, solverParams, nil, attempts)
+		}
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			send(Event{Kind: EvError, Message: "solve: " + err.Error()})
+			if cudaBackend != nil {
+				return
+			}
+			sleepOrCancel(ctx, poll)
+			continue
+		}
+
+		// v2 NVIDIA-locked path: after Solve produced a valid
+		// PoW proof, fetch a fresh challenge and attach an
+		// HMAC attestation bundle before submission. The
+		// challenge ages out after mining.FreshnessWindow, so
+		// we do this POST-solve rather than pre-solve to
+		// minimise the chance of racing against the freshness
+		// deadline on a slow miner.
+		//
+		// On any v2-prepare error we emit an Event and drop
+		// this proof. The miner will loop back to fetchWork
+		// and try again — a transient issuer 503 or a stale
+		// challenge shouldn't kill the binary. Crucially we do
+		// NOT fall back to a v1 submission when v2 was
+		// requested: that would silently send proofs a forked
+		// validator will reject, hiding the real problem from
+		// the operator.
+		if v2ctx.IsEnabled() {
+			if err := V2PrepareAttestation(ctx, fetcher, v2ctx, res.Proof); err != nil {
+				send(Event{Kind: EvError, Message: "v2 prepare: " + err.Error()})
+				sleepOrCancel(ctx, poll)
+				continue
+			}
+			send(Event{
+				Kind:     EvV2ChallengeOK,
+				IssuedAt: res.Proof.Attestation.IssuedAt,
+				Message: fmt.Sprintf("v2 attestation built (issued_at=%d, type=%s)",
+					res.Proof.Attestation.IssuedAt, res.Proof.Attestation.Type),
+			})
+		}
+
+		raw, err := res.Proof.CanonicalJSON()
+		if err != nil {
+			send(Event{Kind: EvError, Message: "encode proof: " + err.Error()})
+			continue
+		}
+		resp, err := submitProof(ctx, client, cfg.ValidatorURL, raw)
+		if err != nil {
+			send(Event{Kind: EvError, Message: "submit: " + err.Error()})
+			sleepOrCancel(ctx, poll)
+			continue
+		}
+		if resp.Accepted {
+			send(Event{
+				Kind:     EvProofAccepted,
+				Height:   work.Height,
+				Epoch:    work.Epoch,
+				Attempts: res.Attempts,
+				ProofID:  resp.ProofID,
+				Message: fmt.Sprintf("proof ACCEPTED height=%d attempts=%d id=%s",
+					work.Height, res.Attempts, resp.ProofID),
+			})
+		} else {
+			send(Event{
+				Kind:   EvProofRejected,
+				Height: work.Height,
+				Reason: resp.RejectReason,
+				Message: fmt.Sprintf("proof rejected reason=%s detail=%q",
+					resp.RejectReason, resp.Detail),
+			})
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// HTTP helpers — straight port of cmd/CELLSminer's fetch/submit. Kept
+// local so this binary has no test-time dependency on cmd/CELLSminer,
+// which is a main package and can't be imported anyway.
+// -----------------------------------------------------------------------------
+
+func fetchWork(ctx context.Context, client *http.Client, baseURL string) (*api.MiningWork, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/mining/work", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, truncateForLine(string(body), 200))
+	}
+	var work api.MiningWork
+	if err := json.Unmarshal(body, &work); err != nil {
+		return nil, fmt.Errorf("decode work: %w", err)
+	}
+	return &work, nil
+}
+
+func submitProof(ctx context.Context, client *http.Client, baseURL string, raw []byte) (*api.MiningSubmitResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/v1/mining/submit", bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var out api.MiningSubmitResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode submit (status %d): %w", resp.StatusCode, err)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
+		return &out, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	return &out, nil
+}
+
+func sleepOrCancel(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Self-test — identical semantics to cmd/CELLSminer --self-test. The
+// implementation is a straight port rather than an import because
+// cmd/CELLSminer is a main package. Keeping a working self-test here
+// means CI can gate this binary against MINING_PROTOCOL.md the same
+// way it gates CELLSminer.
+// -----------------------------------------------------------------------------
+
+func runSelfTest() error {
+	ws := syntheticWorkSet(4)
+	const dagN = 128
+	epoch := uint64(0)
+	dag, err := mining.NewInMemoryDAG(epoch, ws.Root(), dagN)
+	if err != nil {
+		return fmt.Errorf("dag: %w", err)
+	}
+	difficulty := big.NewInt(2)
+	target, err := mining.TargetFromDifficulty(difficulty)
+	if err != nil {
+		return err
+	}
+	headerHash := [32]byte{0x5E, 0x1F, 0x7E, 0x57}
+	batchRoot, err := ws.PrefixRoot(1)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	solveStart := time.Now()
+	res, err := mining.Solve(ctx, mining.SolverParams{
+		Epoch:      epoch,
+		HeaderHash: headerHash,
+		MinerAddr:  "CELLS1selftest",
+		BatchRoot:  batchRoot,
+		BatchCount: 1,
+		Target:     target,
+		DAG:        dag,
+	}, nil, nil)
+	if err != nil {
+		return fmt.Errorf("solve: %w", err)
+	}
+	solveDur := time.Since(solveStart)
+	verifier, err := mining.NewVerifier(mining.VerifierConfig{
+		EpochParams:      mining.NewEpochParams(),
+		DifficultyParams: mining.NewDifficultyAdjusterParams(),
+		Chain:            &selftestChain{tip: 0, header: headerHash},
+		Addresses:        selftestAddr{},
+		Batches:          selftestBatch{},
+		Dedup:            mining.NewProofIDSet(1024),
+		Quarantine:       mining.NewQuarantineSet(),
+		DAGProvider:      func(_ uint64) (mining.DAG, error) { return dag, nil },
+		WorkSetProvider:  func(_ uint64) (mining.WorkSet, error) { return ws, nil },
+		DifficultyAt:     func(_ uint64) (*big.Int, error) { return difficulty, nil },
+	})
+	if err != nil {
+		return fmt.Errorf("verifier: %w", err)
+	}
+	raw, err := res.Proof.CanonicalJSON()
+	if err != nil {
+		return err
+	}
+	if _, err := verifier.Verify(raw, 0); err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	fmt.Printf("self-test: solved in %d attempts in %s\n", res.Attempts, solveDur.Round(time.Millisecond))
+	return nil
+}
+
+func syntheticWorkSet(n int) mining.WorkSet {
+	ws := mining.WorkSet{Batches: make([]mining.Batch, n)}
+	for i := 0; i < n; i++ {
+		cells := make([]mining.ParentCellRef, 3)
+		for j := 0; j < 3; j++ {
+			var ch [32]byte
+			ch[0] = byte(i)
+			ch[1] = byte(j)
+			cells[j] = mining.ParentCellRef{
+				ID:          []byte{byte(i), byte(j), 0xAB},
+				ContentHash: ch,
+			}
+		}
+		ws.Batches[i] = mining.Batch{Cells: cells}
+	}
+	ws.Canonicalize()
+	return ws
+}
+
+type selftestChain struct {
+	tip    uint64
+	header [32]byte
+}
+
+func (c *selftestChain) TipHeight() uint64 { return c.tip }
+func (c *selftestChain) HeaderHashAt(h uint64) ([32]byte, bool) {
+	if h == c.tip {
+		return c.header, true
+	}
+	return [32]byte{}, false
+}
+
+type selftestAddr struct{}
+
+func (selftestAddr) ValidateAddress(a string) error {
+	if a == "" {
+		return errors.New("empty address")
+	}
+	return nil
+}
+
+type selftestBatch struct{}
+
+func (selftestBatch) ValidateBatch(_ mining.Batch) error { return nil }

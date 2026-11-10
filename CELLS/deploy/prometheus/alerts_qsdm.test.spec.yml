@@ -1,0 +1,728 @@
+# =====================================================================
+# Test spec for alerts_CELLS.example.yml -> alerts_CELLS.test.yml.
+# =====================================================================
+#
+# Hand-edited.  Regenerate alerts_CELLS.test.yml with:
+#
+#   python scripts/gen_promtool_tests.py
+#
+# The generator validates 1:1 coverage between alertnames in
+# alerts_CELLS.example.yml and entries in this file: adding an alert
+# without a spec (or removing a spec without removing the alert)
+# fails the generator and CI.
+#
+# Schema (per group):
+#   header:        free-form group banner (multi-line).
+#   tests[]:       list of per-alert specs.
+#
+# Schema (per test):
+#   name:          alertname; must match alerts_CELLS.example.yml.
+#   summary:       one-line firing-condition summary; goes in test name.
+#   early:         eval_time for the negative checkpoint (e.g. "5m").
+#   late:          eval_time for the firing checkpoint   (e.g. "16m").
+#   notes:         (optional) explanatory comment lines for the test.
+#   input_series:  list of {series, values} pairs in promtool format.
+# =====================================================================
+
+groups:
+
+  - header: |
+      CELLS-nvidia-lock — NVIDIA-lock + NGC submission gate
+      OPERATOR_HYGIENE_INCIDENT.md §3.1 / §3.2
+      NGC_SUBMISSION_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSNvidiaLockHTTPBlocksSpike
+        summary: "rate > 0.5/s, for:10m"
+        early: 5m
+        late: 16m
+        notes: "60/min = 1.0/s sustained, 2x the 0.5/s threshold."
+        input_series:
+          - series: CELLS_nvidia_lock_http_blocks_total
+            values: 0+60x30
+      - name: CELLSNvidiaLockP2PRejects
+        summary: "increase > 0 in 15m, for:5m"
+        early: 1m
+        late: 20m
+        notes: Counter ramps 1/min for 30m → increase[15m] = 15.
+        input_series:
+          - series: CELLS_nvidia_lock_p2p_rejects_total
+            values: 0+1x30
+      - name: CELLSNGCChallengeRateLimited
+        summary: "increase > 5 in 10m, for:5m"
+        early: 5m
+        late: 20m
+        notes: 1/min for 30m → increase[10m] = 10 (above 5).
+        input_series:
+          - series: CELLS_ngc_challenge_rate_limited_total
+            values: 0+1x30
+      - name: CELLSNGCProofIngestRejectBurst
+        summary: "sum(increase) > 10 in 10m, for:5m"
+        early: 5m
+        late: 20m
+        notes: 2/min on one reason → sum(increase[10m]) = 20.
+        input_series:
+          - series: "CELLS_ngc_proof_ingest_rejected_total{reason=\"hmac\"}"
+            values: 0+2x30
+
+  - header: |
+      CELLS-submesh
+      SUBMESH_POLICY_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSSubmeshP2PRejects
+        summary: "route OR size increase > 0 in 15m, for:5m"
+        early: 1m
+        late: 20m
+        input_series:
+          - series: CELLS_submesh_p2p_reject_route_total
+            values: 0+1x30
+          - series: CELLS_submesh_p2p_reject_size_total
+            values: "0x30"
+      - name: CELLSSubmeshAPISustained422
+        summary: "summed rejects >= 5 in 10m, for:5m"
+        early: 5m
+        late: 20m
+        notes: 3 series × 10 each = 30 summed.
+        input_series:
+          - series: CELLS_submesh_api_wallet_reject_route_total
+            values: 0+1x30
+          - series: CELLS_submesh_api_wallet_reject_size_total
+            values: 0+1x30
+          - series: CELLS_submesh_api_privileged_reject_size_total
+            values: 0+1x30
+
+  - header: |
+      CELLS-throughput — chain "silent failure" sentinel
+      OPERATOR_HYGIENE_INCIDENT.md §3.4
+    tests:
+      - name: CELLSNoTransactionsStored
+        summary: "stored=0 but processed>0, for:30m"
+        early: 25m
+        late: 65m
+        notes: "processed climbing, stored flat → divergence sustained."
+        input_series:
+          - series: CELLS_transactions_processed_total
+            values: 0+10x80
+          - series: CELLS_transactions_stored_total
+            values: "0x80"
+
+  - header: |
+      CELLS-trust-transparency
+      TRUST_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSTrustNoAttestationsAccepted
+        summary: "accepted-rate=0 over 20m, for:5m"
+        early: 5m
+        late: 40m
+        notes: |
+          Counter increments for first 10m (rate > 0), then flat
+          (rate == 0). At t=40m the 20m rate window covers the
+          flat tail entirely, sum(rate)==0 fires.
+        input_series:
+          - series: "CELLS_ngc_proof_ingest_accepted_total{reason=\"ok\"}"
+            values: 0+1x10 10x60
+      - name: CELLSTrustIngestRejectRateElevated
+        summary: "reject-rate > 1 + accept-rate, for:10m"
+        early: 5m
+        late: 21m
+        notes: rejected = 120/min = 2.0/s; accepted rate = 0/s. 2 > 1+0.
+        input_series:
+          - series: "CELLS_ngc_proof_ingest_rejected_total{reason=\"hmac\"}"
+            values: 0+120x30
+          - series: "CELLS_ngc_proof_ingest_accepted_total{reason=\"ok\"}"
+            values: 5x30
+
+  - header: |
+      CELLS-trust-redundancy
+      TRUST_INCIDENT.md §3.3 / §3.4 / §3.5 / §3.6
+    tests:
+      - name: CELLSTrustAttestationsBelowFloor
+        summary: "warm=1 and attested<2, for:10m"
+        early: 5m
+        late: 16m
+        input_series:
+          - series: CELLS_trust_warm
+            values: 1x30
+          - series: CELLS_trust_attested
+            values: 1x30
+      - name: CELLSTrustNGCServiceDegraded
+        summary: "warm=1 and ngc_healthy=0, for:10m"
+        early: 5m
+        late: 16m
+        input_series:
+          - series: CELLS_trust_warm
+            values: 1x30
+          - series: CELLS_trust_ngc_service_healthy
+            values: "0x30"
+      - name: CELLSTrustLastAttestedStale
+        summary: "(time()-last_attested) > 1800, for:5m"
+        early: 25m
+        late: 40m
+        notes: |
+          last_attested pinned at t=60s. diff > 1800 ⇔ N > 31m;
+          for:5m means firing from t=37m. Tested at 40m.
+        input_series:
+          - series: CELLS_trust_warm
+            values: 1x60
+          - series: CELLS_trust_last_attested_seconds
+            values: 60x60
+      - name: CELLSTrustAggregatorStale
+        summary: "(time()-last_checked) > 120, for:2m"
+        early: 1m
+        late: 6m
+        notes: |
+          last_checked pinned at t=10s. Condition true from t=3m;
+          for:2m → firing from t=5m.
+        input_series:
+          - series: CELLS_trust_warm
+            values: 1x10
+          - series: CELLS_trust_last_checked_seconds
+            values: 10x10
+
+  - header: |
+      CELLS-quarantine
+      QUARANTINE_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSQuarantineAnySubmesh
+        summary: "submeshes>0, for:10m"
+        early: 5m
+        late: 16m
+        input_series:
+          - series: CELLS_quarantine_submeshes
+            values: 1x30
+      - name: CELLSQuarantineMajorityIsolated
+        summary: "tracked>=4 and ratio>0.5, for:15m"
+        early: 10m
+        late: 17m
+        input_series:
+          - series: CELLS_quarantine_submeshes_tracked
+            values: 4x30
+          - series: CELLS_quarantine_submeshes_ratio
+            values: 0.6x30
+
+  - header: |
+      CELLS-v2-mining-slashing
+      SLASHING_INCIDENT.md §3.1 / §3.2 / §3.3 / §3.4
+    tests:
+      - name: CELLSMiningSlashApplied
+        summary: "sum(increase) >= 1 in 15m, for:1m"
+        early: 0m
+        late: 20m
+        input_series:
+          - series: "CELLS_slash_applied_total{reason=\"dust\"}"
+            values: 0+1x30
+      - name: CELLSMiningSlashedDustBurst
+        summary: "dust drained > 5e10 in 15m, for:5m"
+        early: 5m
+        late: 21m
+        notes: Increase 1e10/min → 15m increase = 1.5e11 (3x threshold).
+        input_series:
+          - series: "CELLS_slash_drained_dust_total{reason=\"dust\"}"
+            values: 0+10000000000x30
+      - name: CELLSMiningSlashRejectionsBurst
+        summary: "sum(increase) >= 10 in 10m, for:5m"
+        early: 5m
+        late: 16m
+        input_series:
+          - series: "CELLS_slash_rejected_total{reason=\"evidence\"}"
+            values: 0+1x30
+      - name: CELLSMiningAutoRevokeBurst
+        summary: "sum(increase) >= 3 in 15m, for:5m"
+        early: 5m
+        late: 21m
+        input_series:
+          - series: "CELLS_slash_auto_revoked_total{reason=\"threshold\"}"
+            values: 0+1x30
+
+  - header: |
+      CELLS-v2-mining-enrollment
+      ENROLLMENT_INCIDENT.md §3.1–§3.5
+    tests:
+      - name: CELLSMiningRegistryEmpty
+        summary: "active=0 and uptime>600, for:15m"
+        early: 5m
+        late: 16m
+        input_series:
+          - series: CELLS_enrollment_active_count
+            values: "0x30"
+          - series: CELLS_process_uptime_seconds
+            values: 700+60x30
+      - name: CELLSMiningRegistryShrinkingFast
+        summary: ">25% drop over 1h with baseline >= 4, for:10m"
+        early: 75m
+        late: 86m
+        notes: |
+          Stay at 10 for first 70m (1h+ stable history), then drop
+          to 4. offset 1h at t=86m → t=26m where count was 10.
+          (10-4)/10 = 0.6 > 0.25.
+        input_series:
+          - series: CELLS_enrollment_active_count
+            values: 10x70 4x30
+      - name: CELLSMiningPendingUnbondMajority
+        summary: "pending/total > 0.5 with total >= 4, for:30m"
+        early: 15m
+        late: 32m
+        notes: "active=2, pending=3, total=5≥4, ratio=3/5=0.6>0.5."
+        input_series:
+          - series: CELLS_enrollment_active_count
+            values: 2x40
+          - series: CELLS_enrollment_pending_unbond_count
+            values: 3x40
+      - name: CELLSMiningEnrollmentRejectionsBurst
+        summary: "sum(increase) >= 20 in 10m, for:5m"
+        early: 5m
+        late: 17m
+        notes: 2/min → increase[10m] = 20.
+        input_series:
+          - series: "CELLS_enrollment_rejected_total{reason=\"bond_too_small\"}"
+            values: 0+2x30
+      - name: CELLSMiningBondedDustDropped
+        summary: "bond drops > 5e10 over 30m, for:10m"
+        early: 35m
+        late: 46m
+        notes: "Stay at 1e11 for 30m, then drop to 4e10 → drop=6e10>5e10."
+        input_series:
+          - series: CELLS_enrollment_bonded_dust
+            values: 100000000000x30 40000000000x30
+
+  - header: |
+      CELLS-v2-mining-liveness — chain liveness sentinels
+      MINING_LIVENESS.md §3.1 / §3.2
+    tests:
+      - name: CELLSMiningChainStuck
+        summary: "delta(height[5m])=0 and uptime>300, for:3m"
+        early: 1m
+        late: 9m
+        input_series:
+          - series: CELLS_chain_height
+            values: 100x30
+          - series: CELLS_process_uptime_seconds
+            values: 400+60x30
+      - name: CELLSMiningMempoolBacklog
+        summary: "mempool > 10000, for:10m"
+        early: 5m
+        late: 11m
+        input_series:
+          - series: CELLS_mempool_size
+            values: 20000x30
+
+  - header: |
+      CELLS-v2-attest-archspoof — adversarial arch-claim defence
+      ARCH_SPOOF_INCIDENT.md §3.1 / §3.2 / §3.3
+    tests:
+      - name: CELLSAttestArchSpoofUnknownArchBurst
+        summary: "rate{unknown_arch} > 0.1, for:10m"
+        early: 5m
+        late: 16m
+        notes: 12/min = 0.2/s; 2x the 0.1/s threshold.
+        input_series:
+          - series: "CELLS_attest_archspoof_rejected_total{reason=\"unknown_arch\"}"
+            values: 0+12x30
+      - name: CELLSAttestArchSpoofGPUNameMismatch
+        summary: "rate{gpu_name_mismatch} > 0.05, for:10m"
+        early: 5m
+        late: 16m
+        notes: 6/min = 0.1/s; 2x the 0.05/s threshold.
+        input_series:
+          - series: "CELLS_attest_archspoof_rejected_total{reason=\"gpu_name_mismatch\"}"
+            values: 0+6x30
+      - name: CELLSAttestArchSpoofCCSubjectMismatch
+        summary: "increase{cc_subject_mismatch} > 0 in 15m, for:1m"
+        early: 0m
+        late: 20m
+        input_series:
+          - series: "CELLS_attest_archspoof_rejected_total{reason=\"cc_subject_mismatch\"}"
+            values: 0+1x30
+
+  - header: |
+      CELLS-v2-attest-hashrate — per-arch hashrate plausibility band
+      OPERATOR_HYGIENE_INCIDENT.md §3.3
+    tests:
+      - name: CELLSAttestHashrateOutOfBand
+        summary: "rate per arch > 0.05, for:10m"
+        early: 5m
+        late: 16m
+        notes: 6/min = 0.1/s; 2x the 0.05/s threshold.
+        input_series:
+          - series: "CELLS_attest_hashrate_rejected_total{arch=\"turing\"}"
+            values: 0+6x30
+
+  - header: |
+      CELLS-v2-governance — multisig authority rotation
+      GOVERNANCE_AUTHORITY_INCIDENT.md §3.1 / §3.2 / §3.3
+    tests:
+      - name: CELLSGovAuthorityVoteRecorded
+        summary: "increase[24h] > 0, for:5m"
+        early: 1m
+        late: 60m
+        input_series:
+          - series: CELLS_gov_authority_voted_total
+            values: 0+1x60
+      - name: CELLSGovAuthorityThresholdCrossed
+        summary: "increase[24h] > 0, for:1m"
+        early: 0m
+        late: 60m
+        input_series:
+          - series: CELLS_gov_authority_crossed_total
+            values: 0+1x60
+      - name: CELLSGovAuthorityCountTooLow
+        summary: "count < 2, for:5m"
+        early: 1m
+        late: 7m
+        input_series:
+          - series: CELLS_gov_authority_count
+            values: 1x30
+
+  - header: |
+      CELLS-v2-attest-recent-rejections — §4.6 rejection-ring health
+      REJECTION_FLOOD.md §7.1 / §7.2 / §7.3 / §7.4 / §7.5
+    tests:
+      - name: CELLSAttestRejectionFieldTruncationSustained
+        summary: "truncated/observed > 0.25, for:15m"
+        early: 10m
+        late: 26m
+        notes: "truncated 30/min, observed 60/min → ratio = 0.5."
+        input_series:
+          - series: CELLS_attest_rejection_field_truncated_total
+            values: 0+30x40
+          - series: CELLS_attest_rejection_field_runes_observed_total
+            values: 0+60x40
+      - name: CELLSAttestRejectionFieldRunesMaxNearCap
+        summary: "detail rune-cap >= 180, for:30m"
+        early: 15m
+        late: 32m
+        input_series:
+          - series: "CELLS_attest_rejection_field_runes_max{field=\"detail\"}"
+            values: 200x40
+      - name: CELLSAttestRejectionPersistCompactionsHigh
+        summary: "rate*60 > 5, for:30m"
+        early: 15m
+        late: 36m
+        notes: 6/min sustained → rate ≈ 0.1/s → rate*60 = 6 > 5.
+        input_series:
+          - series: CELLS_attest_rejection_persist_compactions_total
+            values: 0+6x40
+      - name: CELLSAttestRejectionPersistHardCapDropping
+        summary: "rate > 0, for:10m"
+        early: 5m
+        late: 16m
+        input_series:
+          - series: CELLS_attest_rejection_persist_hardcap_drops_total
+            values: 0+1x30
+      - name: CELLSAttestRejectionPerMinerRateLimited
+        summary: "rate > 0, for:10m"
+        early: 5m
+        late: 16m
+        input_series:
+          - series: CELLS_attest_rejection_per_miner_rate_limited_total
+            values: 0+1x30
+
+  - header: |
+      CELLS-stub-active — silent stub-deployment guard
+      STUB_DEPLOYMENT_INCIDENT.md (kind-anchored sections)
+    tests:
+      - name: CELLSStubActive
+        summary: "CELLS_stub_active{kind} == 1, for:5m"
+        early: 4m
+        late: 6m
+        notes: |
+          Gauge held at 1 for the full window; alert fires after the
+          5m for-clause. The early checkpoint at 4m must be silent
+          (still inside for-clause), the late checkpoint at 6m must
+          be firing.
+        input_series:
+          - series: 'CELLS_stub_active{kind="poe"}'
+            values: 1x10
+
+  - header: |
+      CELLS-wallet — wallet HTTP API health
+      WALLET_INCIDENT.md §3.1 / §3.2 / §3.3
+    tests:
+      - name: CELLSWalletSendErrorRate
+        summary: "handler-failure ratio > 0.1, for:10m"
+        early: 5m
+        late: 16m
+        notes: |
+          Total send rate = 60/min (success 40/min + store_failed
+          20/min). store_failed/total = 20/60 ≈ 0.33, well above
+          the 0.1 threshold. instance label propagates from input.
+        input_series:
+          - series: 'CELLS_wallet_send_total{result="success",instance="i1"}'
+            values: 0+40x40
+          - series: 'CELLS_wallet_send_total{result="store_failed",instance="i1"}'
+            values: 0+20x40
+      - name: CELLSWalletStorageErrorBurst
+        summary: "rate*60 > 1, for:5m"
+        early: 1m
+        late: 8m
+        notes: |
+          Combined wallet storage-error rate at 2/min (1 from
+          balance, 1 from send) → rate*60 = 2 > 1. Crosses for:5m.
+        input_series:
+          - series: 'CELLS_wallet_balance_query_total{result="storage_error",instance="i1"}'
+            values: 0+1x40
+          - series: 'CELLS_wallet_send_total{result="store_failed",instance="i1"}'
+            values: 0+1x40
+      - name: CELLSWalletMintBurst
+        summary: "rate*60 > 5, for:30m"
+        early: 15m
+        late: 36m
+        notes: |
+          10 mints/min sustained for the full 40m → rate*60 = 10
+          > 5 threshold. Crosses for:30m at 35m.
+        input_series:
+          - series: 'CELLS_wallet_mint_total{result="success",instance="i1"}'
+            values: 0+10x40
+
+  - header: |
+      CELLS-storage — storage backend health
+      STORAGE_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSStorageWriteErrorBurst
+        summary: "store_transaction err rate*60 > 1, for:5m"
+        early: 1m
+        late: 8m
+        notes: |
+          2 errors/min sustained → rate*60 = 2 > 1 threshold.
+          Crosses for:5m at 6m.
+        input_series:
+          - series: 'CELLS_storage_op_total{op="store_transaction",result="error",instance="i1"}'
+            values: 0+2x40
+      - name: CELLSStorageReadyFailing
+        summary: "ready err rate > 0, for:2m"
+        early: 1m
+        late: 5m
+        notes: |
+          1 ready error/min → rate > 0. Crosses for:2m at 3m.
+        input_series:
+          - series: 'CELLS_storage_op_total{op="ready",result="error",instance="i1"}'
+            values: 0+1x30
+
+  - header: |
+      CELLS-p2p — libp2p peer-graph health
+      NETWORKING_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSP2PNoPeers
+        summary: "peers == 0 with provider live, for:5m"
+        early: 4m
+        late: 7m
+        notes: |
+          peers stays 0 the whole interval; alert crosses
+          for:5m at 6m.
+        input_series:
+          - series: 'CELLS_p2p_peers_connected{provider="live",instance="i1"}'
+            values: 0+0x30
+      - name: CELLSP2PGossipIngressStalled
+        summary: "peers > 0 + zero inbound rate for 10m, for:10m"
+        early: 10m
+        late: 22m
+        notes: |
+          peers stays at 5 (provider="live"), inbound counter
+          flatlines at 0 for the full 30m. The 10m rate window
+          + 10m for: gives a cross at 20m.
+        input_series:
+          - series: 'CELLS_p2p_peers_connected{provider="live",instance="i1"}'
+            values: 5+0x30
+          - series: 'CELLS_p2p_messages_total{direction="in",instance="i1"}'
+            values: 0+0x30
+
+  - header: |
+      CELLS-contracts-bridge — contract exec + bridge op health
+      CONTRACTS_BRIDGE_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSContractExecuteErrorRate
+        summary: "exec error rate > 50% with >=1/min, for:15m"
+        early: 14m
+        late: 32m
+        notes: |
+          1 success/min + 2 error/min sustained → error ratio
+          = 2/3 > 0.5 with rate=3/min ≥ 1/min. Crosses for:15m
+          at ~30m.
+        input_series:
+          - series: 'CELLS_contract_executions_total{result="success",instance="i1"}'
+            values: 0+1x40
+          - series: 'CELLS_contract_executions_total{result="error",instance="i1"}'
+            values: 0+2x40
+      - name: CELLSBridgeOpErrorBurst
+        summary: "bridge error rate > 0.2/min for 10m, for:10m"
+        early: 9m
+        late: 22m
+        notes: |
+          1 redeem error per minute → rate*60 = 1 > 0.2. The
+          10m rate window saturates at 10m, then for:10m
+          fires at 20m.
+        input_series:
+          - series: 'CELLS_bridge_op_total{op="redeem",result="error",instance="i1"}'
+            values: 0+1x30
+
+  - header: |
+      CELLS-reputation — peer-reputation tracker health
+      REPUTATION_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSReputationBanRatioHigh
+        summary: "banned/total > 0.5 with >=4 peers, for:10m"
+        early: 9m
+        late: 12m
+        notes: |
+          5 of 8 peers banned (ratio = 0.625 > 0.5) with
+          total >= 4 sustained for 30m → for:10m fires at 10m.
+        input_series:
+          - series: 'CELLS_reputation_peers_total{tracker="tx",instance="i1"}'
+            values: 8+0x30
+          - series: 'CELLS_reputation_peers_banned{tracker="tx",instance="i1"}'
+            values: 5+0x30
+      - name: CELLSReputationScoreCollapse
+        summary: "min < -100 with >=4 peers, for:30m"
+        early: 29m
+        late: 40m
+        notes: |
+          min_score = -150 with peers_total = 6 sustained
+          for 60m → for:30m fires at 30m.
+        input_series:
+          - series: 'CELLS_reputation_score_min{tracker="tx",instance="i1"}'
+            values: -150+0x60
+          - series: 'CELLS_reputation_peers_total{tracker="tx",instance="i1"}'
+            values: 6+0x60
+
+  - header: |
+      CELLS-hot-reload — runtime config hot-reload health
+      HOT_RELOAD_INCIDENT.md §3.1 / §3.2
+    tests:
+      - name: CELLSHotReloadApplyFailures
+        summary: "apply_failure rate > 0 for 5m, for:10m"
+        early: 9m
+        late: 16m
+        notes: |
+          1 apply failure per minute → rate > 0. The 5m
+          rate window saturates at 5m, then for:10m fires
+          at 15m.
+        input_series:
+          - series: 'CELLS_hot_reload_apply_failure_total{instance="i1"}'
+            values: 0+1x30
+      - name: CELLSHotReloadDryRunDegraded
+        summary: "load_ok=0 with timestamp>0, for:30m"
+        early: 29m
+        late: 40m
+        notes: |
+          load_ok stays at 0, timestamp = 1700000000 (non-
+          zero static). Fires for:30m at 30m.
+        input_series:
+          - series: 'CELLS_hot_reload_last_dry_run_load_ok{instance="i1"}'
+            values: 0+0x60
+          - series: 'CELLS_hot_reload_last_dry_run_policy_ok{instance="i1"}'
+            values: 1+0x60
+          - series: 'CELLS_hot_reload_last_dry_run_timestamp{instance="i1"}'
+            values: 1700000000+0x60
+
+  - header: |
+      CELLS-p2p — wallet-tx dedupe burst (loose-end mode)
+      NETWORKING_INCIDENT.md §3.3
+    tests:
+      - name: CELLSP2PWalletIngressDedupeBurst
+        summary: "dedupe_skip rate > 1/sec for 5m, for:15m"
+        early: 14m
+        late: 22m
+        notes: |
+          120 dedupe skips per minute (= 2/sec) sustained
+          → rate > 1. The 5m rate window saturates at 5m,
+          then for:15m fires at 20m.
+        input_series:
+          - series: 'CELLS_p2p_wallet_ingress_dedupe_skip_total{instance="i1"}'
+            values: 0+120x30
+
+  - header: |
+      CELLS-security — MED-8 security event counters
+      SECURITY_INCIDENT.md §3.1 .. §3.9
+    tests:
+      - name: CELLSSecurityFailedLoginBurst
+        summary: "rate > 1/sec, for:10m"
+        early: 5m
+        late: 16m
+        notes: |
+          120/min = 2/sec sustained, 2x the 1/s
+          threshold. 5m rate window saturates at 5m,
+          then for:10m fires at 15m.
+        input_series:
+          - series: 'CELLS_security_failed_logins_total{instance="i1"}'
+            values: 0+120x30
+      - name: CELLSSecurityAccountLockoutBurst
+        summary: "increase > 5 in 15m, for:5m"
+        early: 5m
+        late: 20m
+        notes: |
+          1/min for 30m → increase[15m] reaches 15.
+          15m window saturates at 15m, for:5m fires at 20m.
+        input_series:
+          - series: 'CELLS_security_account_lockouts_total{instance="i1"}'
+            values: 0+1x30
+      - name: CELLSSecurityRateLimitViolationSpike
+        summary: "rate > 5/sec, for:10m"
+        early: 5m
+        late: 16m
+        notes: |
+          600/min = 10/sec sustained, 2x the 5/s
+          threshold. 5m rate window saturates at 5m,
+          then for:10m fires at 15m.
+        input_series:
+          - series: 'CELLS_security_rate_limit_violations_total{instance="i1"}'
+            values: 0+600x30
+      - name: CELLSSecurityCSRFFailureSpike
+        summary: "rate > 0.1/sec, for:5m"
+        early: 5m
+        late: 11m
+        notes: |
+          12/min = 0.2/sec sustained, 2x the 0.1/s
+          threshold. 5m rate window saturates at 5m,
+          then for:5m fires at 10m.
+        input_series:
+          - series: 'CELLS_security_csrf_failures_total{instance="i1"}'
+            values: 0+12x30
+      - name: CELLSSecurityInvalidTokenSpike
+        summary: "rate > 1/sec, for:10m"
+        early: 5m
+        late: 16m
+        notes: |
+          120/min = 2/sec sustained, 2x the 1/s
+          threshold.
+        input_series:
+          - series: 'CELLS_security_auth_invalid_token_total{instance="i1"}'
+            values: 0+120x30
+      - name: CELLSSecurityTokenRevokedHit
+        summary: "increase > 0 in 15m, for:5m"
+        early: 1m
+        late: 20m
+        notes: |
+          1/min for 30m → increase[15m] > 0 from t=1m.
+          for:5m fires at 5m (rounded to scrape boundary).
+        input_series:
+          - series: 'CELLS_security_token_revoked_hits_total{instance="i1"}'
+            values: 0+1x30
+      - name: CELLSSecurityRequestSignatureFailureSpike
+        summary: "rate > 0.1/sec, for:5m"
+        early: 5m
+        late: 11m
+        notes: |
+          12/min = 0.2/sec sustained, 2x the 0.1/s
+          threshold.
+        input_series:
+          - series: 'CELLS_security_request_signature_failed_total{instance="i1"}'
+            values: 0+12x30
+      - name: CELLSSecurityRequestTimeoutSpike
+        summary: "rate > 0.5/sec, for:10m"
+        early: 5m
+        late: 16m
+        notes: |
+          60/min = 1/sec sustained, 2x the 0.5/s
+          threshold.
+        input_series:
+          - series: 'CELLS_security_request_timeout_total{instance="i1"}'
+            values: 0+60x30
+      - name: CELLSSecurityCORSRejectionSpike
+        summary: "rate > 1/sec, for:10m"
+        early: 5m
+        late: 16m
+        notes: |
+          120/min = 2/sec sustained, 2x the 1/s
+          threshold.
+        input_series:
+          - series: 'CELLS_security_cors_rejections_total{instance="i1"}'
+            values: 0+120x30

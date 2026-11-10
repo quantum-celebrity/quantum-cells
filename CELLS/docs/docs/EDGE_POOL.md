@@ -1,0 +1,208 @@
+# CELLS Hive Mother Mode: Agents and Relay
+
+CELLS pooled edge compute uses an explicit path:
+
+```text
+Agent computers -> CELLS Relay -> one or more CELLS Hives (Mother Hive role) -> CELLS Core
+```
+
+> **Status (October 2026):** paid resource work (the Edge Pool CPU, GPU and RAM tasks) is in an **operator-only test** on the public network and is not yet open to other miners. From block **833,800** (13 October 2026, 13:21 UTC) a consensus rule makes paid edge tasks (`CELLS-edge-worker` and its GPU and RAM variants) settle only through an authorized settlement relay; see [Consensus rules](CONSENSUS_RULES.md). Private LAN Relays still work.
+
+## Topology
+
+- **Agents** are walletless, outbound-only workers that execute fixed CELLS CPU, NVIDIA GPU, or RAM jobs.
+- **Relay** authenticates Agents, applies resource ceilings, verifies results, stores receipts, signs aggregate proofs, and keeps each connected Mother Hive's jobs and settlement state separate.
+- **CELLS Hive** is the only desktop client and owns the active CELL wallet. **Mother Hive** is the role it assumes while coordinating a paired Relay.
+- Relay and CELLS Hive may run on the same computer or separate trusted machines. Edge Control is a setup utility, not another client.
+
+Agents do not need CELLS Hive. Install the standalone Agent on each contributing computer and pair it with the local Relay. Install Hive only on computers that will act as Mother Hives and submit work to that Relay.
+
+For each accepted Relay batch, CELLS Core atomically allocates 70% to the contributor-owner wallet, 15% to the Mother Hive operator, and 15% to the CELL ecosystem reserve at `651a79b2b1790820dd73bda81be24057e1bc27377c1f1117c6db2ab79dc038ea`. Agents remain walletless; Mother Hive binds the contributor-owner wallet for the trusted group. Payouts use only an already-funded task reward pool and do not mint CELL.
+
+Settlement is fail-closed. A task manager must add the Relay's key-derived 64-character ID to the consensus manifest's `authorized_relay_ids` list. Core verifies the Relay ML-DSA-87 signature, exact payout binding, block round, time window, proof ID, and every globally consumed receipt ID before applying the 70/15/15 split. Relay receipts are retained until Hive observes the committed action and acknowledges that exact proof.
+
+## Security boundaries
+
+The agent is not a remote administration tool.
+
+- No remote shell, arbitrary command, script, file-browser, or executable-download endpoint exists.
+- Agents and Mother Hives use different 256-bit HMAC credentials. Each Mother Hive receives its own derived, revocable credential; it cannot read, cancel, or settle another Hive's jobs. Agent credentials cannot read Mother-role proofs, and a Hive credential cannot register as an Agent.
+- Requests use HMAC-SHA256, timestamps, single-use nonces, signed short-lived jobs, and bounded bodies. Settlement batches also carry a persistent ML-DSA-87 Relay signature independently verifiable by every validator.
+- CPU iterations, GPU operations, RAM MiB, runtime, worker count, and proof receipt count have hard limits.
+- RAM buffers are cleared after each job.
+- A non-loopback Relay listener requires `--allow-lan`.
+- Keep both role-specific tokens private. Restrict TCP 7740 to the trusted private subnet.
+
+This protocol is intended for a trusted laboratory. Do not expose the Relay as an anonymous public worker enrollment service.
+
+## Relay resource policy
+
+`--cpu-units`, `--gpu-units`, and `--ram-mib` define per-job ceilings. `--cpu-percent`, `--gpu-percent`, and `--ram-percent` apply 1-100% of those ceilings before an agent's own lower contribution limit is applied. Percentages limit CELLS work units; they are not operating-system utilization throttles. Agent polling also affects duty cycle.
+
+## Downloads
+
+The current CELLS Hive source packages Edge Control 1.3.7, Agent 1.3.7, and the CUDA helper. Additional trusted computers can use:
+
+- [Windows x86-64 Edge Control bundle](https://CELLS.tech/downloads/CELLS-edge-agent-1.3.7-windows-x86_64.zip)
+- [Linux x86-64 Edge Control bundle](https://CELLS.tech/downloads/CELLS-edge-agent-1.3.7-linux-x86_64.tar.gz)
+- [Edge Control checksums](https://CELLS.tech/downloads/CELLS-edge-agent-1.3.7-SHA256SUMS.txt)
+
+## Edge Control GUI
+
+Open `CELLS Edge Control.exe` on Windows or run `./CELLS-edge-control` on Linux. Choose **Relay** on the coordinating computer, set its private-network limits, and copy the generated Agent pairing code. On every worker computer, choose **Agent**, paste that code, select the resources to share, and press **Start Agent**.
+
+Edge Control generates a separate Mother Hive pairing code for the coordinating Hive. Open the dedicated **Mother Hive** page in Hive and paste that code there. Hive stores the role credential with private file permissions, connects to a Relay on the same or another trusted computer, and displays Relay health, Agents, pooled resources, jobs, and receipts. Agent pairing codes are rejected. The Edge Control UI is local-only on `127.0.0.1:7741`; credentials are shown only on explicit request.
+
+The remaining commands in this guide are the advanced automation path.
+
+## Application Compute Gateway
+
+While the Mother Hive task is running, Hive exposes an authenticated application gateway at `http://127.0.0.1:7742`. Native applications on the Mother Hive computer can submit bounded work to the paired Relay and poll for a verified result. The gateway is loopback-only, has no CORS permission, rate-limits requests, caps request bodies, and never exposes the Relay's Mother credential.
+
+The application token is generated by Hive with private file permissions:
+
+- Windows: `%APPDATA%\CELLS-Hive\namespace\CELLS-mother-hive\compute-gateway.token`
+- Linux: `$XDG_CONFIG_HOME/CELLS-Hive/namespace/CELLS-mother-hive/compute-gateway.token`, normally below `$HOME/.config`
+
+Apps can call `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, and `DELETE /v1/jobs/{id}` with `Authorization: Bearer <token>`. The request contract deliberately contains only a resource, a bounded unit count, a deadline, and an idempotent application request ID. It cannot carry commands, scripts, binaries, files, or arbitrary code.
+
+The packaged command-line client uses the default endpoint and token automatically:
+
+```powershell
+CELLS-edge-agent.exe compute submit --request-id image-index-0001 --resource cpu --units 100000
+CELLS-edge-agent.exe compute list
+CELLS-edge-agent.exe compute status --id COMPUTE_JOB_ID
+```
+
+For a RAM job, use `--resource ram --ram-mib 64`. For an NVIDIA job, use `--resource gpu --units 1000000`. A compatible Agent must be online and its own contribution limit must permit the requested budget. Completed records contain the deterministic digest, duration, Agent identity, and durable Relay receipt ID.
+
+This gateway makes pooled resources usable by applications that integrate with the API or CLI. It does not turn remote RAM into ordinary process memory, expose a remote GPU as a local CUDA device, or accelerate unmodified applications. A general application must split its workload into supported jobs and submit those jobs explicitly.
+
+## Virtual Compute Runtime
+
+CELLS Hive 1.3.94 adds a **Virtual Compute Runtime** workbench to the Mother Hive page. The workbench discovers live Agent capacity, lets the operator select CPU, NVIDIA GPU, or RAM, submits a bounded workload, and shows queue state, the Agent that accepted the job, duration, cancellation, and verified receipt status. It uses the private Application Compute Gateway through Electron's main process; the renderer never receives the gateway token.
+
+The runtime identifies itself as `CELLS-virtual-compute/v1` and exposes two read-only discovery routes in addition to the existing job routes:
+
+- `GET /v1/resources` returns current CPU threads, GPU count and memory, RAM allowance, Relay limits, and the number of online Agents.
+- `GET /v1/workloads` returns the signed-in Hive's supported fixed workload catalog.
+
+The first catalog contains `CELLS.cpu.hash-chain.v1`, `CELLS.gpu.cuda-mix.v1`, and `CELLS.ram.memory-scan.v1`. They prove and exercise distributed execution without opening a remote-code path. An application integration can use the same authenticated API or the packaged CLI.
+
+This is a logical compute pool. Operating systems cannot safely present internet or LAN resources as ordinary physical CPU cores, process RAM, or a local CUDA device. Applications must use a CELLS adapter that partitions work into supported jobs. Broader workloads should be added as reviewed, versioned capabilities rather than arbitrary commands.
+
+Cross-location sharing is available as a private HTTPS federation pilot. See the [Mother Hive federation guide](EDGE_FEDERATION.md). Internet invitations use a separate expiring derived credential; never expose or reuse the permanent private-LAN Mother Hive credential.
+
+## Build
+
+From the repository root on the Windows build workstation:
+
+```powershell
+pwsh -NoProfile -File CELLS/scripts/build_edge_pool.ps1
+```
+
+The script builds Windows and Linux x86-64 agents and the Windows CUDA helper. The CUDA helper requires CUDA 12.9 and Visual C++ build tools on the build workstation.
+
+Linux Hive packages must be built on Linux so executable modes and the Electron runtime are preserved. The `CELLS Hive Linux` GitHub Actions workflow builds and verifies the AppImage and tarball natively; Windows cross-built Linux archives are not release artifacts.
+
+## Relay and CELLS Hive setup
+
+```powershell
+CELLS-edge-agent.exe token --out agent.token
+CELLS-edge-agent.exe token --out mother-hive.token
+CELLS-edge-agent.exe relay `
+  --listen 0.0.0.0:7740 `
+  --allow-lan `
+  --agent-token-file agent.token `
+  --mother-token-file mother-hive.token `
+  --cpu-percent 50 `
+  --gpu-percent 40 `
+  --ram-percent 25
+```
+
+Copy only `agent.token` to Agents. Keep `mother-hive.token` on the Relay: it is the Relay's master Mother-Hive secret and must never be copied to Hive. In Edge Control, give each Hive a clear name and choose **Create Mother Hive code**. Paste the resulting `CELLS-EDGE-3` code into that Hive's **Mother Hive** page. The code contains a separate derived credential and a Relay-registered identity that can be revoked without disconnecting other Hives.
+
+Create a different code for every Hive. A Relay can serve several local Mother Hives concurrently; jobs, request IDs, cancellation, receipt visibility, payout bindings, and settlement acknowledgements remain isolated by Mother-Hive identity. Revoking a Hive also cancels its unfinished jobs. The Agent pool is shared capacity, so Relay scheduling determines which eligible Agent accepts each job.
+
+If a Relay credential is configured, the CELLS Hive Mother role fails closed when the Relay is unavailable or has no verified receipt. It does not substitute local work for pooled work.
+
+On Linux, install the Relay as a supervised user service:
+
+```bash
+./CELLS-edge-agent install-relay-service \
+  --listen 0.0.0.0:7740 \
+  --allow-lan \
+  --agent-token-file "$HOME/.config/CELLS/edge-pool/agent.token" \
+  --mother-token-file "$HOME/.config/CELLS/edge-pool/mother-hive.token" \
+  --cpu-percent 50 --gpu-percent 40 --ram-percent 25
+./CELLS-edge-agent relay-service-status
+```
+
+Restrict TCP 7740 to the private laboratory subnet. Existing coordinator receipt journals remain in place during migration.
+
+### Public Internet Relay
+
+Paid pooled work on the public network is in an operator-only test and is not yet open to other miners, so do not plan on the CELLS-operated public Relay route (`https://node.CELLS.tech/v1/*`) for your own work. From block **833,800** (13 October 2026, 13:21 UTC) a consensus rule makes paid edge tasks (`CELLS-edge-worker` and its GPU and RAM variants) settle only through an authorized settlement relay: a settlement that does not come from a Relay listed in the task's `authorized_relay_ids` is rejected. Private LAN Relays configured as described above still work.
+
+Hive reads can use a local synchronized validator or the CELLS Network gateway.
+Signed wallet and task actions use the production Core endpoint unless
+an operator explicitly configured a custom Core. This prevents a local
+follower outage or stale nonce reservation from creating a second task-action
+history. The local and production `/api/v1/status` chain tips and the Mother
+Hive task `state_root` should agree before an operator treats the deployment as
+healthy.
+
+## Agent setup
+
+```powershell
+CELLS-edge-agent.exe configure-agent `
+  --out CELLS-edge-agent.json `
+  --relay http://RELAY-HOST:7740 `
+  --token-file C:\ProgramData\CELLS\agent.token `
+  --worker-id lab-pc-02 `
+  --resources cpu,ram `
+  --ram-mib 256
+
+CELLS-edge-agent.exe agent --config CELLS-edge-agent.json --silent --background
+```
+
+On Linux, use the supervised user service for normal deployment:
+
+```bash
+./CELLS-edge-agent install-service --config ./CELLS-edge-agent.json
+./CELLS-edge-agent service-status
+journalctl --user -u CELLS-edge-agent.service -f
+```
+
+The service restarts after failures and the agent automatically re-registers if the Relay restarts. Completion delivery is idempotent: a retried result returns the same durable receipt and cannot increase aggregate units twice. Enabling `loginctl enable-linger "$USER"` is optional and may require approval from the Linux administrator.
+
+For NVIDIA GPU sharing, include `gpu` and configure the packaged helper:
+
+```powershell
+CELLS-edge-agent.exe configure-agent `
+  --out CELLS-edge-agent.json `
+  --relay http://RELAY-HOST:7740 `
+  --token-file C:\ProgramData\CELLS\agent.token `
+  --worker-id lab-pc-02 `
+  --resources cpu,ram,gpu `
+  --ram-mib 256 `
+  --gpu-helper C:\Program Files\CELLS\CELLS-edge-gpu-helper.exe
+```
+
+The current helper requires NVIDIA Turing or newer, CUDA compute capability 7.5+, and a working NVIDIA driver.
+
+## Status
+
+```powershell
+CELLS-edge-agent.exe status `
+  --relay http://RELAY-HOST:7740 `
+  --mother-token-file mother-hive.token
+```
+
+The output lists workers, receipts, CELLS Hive Mother-role last-seen time, and the enforced Relay resource policy.
+
+It also reports `settlement_relay_id`. A task manager must publish that ID in each CPU, GPU, or RAM task manifest before pooled rewards can settle. Roll out Core on every validator first, publish the authorized manifest second, and release the matching Hive and Relay binaries last.
+
+## Compatibility
+
+`coordinator`, `--coordinator`, and the coordinator service commands remain legacy aliases. A single `--token-file` also remains available for migration, but new deployments should use the Relay names and separate credentials.

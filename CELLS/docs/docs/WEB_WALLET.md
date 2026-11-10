@@ -1,0 +1,330 @@
+# CELLS Web Wallet — Self-Custody Reference
+
+Public URL: <https://CELLS.tech/wallet/>
+Source:    `CELLS/source/wasm_modules/wallet/cmd/CELLS-wallet/main.go`
+            `CELLS/deploy/landing/wallet.html`
+            `CELLS/deploy/landing/wallet.js`
+            `CELLS/deploy/landing/wallet-provider.js`
+Sibling:   `CELLScli wallet new|show|inspect|sign` (CLI · same keystore format)
+
+The web wallet has two self-custody paths. Its standalone tools generate and
+operate ML-DSA-87 (FIPS 204) keystores entirely client-side. Its CELLS Hive panel
+uses the browser extension's `window.CELLS` provider to connect the active Hive
+wallet, read its public address and balance, and request a CELL transfer. The
+panel never receives the keystore or passphrase; Hive presents the site origin
+and transaction for approval before signing.
+
+Validators play no role in keystore creation or storage. Network traffic is
+limited to loading the static wallet assets, public Core reads, signed
+transaction submission, and the authenticated local Hive bridge when the user
+chooses that path.
+
+This document is the reference for what the page does, how, and why.
+
+---
+
+## 1. Architecture
+
+```
+   Browser tab
+   ───────────
+                ┌────────────────────────────────────────┐
+                │ wallet.html  (UI: 5 tabs)              │
+                │   Generate · Open · Sign · Balance ·   │
+                │   Send                                 │
+                └───────────────────┬────────────────────┘
+                                    │ DOM events
+                                    ▼
+   ┌──────────────────────────────────────────────┐
+   │ wallet.js  (~600 LOC)                        │
+   │   • WebCrypto envelope (PBKDF2 + AES-GCM)    │
+   │   • Keystore (de)serialise to/from JSON      │
+   │   • UI state machine                         │
+   └──────────────┬────────────────┬──────────────┘
+                  │                │
+                  ▼                ▼
+   ┌──────────────────────┐ ┌──────────────────────────────┐
+   │ window.crypto.subtle │ │ wallet.wasm  (Go via Circl)  │
+   │  PBKDF2-SHA-256      │ │   • mldsa87.GenerateKey      │
+   │  AES-256-GCM         │ │   • mldsa87.SignTo           │
+   │  getRandomValues     │ │   • mldsa87.Verify           │
+   └──────────────────────┘ └──────────────────────────────┘
+```
+
+**Why split the crypto?** Each side is doing what it is designed for:
+
+- **WebCrypto** is a battle-tested browser primitive for password-based
+  symmetric encryption. Using it instead of a WASM-side PBKDF2/AES
+  saves ~500 KB of WASM, eliminates a side-channel surface, and matches
+  the OWASP guidance to use the platform's native primitives when
+  available.
+- **WASM** is the only practical way to ship a FIPS-204 ML-DSA-87
+  signer in a browser. WebCrypto does not expose post-quantum
+  signature schemes (as of late 2026), so Go-compiled-to-WASM is the
+  reference path. The same `cloudflare/circl` ML-DSA-87 implementation
+  is what the validator side uses, so the browser cannot accidentally
+  produce a signature the network refuses.
+
+---
+
+## 2. Keystore JSON format (v1)
+
+Defined by `pkg/keystore` in the Go source tree. Both the CLI and the
+browser emit byte-identical files:
+
+```json
+{
+  "version":      1,
+  "type":         "CELLS-keystore",
+  "algorithm":    "ml-dsa-87",
+  "address":      "<hex sha256(public_key)>",
+  "public_key":   "<hex 2592-byte FIPS 204 ML-DSA-87 public key>",
+  "kdf":          "pbkdf2-sha256",
+  "kdf_params":   { "iterations": 600000, "salt": "<hex 16>", "key_len": 32 },
+  "cipher":       "aes-256-gcm",
+  "cipher_params":{ "nonce": "<hex 12>" },
+  "ciphertext":   "<hex AES-256-GCM(private_key) with appended 16-byte tag>",
+  "created_at":   "RFC 3339 UTC"
+}
+```
+
+Cross-compatibility is enforced by `CELLS/source/pkg/keystore/keystore_test.go`
+plus an offline Node.js test that decrypts a CLI-produced keystore using
+WebCrypto and signs via WASM (`_tmp_xcompat.js` in the repo root —
+`.gitignored`; runnable manually).
+
+Bumping `iterations` is forward-compatible (a future build can produce
+700 k-iter keystores and the Go-side `Validate` only complains if the
+value is below 100 000). Lowering iterations would be a regression and
+is enforced against.
+
+---
+
+## 3. Threat model
+
+What the wallet **does** protect against:
+
+1. **Server-side custody risk.** No CELLS operator, validator, or
+   third-party service ever holds the private key. The validator's old
+   `POST /api/v1/wallet/create` endpoint was never used by this page: it
+   returned a "ghost" address whose private key the node discarded, so
+   CELL sent there was lost. It now answers 410 Gone and generates no
+   key. The web wallet replaces it.
+2. **Network observers** (passive and active). The page never sends the
+   passphrase or private key. Generate, Open and Sign make no network
+   requests beyond loading the static files; Balance reads public data and
+   Send posts only the signed transaction to
+   `POST /api/v1/wallet/submit-signed`.
+3. **Disk-resident attackers (offline).** The keystore on disk is
+   AES-256-GCM-encrypted under a PBKDF2-derived key (600 k iterations,
+   SHA-256). At commodity hardware speeds (~10⁵ guesses/sec on a
+   single GPU), a 12-character alphanumeric passphrase has ~10²¹
+   combinations — comfortably out of reach. A 6-character passphrase is
+   trivially crackable; the page warns at 8 characters but does not
+   refuse (only a zero-byte passphrase is rejected outright).
+4. **Tampered keystore JSON.** The Go-side `keystore.Validate` enforces
+   that `sha256(public_key) == address`; the browser-side equivalent
+   (`validateKeystore` in `wallet.js`) does the same check before
+   prompting for a passphrase. A flipped byte in the ciphertext fails the
+   AES-GCM tag verification at decrypt time.
+
+What the wallet **does NOT** protect against (and explicit warnings in
+the UI call this out):
+
+5. **A compromised CELLS web server.** If an attacker replaces
+   `wallet.wasm` or `wallet.js` on the CELLS.tech CDN, the page can be
+   modified to exfiltrate the private key the moment it's generated.
+   Mitigations:
+   - The repo publishes the WASM artefact at a known path with a
+     git-tracked SHA-256 (published with the matching release).
+   - The CLI (`CELLScli wallet new`) is the cold-storage path that
+     bypasses the website entirely.
+   - Subresource Integrity (SRI) for `wallet.wasm` is a planned
+     follow-up; the WebAssembly fetch needs the hash baked into the
+     HTML for that to be useful, so it requires a deploy-time
+     rewrite step.
+6. **A compromised endpoint** (your laptop's browser, OS, or
+   keyboard logger). The wallet runs in-tab; if the OS is compromised,
+   nothing here helps.
+7. **A weak passphrase.** PBKDF2-600 k is OWASP-compliant but
+   purely a delay against offline guessing — a passphrase like
+   `password123` is still cracked in seconds. Pick a passphrase
+   long enough that brute-force is infeasible.
+
+---
+
+## 4. Verifying the build (deployer checklist)
+
+A CELLS operator (you, on `blackbeardONE/CELLS`) ships the wallet by:
+
+1. Running `./CELLS/scripts/build_wallet_wasm.sh`. Output:
+   - `CELLS/deploy/landing/wallet.wasm` (~3 MB)
+   - `CELLS/deploy/landing/wasm_exec.js` (copied from `$GOROOT/lib/wasm/`)
+2. Committing both files to the repo. The SHA-256 of `wallet.wasm` is
+   reproducible from the same Go toolchain version + `go.sum`-pinned
+   `cloudflare/circl` version, so two independent builds agree byte-for-byte
+   (modulo `-trimpath`-suppressed file paths).
+3. Verifying locally:
+   - `python3 -m http.server -d CELLS/deploy/landing 8088`
+   - Open `http://127.0.0.1:8088/wallet.html`
+   - Confirm DevTools → Network shows GETs only for the static files
+     and nothing else after pressing Generate.
+4. Confirming the published build matches the repo:
+   - `curl -s https://CELLS.tech/wallet.wasm | sha256sum`
+   - Compare to the SHA-256 published with the matching release.
+
+---
+
+## 5. Practical recipes
+
+### 5a. Generate an address for Hive or the console miner
+
+```bash
+# CLI path — quietest, scriptable
+./CELLScli wallet new --passphrase-file ./pass.txt --out ~/.CELLS/wallet.json
+ADDR="$(./CELLScli wallet show --in ~/.CELLS/wallet.json | awk '/^address/{print $2}')"
+
+# Consumer path: import the keystore JSON in CELLS Hive and run eligible tasks.
+# Advanced/operator path: use CELLSminer-console with a v2 NVIDIA enrollment.
+./CELLSminer-console --protocol=v2 --validator=https://api.CELLS.tech --address="$ADDR"
+```
+
+### 5b. Read an address out of a keystore without revealing the private key
+
+```bash
+./CELLScli wallet show --in ~/.CELLS/wallet.json
+# Address + public-key fields are plaintext in the keystore JSON.
+# The private key remains AES-256-GCM-encrypted; no passphrase prompted.
+```
+
+### 5c. Verify keystore integrity end-to-end
+
+```bash
+./CELLScli wallet inspect --in ~/.CELLS/wallet.json --passphrase-file ./pass.txt
+# Decrypts, then reconstructs the public key from the recovered private key
+# and compares against the stored public_key. Fails loudly if the keystore
+# was edited after encryption.
+```
+
+### 5d. Sign an arbitrary message (e.g., a transaction envelope)
+
+```bash
+echo -n '{"sender":"0xabc","amount":100}' \
+  | ./CELLScli wallet sign --in ~/.CELLS/wallet.json --passphrase-file ./pass.txt --message-file -
+# Stdout: hex ML-DSA-87 signature (4627 bytes).
+```
+
+Browser equivalent: the **Sign message** tab on `CELLS.tech/wallet/` does
+exactly the same thing for short UTF-8 messages.
+
+---
+
+## 6. Sky Fang wallet-link automation
+
+Sky Fang's CELLS integration uses a link challenge minted inside the game:
+
+```text
+CELLS-LINK:<short-code>:<nonce>
+```
+
+The player-facing flow is the CELLS Hive deep-link path. Manual public-key and
+signature copy-paste is no longer the normal path:
+
+```text
+CELLS-hive://skyfang-link?challenge_url=<url>&submit_url=<url>&return_url=<url>
+```
+
+Current deep-link player flow:
+
+1. Player opens `https://skyfang.xyz/dashboard/CELLS` and signs in to Sky Fang.
+2. Player clicks **Confirm with CELLS Hive** on the computer that has Hive
+   installed. Hive signs the Sky Fang challenge locally and posts
+   `{code, public_key, signature}` back to Sky Fang.
+
+The Android game can open the same Sky Fang page for status and handoff, but
+the wallet signature still happens in CELLS Hive on Windows or Linux because that is
+where the CELLS keystore lives. The flow stays on `skyfang.xyz`; the
+`CELLS.tech/wallet` page is no longer part of the normal player path.
+The legacy mobile entry point `https://skyfang.xyz/link-wallet` is kept as a
+compatibility redirect to `https://skyfang.xyz/dashboard/CELLS`.
+
+The in-game `/CELLSlink` command remains a shortcut that shows a short-lived
+Sky Fang confirmation URL:
+
+```text
+https://skyfang.xyz/api/CELLS/link-confirm?code=<short-code>
+```
+
+That page also shows **Confirm with CELLS Hive** and opens the
+`CELLS-hive://skyfang-link...` deep link.
+
+Why the deep-link path remains supported:
+
+- CELLS Hive registers the `CELLS-hive://` protocol.
+- `CELLScli wallet sign` already signs arbitrary messages with ML-DSA-87.
+- The private key stays in the local wallet/keystore; Sky Fang never sees it.
+- It also works when the browser extension is not installed.
+
+Hive 1.4.21 supports the CELLS Wallet extension for Chrome, Edge,
+Chromium, Brave, and Firefox. Supported HTTPS sites can use its `window.CELLS`
+provider for account connection, balance reads, message signing, and approved
+CELL transfers. The extension is not a second wallet: it stores no keystore,
+private key, or passphrase. It talks to Hive through the authenticated native
+messaging bridge and exact-origin permissions, while Hive displays every
+signing or transfer approval.
+
+Install the extension from your browser's store where available. Manual
+Chromium and Firefox review packages remain on <https://CELLS.tech/download.html>
+for testing.
+The Sky Fang deep link and the extension are complementary transport paths to
+the same Hive-held wallet, not separate accounts.
+
+First-run links now use <https://CELLS.tech/wallet-start.html?login=new>. An
+installed provider asks its own background worker to open
+`home.html#/onboarding/welcome?login=new`; a missing provider is sent to the
+official extension download. This avoids browser-specific extension URLs in
+websites. Extension 0.5.1 opens the CELLS Account dashboard from its popup.
+Sign-in currently uses the Hive wallet; email and Telegram sign-in are turned
+off. The extension never receives provider credentials.
+
+The extension popup now shows the active wallet's current CELL balance and
+opens a full wallet dashboard. That dashboard can copy the receiving address,
+refresh the balance, and request a CELL transfer. The signed-in CELLS Account
+dashboard offers the same active-wallet view. Both transfer surfaces call the
+local Hive bridge, and Hive must show and approve the exact recipient and
+amount before signing. They do not support other currencies or tokens yet.
+Hive queues approved transfers from the active wallet. If CELLS Core reports
+that the next wallet nonce is still waiting for a block, Hive waits for the
+committed nonce to advance and rebuilds the transfer instead of exposing a raw
+HTTP 409 error or reusing the occupied nonce.
+
+An account session can view verified identity and linked public wallet
+addresses. The session itself cannot sign, spend CELL, recover a wallet, or
+inherit a site's Hive permission. When Hive and the extension are available,
+the dashboard may request a fresh Hive-approved transfer; that authority is
+never stored in the account session. Linking a wallet requires a fresh ML-DSA
+ownership signature approved in Hive. See the [CELLS Account guide](CELLS_ACCOUNT.md).
+
+The wallet page's manual Sign tab is a developer/emergency diagnostic fallback
+only. For players, install CELLS Hive and use the one-click Sky Fang confirmation
+page.
+
+---
+
+## 7. Known limitations / roadmap
+
+- The Send tab signs locally in WASM and submits the signed transaction to
+  `POST /api/v1/wallet/submit-signed`. When the page is connected to Hive
+  through the extension, its Hive panel can request and submit a CELL transfer
+  after Hive shows a fresh user approval.
+- WebCrypto PBKDF2 can take 2-3 seconds on slower devices. Argon2id would be a
+  stronger KDF but is not available in WebCrypto; adding it in WASM is
+  deferred.
+- No keystore "rename / move passphrase" flow yet. Implementable: open,
+  re-encrypt with a new passphrase, save. Trivial follow-up.
+- The standalone browser wallet still creates legacy random wallets whose
+  recovery artifact is JSON + passphrase. CELLS Hive and `CELLScli` now support
+  24-word `CELLS-wallet-recovery-v1` wallets by deterministically generating
+  ML-DSA-87 from 256-bit phrase entropy. Existing random browser wallets cannot
+  be converted in place; move funds to a newly created recovery-enabled wallet
+  if phrase recovery is required.

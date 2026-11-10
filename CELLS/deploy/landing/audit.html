@@ -1,0 +1,1307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Public audit — CELLS · Cell (CELL)</title>
+<meta name="description" content="CELLS public audit checklist. Live score, evidence provenance breakdown, and the four wall-clock-blocked rows with their engagement-ready wrapper artefacts. Sourced from /api/v1/audit/summary and /api/v1/audit/items — the same JSON the SDK and dashboard tile consume." />
+<meta name="theme-color" content="#061116" />
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/assets/brand/favicon-16.png" />
+<link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+<link rel="manifest" href="/site.webmanifest" />
+<meta property="og:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="CELLS logo: Quantum-Secure Dynamic Mesh ledger and the CELL coin" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<link rel="stylesheet" href="/assets/site.css" />
+<link rel="stylesheet" href="/assets/site-shell.css" />
+
+<!--
+  JSON-LD structured data — schema.org Dataset. Registers the CELLS
+  public audit checklist with crawlers (Google, Bing, etc.) as a
+  first-class dataset so that searches for "CELLS audit", "CELLS
+  transparency", "CELLS public audit" can surface a rich-card
+  result with the score, distribution endpoints, license, and
+  last-modified date inline instead of a vanilla blue link.
+
+  Schema pinned to schema.org/Dataset per Google's structured-data
+  guide at
+  https://developers.google.com/search/docs/appearance/structured-data/dataset.
+
+  Three Distribution / ImageObject entries cover every machine-
+  readable surface the page already publishes for SDK consumers
+  and embedders:
+
+    - /api/v1/audit/summary    → application/json  (score + bucket counts)
+    - /api/v1/audit/items      → application/json  (per-row full list)
+    - /api/v1/audit/badge.svg  → image/svg+xml     (embeddable badge)
+
+  variableMeasured enumerates the four measured properties on the
+  dataset — score (percent), status, severity, category — with
+  the status / severity / category closed-enums kept verbatim in
+  sync with allowedAuditAPI{Statuses,Severities,Categories} in
+  pkg/api/handlers_audit.go. Drift between the two is caught by
+  TestAuditAPI_AllowedFilterEnumsMatchPkgAudit at the API level,
+  but a stale enum in this block does not break the rich card —
+  it only makes the structured description less accurate.
+
+  dateModified is the static-HTML date of the last meaningful
+  checklist change. Update on checklist.go edits that touch a
+  row's Status, Notes, or ReviewedAt. The page below this script
+  tag also renders live per-row ReviewedAt timestamps from the
+  /api/v1/audit/items response, so a stale dateModified here only
+  costs a freshness signal in the rich card, not correctness on
+  the page itself.
+
+  No HTML comments are permitted INSIDE the <script
+  type="application/ld+json"> body — JSON does not have a comment
+  grammar. All rationale lives in this outer HTML comment.
+-->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Dataset",
+  "name": "CELLS Public Audit Checklist",
+  "alternateName": [
+    "CELLS Audit",
+    "CELLS Public Audit",
+    "CELLS Transparency Checklist"
+  ],
+  "description": "The CELLS public audit checklist: an internal, self-maintained row-by-row record of the security, supply-chain, cryptography, network, and infrastructure invariants tracked for the CELLS pilot network (not an independent third-party audit), with status (passed / failed / waived), severity (critical / high / medium / low / info), and provenance (live-deploy / in-tree-tests / in-tree) tracked per row. Same data shipped to the SDK and validator dashboard via /api/v1/audit/summary and /api/v1/audit/items.",
+  "url": "https://CELLS.tech/audit.html",
+  "identifier": "https://CELLS.tech/audit.html",
+  "keywords": [
+    "blockchain audit",
+    "post-quantum security checklist",
+    "supply-chain transparency",
+    "CELLS",
+    "ML-DSA-87",
+    "FIPS 204",
+    "open-source audit checklist"
+  ],
+  "license": "https://opensource.org/license/mit/",
+  "isAccessibleForFree": true,
+  "creativeWorkStatus": "Published",
+  "inLanguage": "en",
+  "dateModified": "2026-05-17",
+  "temporalCoverage": "2026-04-22/..",
+  "publisher": {
+    "@type": "Organization",
+    "name": "CELLS",
+    "url": "https://CELLS.tech",
+    "sameAs": [
+      "https://github.com/blackbeardONE/CELLS"
+    ]
+  },
+  "creator": {
+    "@type": "Organization",
+    "name": "CELLS",
+    "url": "https://CELLS.tech"
+  },
+  "distribution": [
+    {
+      "@type": "DataDownload",
+      "name": "Audit summary (JSON)",
+      "description": "Top-level score and per-status / per-severity bucket counts.",
+      "encodingFormat": "application/json",
+      "contentUrl": "https://CELLS.tech/api/v1/audit/summary"
+    },
+    {
+      "@type": "DataDownload",
+      "name": "Audit items (JSON)",
+      "description": "Full per-row checklist with status, severity, category, notes, evidence pointers, and reviewer timestamps.",
+      "encodingFormat": "application/json",
+      "contentUrl": "https://CELLS.tech/api/v1/audit/items"
+    },
+    {
+      "@type": "ImageObject",
+      "name": "Audit score badge (SVG)",
+      "description": "Server-rendered shields.io-style SVG badge — embeddable in third-party READMEs, dashboards, and exchange listings. Same endpoint the homepage trust strip and every product landing page render.",
+      "encodingFormat": "image/svg+xml",
+      "contentUrl": "https://CELLS.tech/api/v1/audit/badge.svg"
+    }
+  ],
+  "variableMeasured": [
+    {
+      "@type": "PropertyValue",
+      "name": "Audit score",
+      "description": "Aggregate percentage of audit rows passed (or waived with documented mitigation).",
+      "unitText": "percent"
+    },
+    {
+      "@type": "PropertyValue",
+      "name": "Status",
+      "description": "Per-row audit status. Closed enum: passed, failed, pending, waived."
+    },
+    {
+      "@type": "PropertyValue",
+      "name": "Severity",
+      "description": "Per-row severity if the invariant fails. Closed enum: critical, high, medium, low, info."
+    },
+    {
+      "@type": "PropertyValue",
+      "name": "Category",
+      "description": "Per-row audit category. Closed enum: cryptography, authentication, authorisation, network, smart_contracts, bridge, storage, api, governance, infrastructure, supply_chain, runtime, secret_rotation, rebrand, tokenomics, mining_audit, trust_api."
+    }
+  ],
+  "mainEntityOfPage": "https://CELLS.tech/audit.html"
+}
+</script>
+<style>
+  /* CELLS public audit page. Modelled directly on trust.html — same
+   * brand voice, same colour tokens, same fetch-with-fallback
+   * strategy, same 60-second refresh cadence.
+   *
+   * The shape:
+   *   1. Score panel — headline % + bucket counts + has-blocking pill.
+   *   2. Evidence provenance — three-column breakdown of *how* the
+   *      passed rows became passed (live-deploy / in-tree-tests /
+   *      in-tree). This is the bit that distinguishes a real audit
+   *      checklist from a marketing checklist: every passed row
+   *      points at runnable evidence.
+   *   3. Blocking findings — only rendered when has_blocking_findings
+   *      is true. Top-5 capped at the API; full list reachable via
+   *      "View all pending" CTA.
+   *   4. Filter chips — closed-enum, mirrors the API filter contract.
+   *   5. Items table — 88 rows, sticky header, click-to-expand for
+   *      Notes / ReviewedBy / ReviewedAt.
+   *
+   * Anti-features (intentional):
+   *   - No build step. Pure HTML / CSS / vanilla JS, no React, no
+   *     bundler, no npm.
+   *   - No analytics or telemetry. The page makes exactly two
+   *     fetches against the public API.
+   *   - No edit/admin path. The checklist is read-only from this
+   *     surface; mutation happens in the source tree via PR.
+   */
+  :root {
+    --bg: #061116;
+    --bg-2: #0a1f26;
+    --panel: #0c242c;
+    --panel-2: #12323c;
+    --border: rgba(142, 220, 224, 0.16);
+    --text: #f4fbfd;
+    --text-2: rgba(244, 251, 253, 0.62);
+    --muted: rgba(173, 198, 204, 0.72);
+    --gold: #d6b75f;
+    --teal: #8edce0;
+    --accent: #d6b75f;
+    --accent-2: #8edce0;
+    --accent-3: #8edce0;
+    --ink: #061116;
+    --danger: #ff6b6b;
+    --warn: #ffb454;
+    --success: #3ddc97;
+    --warning: #e8c547;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  a { color: var(--accent-3); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .container { max-width: 1120px; margin: 0 auto; padding: 36px 20px; }
+  header { border-bottom: 1px solid var(--border); }
+  header .container { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; gap: 16px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 700; letter-spacing: 0.2px; }
+  .brand svg { width: 26px; height: 26px; }
+  h1 { font-size: 36px; line-height: 1.1; margin: 0 0 12px; }
+  h2 { font-size: 22px; margin: 32px 0 12px; }
+  h3 { font-size: 15px; margin: 0 0 6px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; }
+  .lede { color: var(--text-2); font-size: 17px; line-height: 1.55; max-width: 760px; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 22px 24px;
+  }
+  .panel-tight { padding: 16px 18px; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 720px) {
+    .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+  }
+
+  /* score panel */
+  .score-big { font-family: var(--mono); font-size: 64px; font-weight: 700; letter-spacing: 0; line-height: 1; }
+  .score-big .small { font-size: 22px; color: var(--text-2); font-weight: 500; margin-left: 8px; }
+  .bucket-tile {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .bucket-tile .label { color: var(--text-2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600; margin-bottom: 4px; }
+  .bucket-tile .value { font-family: var(--mono); font-size: 24px; font-weight: 700; }
+  .bucket-tile.passed  .value { color: var(--success); }
+  .bucket-tile.pending .value { color: var(--warn); }
+  .bucket-tile.failed  .value { color: var(--danger); }
+  .bucket-tile.waived  .value { color: var(--muted); }
+
+  /* pills */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px; font-size: 11.5px;
+    border: 1px solid var(--border); background: rgba(255,255,255,0.02);
+    color: var(--text-2); font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px;
+    white-space: nowrap;
+  }
+  .pill.severity-critical { color: #ffb1b1; border-color: #4a1f2a; background: rgba(255,107,107,0.07); }
+  .pill.severity-high     { color: #ffcf9c; border-color: #4a311a; background: rgba(255,180,84,0.07); }
+  .pill.severity-medium   { color: #d7f5f6; border-color: rgba(142,220,224,.28); background: rgba(142,220,224,0.07); }
+  .pill.severity-low      { color: var(--text-2); }
+  .pill.severity-info     { color: var(--muted); }
+  .pill.status-passed     { color: #aef3ce; border-color: #1f4633; background: rgba(61,220,151,0.07); }
+  .pill.status-pending    { color: #ffd9a7; border-color: #4a311a; background: rgba(255,180,84,0.08); }
+  .pill.status-failed     { color: #ffb1b1; border-color: #4a1f2a; background: rgba(255,107,107,0.08); }
+  .pill.status-waived     { color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.status-healthy  { background: var(--success); box-shadow: 0 0 8px var(--success); }
+  .dot.status-blocked  { background: var(--warn);    box-shadow: 0 0 8px var(--warn); }
+  .dot.status-failed   { background: var(--danger);  box-shadow: 0 0 8px var(--danger); }
+  .dot.status-unknown  { background: var(--muted); }
+
+  /* filter chip row */
+  .filterbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 14px; align-items: center; }
+  .filterbar .label { color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; margin-right: 4px; }
+  .chip {
+    cursor: pointer; user-select: none;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 11px; border-radius: 999px; font-size: 12.5px;
+    border: 1px solid var(--border); background: rgba(255,255,255,0.02);
+    color: var(--text-2); font-weight: 500;
+  }
+  .chip:hover { color: var(--text); border-color: rgba(142,220,224,.34); }
+  .chip.active {
+    background: rgba(214,183,95,0.10); border-color: rgba(214,183,95,.45); color: #f0dc92;
+  }
+  .chip .count { font-family: var(--mono); color: var(--muted); font-size: 11px; }
+  .chip.active .count { color: #d6b75f; }
+
+  /* items table */
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th {
+    color: var(--text-2); font-weight: 600; font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.6px;
+    background: var(--panel); position: sticky; top: 0;
+  }
+  tr.row { transition: background-color 0.08s ease; }
+  tr.row:hover { background: rgba(142,220,224,0.04); }
+  tr.row.open { background: rgba(142,220,224,0.06); }
+  tr.row td { cursor: pointer; }
+  /* scroll-margin-top is the offset applied when scrollIntoView lands
+   * on this element, accounting for the sticky thead so a deep-linked
+   * row is not painted UNDER the header. 60px matches the rendered
+   * height of th (10px top/bottom padding + 12px content + 1px
+   * border + ~25px safety) — measured in Chrome 121 against the
+   * rendered table; revisit if the th padding ever changes. */
+  tr.row { scroll-margin-top: 60px; }
+  /* Permalink flash: brief tint + outline pulse when a row is
+   * landed on via #row=<id>. Auto-removes after the animation;
+   * see flashDeepLinkedRow() in the script block. The keyframes
+   * use only background-color + box-shadow so the animation
+   * does NOT reflow the table (transform / width changes would
+   * cause the sticky thead to repaint and look janky). */
+  @keyframes audit-row-flash {
+    0%   { background: rgba(142,220,224,0.30); box-shadow: inset 0 0 0 2px var(--accent-3); }
+    60%  { background: rgba(142,220,224,0.20); box-shadow: inset 0 0 0 2px var(--accent-3); }
+    100% { background: rgba(142,220,224,0.06); box-shadow: inset 0 0 0 0   transparent; }
+  }
+  tr.row.flash { animation: audit-row-flash 2200ms ease-out 1; }
+  tr.detail td { padding: 0; cursor: default; }
+  tr.detail .inner {
+    padding: 14px 16px 18px 16px;
+    background: var(--panel-2);
+    border-left: 3px solid var(--accent-3);
+    font-size: 13.5px; color: var(--text-2); line-height: 1.6;
+  }
+  tr.detail .inner h4 {
+    color: var(--text); margin: 0 0 4px; font-size: 13px;
+    text-transform: uppercase; letter-spacing: 0.6px;
+  }
+  tr.detail .inner .field { margin-bottom: 12px; }
+  tr.detail .inner .field:last-child { margin-bottom: 0; }
+  tr.detail .inner .mono { font-family: var(--mono); font-size: 12.5px; color: var(--text); }
+  td.mono { font-family: var(--mono); color: var(--text); }
+  td.id { font-family: var(--mono); color: var(--accent-2); font-size: 13px; }
+  td.title { color: var(--text); }
+  td.category { color: var(--text-2); font-size: 12px; }
+
+  .scope-note {
+    padding: 12px 16px; border-left: 3px solid var(--accent);
+    background: rgba(214,183,95,0.04); color: var(--text-2); font-size: 13px; line-height: 1.55;
+    margin: 20px 0;
+  }
+  .scope-note strong { color: var(--text); }
+  .scope-note code { font-family: var(--mono); background: rgba(255,255,255,.06); padding: 1px 6px; border-radius: 4px; font-size: 12px; color: var(--text); }
+
+  .blocking-card {
+    padding: 14px 16px; margin: 8px 0;
+    border-radius: 8px;
+    background: rgba(255,180,84,0.05);
+    border: 1px solid #3a2a14;
+  }
+  .blocking-card .title { color: var(--text); font-weight: 600; margin-top: 4px; }
+  .blocking-card .meta { color: var(--text-2); font-size: 12.5px; margin-top: 6px; display: flex; gap: 10px; flex-wrap: wrap; }
+
+  .meter { background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; height: 10px; overflow: hidden; margin-top: 8px; }
+  .meter .fill { height: 100%; background: var(--accent-2); transition: width 0.3s ease; }
+
+  /* Category breakdown panel
+   *
+   * Each card aggregates per-category status counts from lastItems and
+   * doubles as the category filter control. Clicking a card sets
+   * filterState.category and scrolls to the items table; clicking the
+   * already-active card (or the explicit "all categories" pill above
+   * the grid) clears the filter. The active state has a slightly
+   * elevated background and an accent-coloured left border so a
+   * visitor can see at a glance which category is currently driving
+   * the table below.
+   *
+   * The stacked mini-bar mirrors the bucket palette from the
+   * bucket-tile / .pill rules above (passed=success / pending=warn /
+   * failed=danger / waived=muted), so the colour vocabulary across
+   * the whole page is one set of meanings.
+   */
+  .cat-clear-row { margin: 0 0 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .cat-clear-row .label { color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; margin-right: 4px; }
+  .cat-clear-row .chip.cat-clear { background: rgba(214,183,95,0.10); border-color: rgba(214,183,95,.45); color: #f0dc92; }
+  .cat-clear-row .chip.cat-clear:hover { background: rgba(214,183,95,0.18); }
+  .cat-clear-row .chip.cat-clear-inactive {
+    background: rgba(255,255,255,0.02);
+    border-color: var(--border);
+    color: var(--text-2);
+    cursor: default;
+  }
+  .cat-clear-row .chip.cat-clear-inactive:hover { background: rgba(255,255,255,0.02); border-color: var(--border); }
+  .cat-active-indicator { color: var(--text-2); font-size: 12.5px; }
+  .cat-active-indicator .mono { font-family: var(--mono); color: var(--accent-2); }
+
+  .cat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin: 6px 0 22px;
+  }
+  @media (max-width: 980px) {
+    .cat-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 560px) {
+    .cat-grid { grid-template-columns: 1fr; }
+  }
+  .cat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.08s ease, border-color 0.08s ease;
+  }
+  .cat-card:hover {
+    background: var(--panel-2);
+    border-color: rgba(142,220,224,.34);
+    border-left-color: var(--accent-3);
+  }
+  .cat-card.active {
+    background: var(--panel-2);
+    border-color: rgba(214,183,95,.45);
+    border-left-color: var(--accent);
+  }
+  .cat-card.dim { opacity: 0.55; }
+  .cat-card.dim:hover { opacity: 1; }
+  .cat-card .head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 8px; margin-bottom: 6px;
+  }
+  .cat-card .name {
+    color: var(--text); font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .cat-card .ratio {
+    font-family: var(--mono); color: var(--text-2); font-size: 12.5px; white-space: nowrap;
+  }
+  .cat-card .ratio .score {
+    color: var(--text); font-weight: 700;
+  }
+  /* stacked bar: each .seg is a div with a flex-grow proportional to
+   * the per-status count; the segment order matches the bucket-tile
+   * colours so visual scanning ("more green = healthier") works
+   * without a legend. */
+  .cat-bar {
+    display: flex;
+    height: 6px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 2px 0 6px;
+  }
+  .cat-bar .seg { height: 100%; }
+  .cat-bar .seg.passed  { background: var(--success); }
+  .cat-bar .seg.pending { background: var(--warn); }
+  .cat-bar .seg.failed  { background: var(--danger); }
+  .cat-bar .seg.waived  { background: var(--muted); }
+
+  .cat-meta {
+    color: var(--muted); font-size: 11.5px;
+    display: flex; gap: 10px; flex-wrap: wrap;
+  }
+  .cat-meta .pcount { color: var(--success); }
+  .cat-meta .ncount { color: var(--warn); }
+  .cat-meta .fcount { color: var(--danger); }
+  .cat-meta .wcount { color: var(--muted); }
+
+  footer { border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  footer .container { padding: 20px; max-width: 1120px; }
+  footer .mono { font-family: var(--mono); }
+  .empty {
+    color: var(--muted); padding: 18px 12px; text-align: center;
+  }
+  .sr { position: absolute; left: -9999px; }
+
+  /* keyboard-focus visibility */
+  .chip:focus-visible, tr.row td:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent-3); outline-offset: 2px; border-radius: 6px;
+  }
+</style>
+</head>
+<body data-page="audit">
+<header id="site-header"></header>
+<script src="/assets/site-shell.js"></script>
+
+<main id="main" class="container">
+  <span class="pill"><span class="dot status-unknown" id="status-dot"></span> <span id="status-label">loading</span></span>
+  <h1>Public audit checklist</h1>
+  <p class="lede">
+    Live snapshot of the CELLS internal audit checklist. Every row points at runnable
+    in-tree evidence (a test file, a live deployment, or a verifiable source-tree
+    artefact). For the optional NVIDIA attestation feed, see
+    <a href="/trust.html">attestation transparency</a>.
+    The score and items below are fetched directly from the public API —
+    the same JSON the SDK and the operator dashboard tile consume.
+  </p>
+
+  <div class="scope-note">
+    <strong>Scope:</strong> this is an <em>internal</em> audit checklist maintained
+    in <code>pkg/audit/checklist.go</code>; it is not a substitute for the
+    <em>external</em> security audit tracked by row <code>mining-01</code> (RFP
+    drafted, see <code>CELLS/docs/docs/audit/MINING_AUDITOR_RFP.md</code>). The
+    internal checklist surfaces <strong>what we have done</strong>; the external
+    audit will surface <strong>what we missed</strong>. Treat the internal
+    score as a necessary, not sufficient, signal of readiness.
+  </div>
+
+  <!-- Score panel -->
+  <section class="panel" style="margin: 22px 0;">
+    <div class="grid-2" style="align-items: center;">
+      <div>
+        <h3>Audit score</h3>
+        <div class="score-big" id="score">— <span class="small">of 100</span></div>
+        <div class="meter" aria-hidden="true"><div class="fill" id="meter" style="width:0%"></div></div>
+        <div style="color:var(--muted); font-size:12px; margin-top:8px;">
+          (passed + waived) ÷ total — same formula as <code>audit.Checklist.Score()</code>.
+        </div>
+      </div>
+      <div>
+        <h3>Bucket counts</h3>
+        <div class="grid-4">
+          <div class="bucket-tile passed">
+            <div class="label">Passed</div>
+            <div class="value" id="bucket-passed">—</div>
+          </div>
+          <div class="bucket-tile pending">
+            <div class="label">Pending</div>
+            <div class="value" id="bucket-pending">—</div>
+          </div>
+          <div class="bucket-tile failed">
+            <div class="label">Failed</div>
+            <div class="value" id="bucket-failed">—</div>
+          </div>
+          <div class="bucket-tile waived">
+            <div class="label">Waived</div>
+            <div class="value" id="bucket-waived">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Evidence provenance -->
+  <h2>Evidence provenance</h2>
+  <p style="color:var(--text-2); margin: 0 0 12px; max-width: 760px;">
+    <em>How</em> the passed rows became passed. A row marked
+    <code>evidence:live-deploy</code> has been verified against the
+    production validator at <code>api.CELLS.tech</code>; <code>in-tree-tests</code>
+    means a Go test pins the behaviour in CI; <code>in-tree</code> means
+    the evidence is a source-tree artefact (a config, a runbook, a build flag).
+  </p>
+  <div class="grid-3">
+    <div class="panel panel-tight">
+      <h3>Live deploy</h3>
+      <div class="score-big" id="prov-live" style="font-size: 32px;">—</div>
+      <div style="color:var(--muted); font-size:12px;">verified against api.CELLS.tech</div>
+    </div>
+    <div class="panel panel-tight">
+      <h3>In-tree tests</h3>
+      <div class="score-big" id="prov-tests" style="font-size: 32px;">—</div>
+      <div style="color:var(--muted); font-size:12px;">pinned in CI by Go tests</div>
+    </div>
+    <div class="panel panel-tight">
+      <h3>In-tree</h3>
+      <div class="score-big" id="prov-itree" style="font-size: 32px;">—</div>
+      <div style="color:var(--muted); font-size:12px;">source-tree artefacts</div>
+    </div>
+  </div>
+
+  <!-- Category breakdown
+       Per-category aggregation rendered as clickable cards: each card
+       shows total / passed-share / mini stacked bar, and acts as the
+       category filter for the items table below. The 17 audit categories
+       are defined by allowedAuditAPICategories in pkg/api/handlers_audit.go
+       and pkg/audit/checklist.go; renderCategoryBreakdown() picks them up
+       dynamically so a new category constant added in either of those
+       sources surfaces here on the next deploy without an audit.html
+       edit. Deep-linkable via ?category=<name>; selection state is
+       reflected in the URL via history.replaceState (no reload).
+  -->
+  <h2 style="margin-top: 30px;">Category breakdown</h2>
+  <p style="color:var(--text-2); margin: 0 0 14px; max-width: 760px;">
+    Where the work concentrates and where the gaps are. Click any
+    category to drill into the items table below — same rows as
+    <code>?category=&lt;name&gt;</code> on
+    <code>/api/v1/audit/items</code>. Bars use the same palette as the
+    bucket counts: <span style="color:var(--success);">passed</span> /
+    <span style="color:var(--warn);">pending</span> /
+    <span style="color:var(--danger);">failed</span> /
+    <span style="color:var(--muted);">waived</span>.
+  </p>
+  <div class="cat-clear-row" id="cat-clear-row">
+    <span class="label">Filter:</span>
+    <span id="cat-active-indicator" class="cat-active-indicator">All categories</span>
+    <button id="cat-clear-btn" class="chip cat-clear-inactive" type="button" aria-label="Clear category filter" disabled>
+      Clear
+    </button>
+  </div>
+  <div class="cat-grid" id="cat-grid">
+    <div class="empty" style="grid-column: 1 / -1;">loading…</div>
+  </div>
+
+  <!-- Blocking findings (only when present) -->
+  <section id="blocking-section" style="display:none;">
+    <h2>Blocking findings</h2>
+    <p style="color:var(--text-2); margin: 0 0 12px; max-width: 760px;">
+      Critical and high-severity rows that are still <code>pending</code> or
+      <code>failed</code>. Each of these is wall-clock-blocked on an external
+      party (an auditor, counsel, the market, or a trademark office). The
+      engagement-ready wrapper documents live in
+      <code>CELLS/docs/docs/audit/</code>.
+    </p>
+    <div id="blocking-list"></div>
+  </section>
+
+  <!-- Items table -->
+  <h2 id="items-heading">All audit rows</h2>
+  <div class="filterbar" id="filter-status">
+    <span class="label">Status</span>
+    <button class="chip active" data-status="">All <span class="count" id="cnt-status-all"></span></button>
+    <button class="chip" data-status="passed">Passed <span class="count" id="cnt-status-passed"></span></button>
+    <button class="chip" data-status="pending">Pending <span class="count" id="cnt-status-pending"></span></button>
+    <button class="chip" data-status="failed">Failed <span class="count" id="cnt-status-failed"></span></button>
+    <button class="chip" data-status="waived">Waived <span class="count" id="cnt-status-waived"></span></button>
+  </div>
+  <div class="filterbar" id="filter-severity">
+    <span class="label">Severity</span>
+    <button class="chip active" data-severity="">All</button>
+    <button class="chip" data-severity="critical">Critical</button>
+    <button class="chip" data-severity="high">High</button>
+    <button class="chip" data-severity="medium">Medium</button>
+    <button class="chip" data-severity="low">Low</button>
+    <button class="chip" data-severity="info">Info</button>
+  </div>
+
+  <div class="panel" style="padding: 0;">
+    <table aria-describedby="items-desc">
+      <thead>
+        <tr>
+          <th style="width: 12%;">ID</th>
+          <th style="width: 14%;">Category</th>
+          <th style="width: 10%;">Severity</th>
+          <th style="width: 10%;">Status</th>
+          <th>Title</th>
+        </tr>
+      </thead>
+      <tbody id="items-body">
+        <tr><td colspan="5" class="empty">loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p id="items-desc" style="color:var(--muted); font-size:12.5px; margin-top:10px;">
+    Click any row to expand its description, notes, and review provenance.
+    Showing <span id="visible-count">—</span> of <span id="total-count">—</span> rows.
+  </p>
+
+  <!--
+    Embed section: drop-in artefacts for third-party transparency.
+    The badge is a server-rendered shields.io-style SVG at
+    /api/v1/audit/badge.svg — every page-load fetches a fresh score
+    from origin (60 s edge cache). Width auto-sizes to the score
+    text; colour cascades on the standard shields.io ladder
+    (brightgreen >= 95, yellowgreen >= 85, etc.).
+  -->
+  <h2 style="margin-top: 40px;">Embed</h2>
+  <div class="panel" style="padding: 22px;">
+    <p style="margin-top:0; color:var(--muted); font-size:13.5px; line-height:1.55;">
+      Hot-link the badge below from any README, exchange listing,
+      validator dashboard, blog post, or status page. The SVG is
+      server-rendered on every request, so the score is always
+      live (60&nbsp;s edge cache). Drop-in <code>&lt;img&gt;</code>
+      works across GitHub, GitLab, Notion, Bear, and every
+      mainstream Markdown renderer — no CORS, no JS, no iframe.
+    </p>
+
+    <div style="margin: 16px 0 20px; padding: 14px 16px; background: rgba(255,255,255,.04); border: 1px solid var(--panel-border); border-radius: 8px;">
+      <div style="font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 10px;">
+        Live preview
+      </div>
+      <img src="/api/v1/audit/badge.svg"
+           alt="CELLS audit score (live)"
+           style="display: block; height: 20px;" />
+    </div>
+
+    <div style="display: grid; grid-template-columns: 1fr; gap: 14px;">
+      <div>
+        <div style="font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px;">
+          Markdown (GitHub READMEs)
+        </div>
+        <pre style="margin:0; padding: 10px 12px; background: rgba(0,0,0,.35); border: 1px solid var(--panel-border); border-radius: 6px; font-family: var(--mono); font-size: 12.5px; color: var(--text); overflow-x: auto; line-height: 1.45;"><code>[![CELLS audit](https://CELLS.tech/api/v1/audit/badge.svg)](https://CELLS.tech/audit.html)</code></pre>
+      </div>
+
+      <div>
+        <div style="font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px;">
+          HTML &lt;img&gt; (blogs, dashboards, status pages)
+        </div>
+        <pre style="margin:0; padding: 10px 12px; background: rgba(0,0,0,.35); border: 1px solid var(--panel-border); border-radius: 6px; font-family: var(--mono); font-size: 12.5px; color: var(--text); overflow-x: auto; line-height: 1.45;"><code>&lt;a href="https://CELLS.tech/audit.html"&gt;
+  &lt;img src="https://CELLS.tech/api/v1/audit/badge.svg" alt="CELLS audit score" /&gt;
+&lt;/a&gt;</code></pre>
+      </div>
+
+      <div>
+        <div style="font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px;">
+          Raw endpoint
+        </div>
+        <pre style="margin:0; padding: 10px 12px; background: rgba(0,0,0,.35); border: 1px solid var(--panel-border); border-radius: 6px; font-family: var(--mono); font-size: 12.5px; color: var(--text); overflow-x: auto; line-height: 1.45;"><code>GET https://CELLS.tech/api/v1/audit/badge.svg
+GET https://api.CELLS.tech/api/v1/audit/badge.svg   # equivalent</code></pre>
+      </div>
+    </div>
+
+    <p style="margin: 18px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.55;">
+      Colour ladder: <strong style="color:#4c1;">≥95% brightgreen</strong>
+      &middot; <strong style="color:#c8c821;">≥85% yellowgreen</strong>
+      &middot; <strong style="color:#dfb317;">≥70% yellow</strong>
+      &middot; <strong style="color:#fe7d37;">≥50% orange</strong>
+      &middot; <strong style="color:#e05d44;">&lt;50% red</strong>.
+      Pinned by <code>scoreColour</code> in
+      <code>pkg/api/handlers_audit_badge.go</code>; threshold drift
+      fails CI via <code>TestAuditBadge_ColourThresholds</code>.
+    </p>
+  </div>
+</main>
+
+<div class="q-wrap"><p class="q-note page-foot-note">Source:
+      <span class="mono">GET /api/v1/audit/summary</span>,
+      <span class="mono">/api/v1/audit/items</span>,
+      <span class="mono">/api/v1/audit/badge.svg</span>.
+      Refreshes every 60&nbsp;s.
+      <a href="https://github.com/blackbeardONE/CELLS/blob/main/CELLS/source/pkg/audit/checklist.go">pkg/audit/checklist.go</a>.
+      © <span id="y"></span> CELLS · CELL.</p></div>
+<footer id="site-footer"></footer>
+
+<script>
+(function() {
+  document.getElementById('y').textContent = new Date().getFullYear();
+
+  // Endpoints with same-origin first, then api.CELLS.tech fallback.
+  // Mirrors the trust.html pattern so the page works both when
+  // served from api.CELLS.tech (same-origin) and from a static
+  // host (CORS-allowed cross-origin).
+  var endpoints = {
+    summary: ['/api/v1/audit/summary', 'https://api.CELLS.tech/api/v1/audit/summary'],
+    items:   ['/api/v1/audit/items',   'https://api.CELLS.tech/api/v1/audit/items']
+  };
+
+  // Currently-selected filter state. Empty string = "no filter".
+  // status / severity are driven by the chip rows below the items
+  // table; category is driven by the Category breakdown cards above
+  // it. Both are independent filter dimensions ANDed together in
+  // passesFilters. Initial values are pulled from the URL so a
+  // deep-link like /audit.html?category=tokenomics&status=pending
+  // lands on the filtered view directly.
+  var filterState = (function() {
+    var p = new URLSearchParams(window.location.search);
+    function pick(key, allowed) {
+      var v = (p.get(key) || '').trim().toLowerCase();
+      return allowed.indexOf(v) >= 0 ? v : '';
+    }
+    return {
+      status:   pick('status',   ['', 'passed', 'pending', 'failed', 'waived']),
+      severity: pick('severity', ['', 'critical', 'high', 'medium', 'low', 'info']),
+      // category allow-list is open here because we don't want to
+      // hard-code the 17 enum values in two places (the Go source
+      // already enforces the closed-enum on /api/v1/audit/items);
+      // an invalid category from the URL just renders the empty
+      // state for the table, which is the right "you mis-typed the
+      // filter" signal.
+      category: (p.get('category') || '').trim().toLowerCase()
+    };
+  })();
+
+  // Persist the current filterState into the URL so the visible
+  // page state survives a copy-paste of the URL or a browser
+  // refresh, without polluting the back-stack. Preserves any
+  // existing #row=<id> permalink hash so toggling a chip while a
+  // deep-linked row is open does not "lose" the permalink.
+  function syncURLFromFilters() {
+    var p = new URLSearchParams();
+    if (filterState.status)   p.set('status',   filterState.status);
+    if (filterState.severity) p.set('severity', filterState.severity);
+    if (filterState.category) p.set('category', filterState.category);
+    var qs = p.toString();
+    var newURL = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash;
+    try { window.history.replaceState(null, '', newURL); } catch (e) { /* ignore */ }
+  }
+
+  // Parse the #row=<id> permalink from the URL hash. The hash is
+  // intentionally a `key=value` shape (not just `#id`) so it does
+  // not collide with the legacy "fragment is the element id"
+  // browser convention — that convention would force the page to
+  // auto-scroll to a DOM element with id="<id>" the moment the
+  // hash is set, before our JS has had a chance to render the
+  // items table. Using #row=<id> lets us own the scroll target.
+  function parseRowHash() {
+    var h = (window.location.hash || '').replace(/^#/, '');
+    if (h.indexOf('row=') !== 0) return '';
+    return h.slice(4).trim().toLowerCase();
+  }
+
+  // Write a #row=<id> permalink hash without scrolling (the
+  // default `location.hash = ...` setter scrolls to the matching
+  // element and we already manage scroll ourselves). Empty id
+  // strips the hash entirely.
+  function writeRowHash(id) {
+    var p = window.location.search;
+    var newURL = window.location.pathname + p + (id ? '#row=' + id : '');
+    try { window.history.replaceState(null, '', newURL); } catch (e) { /* ignore */ }
+  }
+
+  // Last full items list received from the API. Re-rendered when
+  // filters change so we don't hammer the API on every chip click.
+  var lastItems = [];
+  // Track which row IDs are expanded so a refresh doesn't collapse
+  // a user's currently-open row.
+  var openIds = Object.create(null);
+
+  function setStatus(state, label) {
+    var dot = document.getElementById('status-dot');
+    dot.className = 'dot status-' + (state || 'unknown');
+    document.getElementById('status-label').textContent = label || state || 'unknown';
+  }
+
+  function tryEach(list, i, onData, onError) {
+    if (i >= list.length) { onError(); return; }
+    fetch(list[i], { headers: { 'Accept': 'application/json' } })
+      .then(function(res) {
+        if (!res.ok) throw new Error('http ' + res.status);
+        return res.json();
+      })
+      .then(function(data) { onData(data); })
+      .catch(function() { tryEach(list, i + 1, onData, onError); });
+  }
+
+  function fmtScore(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '—';
+    return n.toFixed(2);
+  }
+
+  function loadSummary() {
+    tryEach(endpoints.summary, 0,
+      function(data) {
+        document.getElementById('score').innerHTML =
+          fmtScore(data.score) + '<span class="small">% of 100</span>';
+        document.getElementById('meter').style.width =
+          Math.min(100, Math.max(0, data.score || 0)) + '%';
+
+        var s = data.summary || {};
+        document.getElementById('bucket-passed').textContent  = (s.passed  != null ? s.passed  : '—');
+        document.getElementById('bucket-pending').textContent = (s.pending != null ? s.pending : '—');
+        document.getElementById('bucket-failed').textContent  = (s.failed  != null ? s.failed  : '—');
+        document.getElementById('bucket-waived').textContent  = (s.waived  != null ? s.waived  : '—');
+
+        var p = data.evidence_provenance || {};
+        document.getElementById('prov-live').textContent  = (p['evidence:live-deploy']   != null ? p['evidence:live-deploy']   : '—');
+        document.getElementById('prov-tests').textContent = (p['evidence:in-tree-tests'] != null ? p['evidence:in-tree-tests'] : '—');
+        document.getElementById('prov-itree').textContent = (p['evidence:in-tree']       != null ? p['evidence:in-tree']       : '—');
+
+        renderBlocking(data);
+
+        if (data.has_blocking_findings) {
+          setStatus('blocked', data.blocking_count + ' blocker(s)');
+        } else {
+          setStatus('healthy', 'no blockers');
+        }
+      },
+      function() { setStatus('failed', 'API unavailable'); }
+    );
+  }
+
+  function escapeHTML(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function renderBlocking(data) {
+    var section = document.getElementById('blocking-section');
+    var list = document.getElementById('blocking-list');
+    var preview = data.blocking_preview || [];
+    if (!data.has_blocking_findings || preview.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+    var html = preview.map(function(b) {
+      return '<div class="blocking-card">'
+        + '<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">'
+        + '<span class="pill severity-' + escapeHTML(b.severity) + '">' + escapeHTML(b.severity) + '</span>'
+        + '<span class="pill status-'   + escapeHTML(b.status)   + '">' + escapeHTML(b.status)   + '</span>'
+        + '<span class="mono" style="color:var(--accent-2);">' + escapeHTML(b.id) + '</span>'
+        + '<span style="color:var(--muted); font-size:12.5px;">' + escapeHTML(b.category) + '</span>'
+        + '</div>'
+        + '<div class="title">' + escapeHTML(b.title) + '</div>'
+        + '</div>';
+    }).join('');
+    if (data.blocking_count > preview.length) {
+      html += '<div style="color:var(--text-2); font-size:13px; margin-top:8px;">'
+        + '+ ' + (data.blocking_count - preview.length) + ' more — '
+        + '<a href="#" id="show-all-pending">view all pending</a>'
+        + '</div>';
+    }
+    list.innerHTML = html;
+    var showAll = document.getElementById('show-all-pending');
+    if (showAll) {
+      showAll.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        selectStatusChip('pending');
+        document.querySelector('#filter-status').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  }
+
+  function loadItems() {
+    tryEach(endpoints.items, 0,
+      function(data) {
+        lastItems = (data.items || []).slice();
+        renderCategoryBreakdown();
+        renderItems();
+        renderChipCounts();
+        // The initial filterState may have come from the URL on
+        // load; reflect it visually in the chip rows now that we
+        // have the data to count against.
+        applyFiltersFromState();
+        // Apply the #row=<id> permalink AFTER renderItems so the
+        // target <tr> exists in the DOM. openRowFromHash is a
+        // no-op when there is no hash, or when the hash points
+        // to an unknown id, so we can call it unconditionally
+        // on every items refresh — the 60s setInterval refresh
+        // will preserve a deep-linked row's open state.
+        openRowFromHash();
+      },
+      function() {
+        document.getElementById('items-body').innerHTML =
+          '<tr><td colspan="5" class="empty">items API unavailable</td></tr>';
+        document.getElementById('cat-grid').innerHTML =
+          '<div class="empty" style="grid-column: 1 / -1;">items API unavailable</div>';
+      }
+    );
+  }
+
+  function passesFilters(it) {
+    if (filterState.status   && it.status   !== filterState.status)   return false;
+    if (filterState.severity && it.severity !== filterState.severity) return false;
+    if (filterState.category && it.category !== filterState.category) return false;
+    return true;
+  }
+
+  // Per-category aggregation from lastItems → an ordered list of
+  // {category, total, passed, pending, failed, waived, score}.
+  // Category insertion order is the order each category FIRST
+  // appears in lastItems (which is the canonical defaultItems()
+  // order from the Go source), so the visual layout matches the
+  // order operators read the checklist in code review.
+  function aggregateByCategory(items) {
+    var byCat = Object.create(null);
+    var order = [];
+    items.forEach(function(it) {
+      var c = it.category || 'unknown';
+      if (!byCat[c]) {
+        byCat[c] = { category: c, total: 0, passed: 0, pending: 0, failed: 0, waived: 0 };
+        order.push(c);
+      }
+      byCat[c].total++;
+      if (byCat[c][it.status] != null) byCat[c][it.status]++;
+    });
+    return order.map(function(c) {
+      var b = byCat[c];
+      b.score = b.total > 0
+        ? ((b.passed + b.waived) / b.total) * 100.0
+        : 0;
+      return b;
+    });
+  }
+
+  // Pretty-print a snake_case audit category like
+  // "smart_contracts" as "Smart contracts" (capitalise first letter
+  // only — "API" stays "Api" which is a known minor uglification
+  // and not worth a special-case table).
+  function prettyCategory(s) {
+    if (!s) return '';
+    var spaced = String(s).replace(/_/g, ' ');
+    return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+  }
+
+  function renderCategoryBreakdown() {
+    var grid = document.getElementById('cat-grid');
+    if (lastItems.length === 0) {
+      grid.innerHTML = '<div class="empty" style="grid-column: 1 / -1;">no items loaded</div>';
+      return;
+    }
+    var rows = aggregateByCategory(lastItems);
+    var active = filterState.category;
+    grid.innerHTML = rows.map(function(r) {
+      var cls = 'cat-card';
+      if (active && r.category === active) cls += ' active';
+      else if (active)                     cls += ' dim';
+      // Stacked-bar segments use flex-grow proportional to the
+      // count; segments with zero count collapse to width 0 via
+      // flex-basis: 0 (the default). Order matches the bucket
+      // tile palette: passed → pending → failed → waived.
+      var passedPct  = (r.passed  / r.total) * 100;
+      var pendingPct = (r.pending / r.total) * 100;
+      var failedPct  = (r.failed  / r.total) * 100;
+      var waivedPct  = (r.waived  / r.total) * 100;
+      var meta = [];
+      if (r.passed)  meta.push('<span class="pcount">' + r.passed  + ' passed</span>');
+      if (r.pending) meta.push('<span class="ncount">' + r.pending + ' pending</span>');
+      if (r.failed)  meta.push('<span class="fcount">' + r.failed  + ' failed</span>');
+      if (r.waived)  meta.push('<span class="wcount">' + r.waived  + ' waived</span>');
+      return '<div class="' + cls + '" tabindex="0" role="button"'
+        + ' data-category="' + escapeHTML(r.category) + '"'
+        + ' aria-pressed="' + (active && r.category === active ? 'true' : 'false') + '"'
+        + ' aria-label="' + escapeHTML(prettyCategory(r.category)) + ': '
+            + r.passed + ' passed of ' + r.total + ' total. '
+            + 'Click to ' + (active && r.category === active ? 'clear' : 'filter to') + ' this category.">'
+        + '<div class="head">'
+          + '<div class="name">' + escapeHTML(prettyCategory(r.category)) + '</div>'
+          + '<div class="ratio"><span class="score">' + r.score.toFixed(0) + '%</span> · ' + r.passed + '/' + r.total + '</div>'
+        + '</div>'
+        + '<div class="cat-bar" aria-hidden="true">'
+          + (r.passed  ? '<div class="seg passed"  style="flex: ' + passedPct  + ';"></div>' : '')
+          + (r.pending ? '<div class="seg pending" style="flex: ' + pendingPct + ';"></div>' : '')
+          + (r.failed  ? '<div class="seg failed"  style="flex: ' + failedPct  + ';"></div>' : '')
+          + (r.waived  ? '<div class="seg waived"  style="flex: ' + waivedPct  + ';"></div>' : '')
+        + '</div>'
+        + '<div class="cat-meta">' + meta.join('<span style="color:var(--border);">·</span>') + '</div>'
+        + '</div>';
+    }).join('');
+    // Rebind click + keyboard handlers after innerHTML rebuild.
+    Array.prototype.forEach.call(grid.querySelectorAll('.cat-card'), function(card) {
+      card.addEventListener('click', function() { onCategoryCardClick(card.getAttribute('data-category')); });
+      card.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          onCategoryCardClick(card.getAttribute('data-category'));
+        }
+      });
+    });
+    renderCategoryClearBar();
+  }
+
+  function renderCategoryClearBar() {
+    var ind = document.getElementById('cat-active-indicator');
+    var btn = document.getElementById('cat-clear-btn');
+    if (filterState.category) {
+      ind.innerHTML = 'Showing category <span class="mono">' + escapeHTML(filterState.category) + '</span>';
+      btn.classList.remove('cat-clear-inactive');
+      btn.classList.add('cat-clear');
+      btn.disabled = false;
+    } else {
+      ind.textContent = 'All categories';
+      btn.classList.remove('cat-clear');
+      btn.classList.add('cat-clear-inactive');
+      btn.disabled = true;
+    }
+  }
+
+  function onCategoryCardClick(cat) {
+    // Clicking the already-active card clears the filter.
+    if (filterState.category === cat) {
+      filterState.category = '';
+    } else {
+      filterState.category = cat;
+    }
+    syncURLFromFilters();
+    renderCategoryBreakdown();
+    renderItems();
+    if (filterState.category) {
+      // Scroll the items table into view so the visitor sees the
+      // filtered rows immediately. block: 'start' lines the
+      // section heading up with the top of the viewport.
+      var tableHeading = document.querySelector('h2#items-heading') ||
+                         document.querySelector('h2[data-anchor="items-table"]');
+      if (tableHeading) {
+        tableHeading.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }
+  }
+
+  function clearCategoryFilter() {
+    if (!filterState.category) return;
+    filterState.category = '';
+    syncURLFromFilters();
+    renderCategoryBreakdown();
+    renderItems();
+  }
+
+  // Apply current filterState to the chip rows on load (in case the
+  // initial state came from the URL). Idempotent — safe to call
+  // every time the items list refreshes.
+  function applyFiltersFromState() {
+    ['status', 'severity'].forEach(function(key) {
+      var bar = document.getElementById('filter-' + key);
+      if (!bar) return;
+      Array.prototype.forEach.call(bar.querySelectorAll('button.chip'), function(b) {
+        var v = b.getAttribute('data-' + key) || '';
+        b.classList.toggle('active', v === filterState[key]);
+      });
+    });
+  }
+
+  function renderItems() {
+    var body = document.getElementById('items-body');
+    var filtered = lastItems.filter(passesFilters);
+    document.getElementById('visible-count').textContent = filtered.length;
+    document.getElementById('total-count').textContent = lastItems.length;
+    if (filtered.length === 0) {
+      body.innerHTML = '<tr><td colspan="5" class="empty">no rows match the current filters</td></tr>';
+      return;
+    }
+    var html = filtered.map(function(it) {
+      var open = !!openIds[it.id];
+      var rowCls = 'row' + (open ? ' open' : '');
+      var head = '<tr class="' + rowCls + '" data-id="' + escapeHTML(it.id) + '" tabindex="0" role="button" aria-expanded="' + (open ? 'true' : 'false') + '">'
+        + '<td class="id">' + escapeHTML(it.id) + '</td>'
+        + '<td class="category">' + escapeHTML(it.category) + '</td>'
+        + '<td><span class="pill severity-' + escapeHTML(it.severity) + '">' + escapeHTML(it.severity) + '</span></td>'
+        + '<td><span class="pill status-'   + escapeHTML(it.status)   + '">' + escapeHTML(it.status)   + '</span></td>'
+        + '<td class="title">' + escapeHTML(it.title) + '</td>'
+        + '</tr>';
+      if (!open) return head;
+      var detail = '<tr class="detail" data-detail-for="' + escapeHTML(it.id) + '"><td colspan="5"><div class="inner">'
+        + '<div class="field"><h4>Description</h4>' + escapeHTML(it.description || '—') + '</div>'
+        + (it.notes ? '<div class="field"><h4>Notes</h4>' + escapeHTML(it.notes) + '</div>' : '')
+        + (it.reviewed_by ? '<div class="field"><h4>Reviewed by</h4><span class="mono">' + escapeHTML(it.reviewed_by) + '</span></div>' : '')
+        + (it.reviewed_at ? '<div class="field"><h4>Reviewed at</h4><span class="mono">' + escapeHTML(it.reviewed_at) + '</span></div>' : '')
+        + '</div></td></tr>';
+      return head + detail;
+    }).join('');
+    body.innerHTML = html;
+    // Re-bind row-click handlers after innerHTML rebuild.
+    Array.prototype.forEach.call(body.querySelectorAll('tr.row'), function(tr) {
+      tr.addEventListener('click', function() { toggleRow(tr.getAttribute('data-id')); });
+      tr.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          toggleRow(tr.getAttribute('data-id'));
+        }
+      });
+    });
+  }
+
+  function toggleRow(id) {
+    if (openIds[id]) {
+      delete openIds[id];
+    } else {
+      openIds[id] = true;
+    }
+    // Sync the #row=<id> permalink to the URL. The convention:
+    //   - opening a row sets the hash to that row's id, so a
+    //     paste-the-URL share lands a viewer back on that row
+    //   - closing the row strips the hash, because there is no
+    //     meaningful "currently focused" row left
+    //   - opening a SECOND row (which leaves the first open too)
+    //     updates the hash to the most-recently-opened one,
+    //     because that's the row the user just expressed
+    //     interest in
+    if (openIds[id]) {
+      writeRowHash(id);
+    } else if (parseRowHash() === id) {
+      writeRowHash('');
+    }
+    renderItems();
+  }
+
+  // Pulse the deep-linked row briefly so a visitor's eye is
+  // drawn to it. The .flash class is removed after the keyframe
+  // duration (matched in CSS) so the row settles back to its
+  // normal .open background. CSS animation handles all of the
+  // visual work; this function just toggles the class.
+  function flashDeepLinkedRow(id) {
+    var tr = document.querySelector('tr.row[data-id="' + cssEscape(id) + '"]');
+    if (!tr) return;
+    tr.classList.remove('flash');
+    // Force reflow so the keyframe animation restarts when
+    // openRowFromHash is called twice in a row (e.g. on
+    // hashchange via back-button replay).
+    void tr.offsetWidth;
+    tr.classList.add('flash');
+    setTimeout(function() { tr.classList.remove('flash'); }, 2400);
+  }
+
+  // CSS.escape() polyfill suffices for our use (audit row IDs
+  // are kebab/dot-separated alnum like "rotation-01" or
+  // "store-02"); the full polyfill is unnecessary here.
+  function cssEscape(s) {
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  }
+
+  // Tracks the last hash value that triggered a scroll+flash, so
+  // the 60s auto-refresh doesn't keep re-flashing a row the
+  // visitor has already been pulled to. Reset whenever the hash
+  // changes externally (hashchange listener below) so a back-
+  // button replay DOES re-flash.
+  var lastAppliedRowHash = null;
+
+  // openRowFromHash: ensures the row whose id matches the
+  // current #row=<id> hash is expanded, scrolled into view, and
+  // briefly highlighted. Called on initial load (deferred until
+  // items have rendered), on hashchange (back/forward replay),
+  // and on every items refresh (the 60s setInterval) — the
+  // lastAppliedRowHash guard makes the refresh path a no-op
+  // for the flash, but still preserves the row's open state.
+  function openRowFromHash() {
+    var id = parseRowHash();
+    if (!id) {
+      lastAppliedRowHash = null;
+      return;
+    }
+    // Filtered-out: don't surface an error; just no-op so the
+    // hash is preserved when the user clears the filter the
+    // row will re-render and become visible again.
+    var match = lastItems.filter(function(it) { return it.id === id; });
+    if (match.length === 0) return;
+    // If a category filter is active and the deep-linked row
+    // belongs to a different category, clear the category
+    // filter so the row is actually visible. Status/severity
+    // are NOT auto-cleared because they're orthogonal
+    // dimensions the URL also carries — the visitor presumably
+    // wants both filters AND the row.
+    if (filterState.category && match[0].category !== filterState.category) {
+      filterState.category = '';
+      syncURLFromFilters();
+      renderCategoryBreakdown();
+    }
+    openIds[id] = true;
+    // Only scroll + flash if this is a NEW hash for us (initial
+    // load or hashchange) — not on the 60s auto-refresh that
+    // also calls into this function. Without this guard the row
+    // would flash every minute, which reads as "something is
+    // broken" rather than "you have been pulled to this row".
+    var shouldFlash = (lastAppliedRowHash !== id);
+    lastAppliedRowHash = id;
+    renderItems();
+    if (!shouldFlash) return;
+    // requestAnimationFrame ensures the new <tr> is in the DOM
+    // before scrollIntoView fires; without it, the scroll
+    // target can be the OLD <tr> that renderItems() just
+    // replaced, which leads to a no-op scroll.
+    window.requestAnimationFrame(function() {
+      var tr = document.querySelector('tr.row[data-id="' + cssEscape(id) + '"]');
+      if (tr) {
+        tr.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        flashDeepLinkedRow(id);
+      }
+    });
+  }
+
+  function renderChipCounts() {
+    var counts = { '': lastItems.length, passed: 0, pending: 0, failed: 0, waived: 0 };
+    lastItems.forEach(function(it) {
+      if (counts[it.status] != null) counts[it.status]++;
+    });
+    document.getElementById('cnt-status-all').textContent     = counts[''];
+    document.getElementById('cnt-status-passed').textContent  = counts.passed;
+    document.getElementById('cnt-status-pending').textContent = counts.pending;
+    document.getElementById('cnt-status-failed').textContent  = counts.failed;
+    document.getElementById('cnt-status-waived').textContent  = counts.waived;
+  }
+
+  function wireChips(barId, key) {
+    var bar = document.getElementById(barId);
+    Array.prototype.forEach.call(bar.querySelectorAll('button.chip'), function(btn) {
+      btn.addEventListener('click', function() {
+        var v = btn.getAttribute('data-' + key) || '';
+        filterState[key] = v;
+        Array.prototype.forEach.call(bar.querySelectorAll('button.chip'), function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+        syncURLFromFilters();
+        renderItems();
+      });
+    });
+  }
+
+  function selectStatusChip(status) {
+    var bar = document.getElementById('filter-status');
+    var target = bar.querySelector('button.chip[data-status="' + status + '"]');
+    if (target) target.click();
+  }
+
+  wireChips('filter-status', 'status');
+  wireChips('filter-severity', 'severity');
+
+  // Clear-category button (the pill above the cards). The cards
+  // themselves also clear the filter when re-clicked; this button
+  // is the explicit affordance for the "ok I'm done filtering"
+  // intent, in case the visitor scrolled away from the cards.
+  document.getElementById('cat-clear-btn').addEventListener('click', clearCategoryFilter);
+
+  // Back/forward navigation between deep-linked rows: when the
+  // browser fires hashchange (because the user pressed Back
+  // after opening multiple rows in sequence, or pasted a new
+  // hash into the address bar without reloading), re-apply the
+  // current hash. openRowFromHash is idempotent — calling it
+  // when the row is already open just refreshes the flash
+  // animation, which is the right cue ("yes, you're looking at
+  // this row").
+  window.addEventListener('hashchange', function() {
+    openRowFromHash();
+  });
+
+  loadSummary();
+  loadItems();
+  setInterval(function() { loadSummary(); loadItems(); }, 60000);
+})();
+</script>
+</body>
+</html>

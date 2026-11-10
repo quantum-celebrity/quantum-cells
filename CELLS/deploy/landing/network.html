@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CELLS Network status — producer, backup node, block time, API health</title>
+  <meta name="description" content="Live status of the CELLS CELL network: block producer version and uptime, chain tip, block-time check from recent blocks, backup node status and public API health." />
+  <link rel="canonical" href="https://CELLS.tech/network.html" />
+  <meta name="theme-color" content="#061116" />
+  <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/brand/favicon-16.png" />
+  <link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <meta property="og:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="CELLS logo: Quantum-Secure Dynamic Mesh ledger and the CELL coin" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+  <link rel="stylesheet" href="/assets/site.css" />
+  <link rel="stylesheet" href="/assets/site-shell.css" />
+  <style>
+    .status-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.6rem; margin-bottom: 1rem; }
+    .status-head h3 { margin: 0; font-size: 1.15rem; }
+    .health-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    .health-table th, .health-table td { padding: 0.65rem 0.5rem 0.65rem 0; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    .health-table thead th { color: var(--muted); font-size: 0.76rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+    .health-table tbody th { font-weight: 500; font-family: var(--mono); font-size: 0.84rem; color: var(--text); overflow-wrap: anywhere; }
+    .health-table td { font-family: var(--mono); font-size: 0.84rem; color: var(--text-2); }
+    .tablewrap { overflow-x: auto; }
+    .boundary { margin: 0; display: grid; gap: 0; border-top: 1px solid var(--border); }
+    .boundary div { display: grid; gap: 0.2rem; padding: 0.85rem 0; border-bottom: 1px solid var(--border); }
+    @media (min-width: 720px) { .boundary div { grid-template-columns: 14rem 1fr; gap: 1.5rem; } }
+    .boundary dt { font-weight: 600; }
+    .boundary dd { margin: 0; color: var(--muted); }
+  </style>
+</head>
+<body data-page="network">
+  <header id="site-header"></header>
+  <script src="/assets/site-shell.js"></script>
+
+  <main id="main">
+    <section class="page-hero" aria-labelledby="net-title">
+      <div class="q-wrap">
+        <span class="q-eyebrow">Network status</span>
+        <h1 id="net-title">CELLS Network <span class="dim">live status.</span></h1>
+        <p class="lead">
+          The CELL chain is currently produced by a single block producer while the
+          network recovers, with a backup node following it. This page checks both,
+          plus block timing and the public API, every 15 seconds.
+        </p>
+        <p class="source-line" style="margin-top:1rem">Overall: <span class="q-pill" id="overall">checking</span> · <span id="n-updated">loading…</span></p>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="nodes-title" style="border-top:0;padding-top:0">
+      <div class="q-wrap">
+        <h2 id="nodes-title" class="visually-hidden">Nodes</h2>
+        <div class="q-grid q-grid-2">
+          <article class="card" aria-labelledby="prod-title">
+            <div class="status-head"><h3 id="prod-title">Block producer</h3><span class="q-pill" id="p-pill">checking</span></div>
+            <dl class="q-kv">
+              <dt>Chain tip</dt><dd id="p-tip">—</dd>
+              <dt>Version</dt><dd id="p-version">—</dd>
+              <dt>Git commit</dt><dd id="p-sha">—</dd>
+              <dt>Build date</dt><dd id="p-build">—</dd>
+              <dt>Uptime</dt><dd id="p-uptime">—</dd>
+              <dt>Role</dt><dd id="p-role">—</dd>
+              <dt>Peers</dt><dd id="p-peers">—</dd>
+              <dt>Node ID</dt><dd id="p-node">—</dd>
+            </dl>
+            <p class="source-line">Source: <code>GET /api/v1/status</code></p>
+          </article>
+          <article class="card" aria-labelledby="backup-title">
+            <div class="status-head"><h3 id="backup-title">Backup node</h3><span class="q-pill" id="b-pill">checking</span></div>
+            <dl class="q-kv">
+              <dt>Chain tip</dt><dd id="b-tip">—</dd>
+              <dt>Behind producer</dt><dd id="b-lag">—</dd>
+              <dt>Version</dt><dd id="b-version">—</dd>
+              <dt>Uptime</dt><dd id="b-uptime">—</dd>
+              <dt>Role</dt><dd id="b-role">—</dd>
+              <dt>Node ID</dt><dd id="b-node">—</dd>
+            </dl>
+            <p class="source-line">Source: <code>https://api.CELLS.tech/attest/home-validator/api/v1/status</code></p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="bt-title">
+      <div class="q-wrap">
+        <div class="sec-head">
+          <h2 id="bt-title">Block-time check</h2>
+          <p>Measured from the timestamps of the most recent <span id="bt-n">200</span> blocks. Target: <span class="mono">10 s</span>.</p>
+        </div>
+        <div class="stat-strip">
+          <div class="q-stat"><span class="stat-label">Average interval</span><span class="stat-value" id="bt-avg">—</span><span class="stat-sub" id="bt-verdict">—</span></div>
+          <div class="q-stat"><span class="stat-label">Fastest</span><span class="stat-value" id="bt-min">—</span><span class="stat-sub">shortest gap</span></div>
+          <div class="q-stat"><span class="stat-label">Slowest</span><span class="stat-value" id="bt-max">—</span><span class="stat-sub">longest gap</span></div>
+          <div class="q-stat"><span class="stat-label">Latest block</span><span class="stat-value" id="bt-age">—</span><span class="stat-sub" id="bt-tip">—</span></div>
+          <div class="q-stat"><span class="stat-label">Producers seen</span><span class="stat-value" id="bt-producers">—</span><span class="stat-sub">in this range</span></div>
+          <div class="q-stat"><span class="stat-label">Transactions</span><span class="stat-value" id="bt-tx">—</span><span class="stat-sub">in this range</span></div>
+        </div>
+        <p class="source-line">Source: <code>GET /api/v1/mining/blocks?limit=200</code> · latest block hash <span class="mono" id="bt-hash">—</span></p>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="api-title">
+      <div class="q-wrap">
+        <div class="sec-head">
+          <h2 id="api-title">API health</h2>
+          <p>Each public endpoint is called from your browser. Latency includes your network.</p>
+        </div>
+        <div class="tablewrap">
+          <table class="health-table">
+            <thead><tr><th scope="col">Endpoint</th><th scope="col">Result</th><th scope="col">Latency</th><th scope="col">Detail</th></tr></thead>
+            <tbody id="health-rows"></tbody>
+          </table>
+        </div>
+        <p class="q-note" style="margin-top:1rem">Full endpoint list with examples: <a href="/api.html">API reference</a>. Supply and consensus details: <a href="/#spec-title">specification</a>.</p>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="custody-title">
+      <div class="q-wrap">
+        <div class="sec-head">
+          <h2 id="custody-title">What the network sees</h2>
+          <p>CELLS Network receives requests signed on your device and verifies them. It never receives your private key.</p>
+        </div>
+        <dl class="boundary">
+          <div><dt>CELLS Network receives</dt><dd>Public addresses, public chain queries, and signed action envelopes.</dd></div>
+          <div><dt>Hive retains</dt><dd>Keystore JSON, passphrase, local approval state, and private signing operations.</dd></div>
+          <div><dt>Websites receive</dt><dd>The connected public address and only the signatures explicitly approved by the user.</dd></div>
+          <div><dt>Validators enforce</dt><dd>Signature validity, sender binding, nonce/replay checks, balances, stake, and consensus rules. During the pilot this is the single block producer.</dd></div>
+        </dl>
+        <p class="q-note" style="margin-top:1rem">More: <a href="/validators.html">Validators</a> · <a href="/trust.html">Attestations</a> · <a href="/audit.html">Public audit</a> · <a href="/docs/#/CELLS-network">Network architecture</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer id="site-footer"></footer>
+
+  <script>
+    (function () {
+      "use strict";
+      var Q = window.CELLS;
+      if (!Q) return;
+      var state = { producerTip: null, backupTip: null, tipTime: null, producerOk: null, backupOk: null };
+
+      function pill(id, cls, text) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.className = "q-pill" + (cls ? " " + cls : "");
+        el.textContent = text;
+      }
+
+      function overall() {
+        if (state.producerOk === null) return;
+        if (!state.producerOk) { pill("overall", "bad", "producer unreachable"); return; }
+        var age = Q.ageOf(state.tipTime);
+        if (age !== null && age > 120) { pill("overall", "warn", "no new block for " + Q.fmtDuration(age)); return; }
+        pill("overall", "ok", "producing blocks");
+      }
+
+      function lag() {
+        if (state.producerTip === null || state.backupTip === null) return;
+        var d = state.producerTip - state.backupTip;
+        Q.setText("b-lag", d <= 0 ? "0 blocks (in sync)" : Q.fmtInt(d) + " blocks");
+        if (state.backupOk) pill("b-pill", d > 30 ? "warn" : "ok", d > 30 ? "behind" : "following");
+      }
+
+      function producer() {
+        return Q.api("/status").then(function (s) {
+          state.producerOk = true;
+          state.producerTip = Number(s.chain_tip);
+          Q.setText("p-tip", Q.fmtInt(s.chain_tip));
+          Q.setText("p-version", s.version || "—");
+          Q.setText("p-sha", s.git_sha ? s.git_sha.slice(0, 12) : "—");
+          Q.setText("p-build", s.build_date || "—");
+          Q.setText("p-uptime", s.uptime || "—");
+          Q.setText("p-role", s.node_role || "—");
+          Q.setText("p-peers", s.peers === undefined ? "—" : String(s.peers));
+          Q.setText("p-node", Q.short(s.node_id, 12));
+          pill("p-pill", "ok", "online");
+        }).catch(function () {
+          state.producerOk = false;
+          pill("p-pill", "bad", "unreachable");
+        });
+      }
+
+      function backup() {
+        return Q.attest("/status").then(function (s) {
+          state.backupOk = true;
+          state.backupTip = Number(s.chain_tip);
+          Q.setText("b-tip", Q.fmtInt(s.chain_tip));
+          Q.setText("b-version", s.version || "—");
+          Q.setText("b-uptime", s.uptime || "—");
+          Q.setText("b-role", s.node_role || "—");
+          Q.setText("b-node", Q.short(s.node_id, 12));
+          pill("b-pill", "ok", "online");
+        }).catch(function () {
+          state.backupOk = false;
+          pill("b-pill", "warn", "not reachable from this browser");
+        });
+      }
+
+      function blocks() {
+        return Q.api("/mining/blocks?limit=200").then(function (d) {
+          var h = (d.headers || []).slice().sort(function (a, b) { return a.height - b.height; });
+          if (h.length < 2) return;
+          var gaps = [], producers = {}, tx = 0;
+          for (var i = 0; i < h.length; i++) {
+            producers[h[i].producer_id] = 1;
+            tx += Number(h[i].tx_count) || 0;
+            if (i > 0) {
+              var g = (Date.parse(h[i].timestamp) - Date.parse(h[i - 1].timestamp)) / 1000;
+              if (isFinite(g)) gaps.push(g);
+            }
+          }
+          var last = h[h.length - 1];
+          var span = (Date.parse(last.timestamp) - Date.parse(h[0].timestamp)) / 1000;
+          var avg = span / (h.length - 1);
+          Q.setText("bt-n", String(h.length));
+          Q.setText("bt-avg", avg.toFixed(2) + " s");
+          var dev = Math.abs(avg - 10) / 10;
+          Q.setText("bt-verdict", dev <= 0.1 ? "on target (within 10%)" : (avg > 10 ? "slower than target" : "faster than target"));
+          if (gaps.length) {
+            Q.setText("bt-min", Math.min.apply(null, gaps).toFixed(1) + " s");
+            Q.setText("bt-max", Math.max.apply(null, gaps).toFixed(1) + " s");
+          }
+          Q.setText("bt-producers", String(Object.keys(producers).length));
+          Q.setText("bt-tx", Q.fmtInt(tx));
+          Q.setText("bt-tip", "block " + Q.fmtInt(last.height));
+          Q.setText("bt-hash", last.hash || "—");
+          state.tipTime = last.timestamp;
+          tickAge();
+        }).catch(function () {});
+      }
+
+      var CHECKS = [
+        { path: "/health/live", detail: function (j) { return j.status || ""; } },
+        { path: "/health/ready", detail: function (j) { return (j.status || "") + (j.checks ? " · " + Object.keys(j.checks).map(function (k) { return k + " " + j.checks[k]; }).join(", ") : ""); } },
+        { path: "/status", detail: function (j) { return "tip " + Q.fmtInt(j.chain_tip); } },
+        { path: "/versions", detail: function (j) { return "current " + (j.current || "—"); } },
+        { path: "/mining/emission", detail: function (j) { return "emitted " + Q.fmtDec(j.emitted_cell, 2) + " CELL"; } },
+        { path: "/mining/blocks?limit=1", detail: function (j) { return "tip " + Q.fmtInt(j.tip); } },
+        { path: "/receipts?limit=1", detail: function (j) { return (j.receipts || []).length + " receipt(s)"; } },
+        { path: "/mining/enrollments?limit=1", detail: function (j) { return (j.total_matches !== undefined ? Q.fmtInt(j.total_matches) : "—") + " enrollments"; } },
+        { path: "/mining/work", detail: function (j) { return "difficulty " + Q.fmtInt(j.difficulty); } },
+        { path: "/audit/summary", detail: function (j) { return j.summary ? j.summary.passed + "/" + j.summary.total + " checks passed" : ""; } }
+      ];
+
+      function buildRows() {
+        var tb = document.getElementById("health-rows");
+        tb.innerHTML = CHECKS.map(function (c, i) {
+          return '<tr><th scope="row">/api/v1' + c.path.replace(/&/g, "&amp;") + '</th><td id="hc-r' + i + '">—</td><td id="hc-l' + i + '">—</td><td id="hc-d' + i + '">—</td></tr>';
+        }).join("");
+      }
+
+      function health() {
+        CHECKS.forEach(function (c, i) {
+          var t0 = performance.now();
+          Q.api(c.path).then(function (j) {
+            Q.setText("hc-r" + i, "OK");
+            Q.setText("hc-l" + i, Math.round(performance.now() - t0) + " ms");
+            var d = "";
+            try { d = c.detail(j); } catch (e) { d = ""; }
+            Q.setText("hc-d" + i, d || "—");
+          }).catch(function (e) {
+            Q.setText("hc-r" + i, "FAIL");
+            Q.setText("hc-l" + i, "—");
+            Q.setText("hc-d" + i, (e && e.message) || "unavailable");
+          });
+        });
+      }
+
+      function tickAge() {
+        var a = Q.ageOf(state.tipTime);
+        if (a !== null) Q.setText("bt-age", Q.fmtDuration(a) + " ago");
+      }
+
+      function refresh() {
+        Promise.all([producer(), backup(), blocks()]).then(function () {
+          lag();
+          overall();
+          Q.setText("n-updated", "updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+        });
+      }
+
+      buildRows();
+      refresh();
+      health();
+      setInterval(refresh, 15000);
+      setInterval(health, 60000);
+      setInterval(tickAge, 1000);
+    })();
+  </script>
+</body>
+</html>

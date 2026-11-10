@@ -1,0 +1,206 @@
+(() => {
+  "use strict";
+
+  // The wallet dashboard moved to popup.html?full=1 (the same wallet as the
+  // toolbar popup, in a tab). Old links to home.html#/wallet land there.
+  if (window.location.hash.startsWith("#/wallet")) {
+    window.location.replace(chrome.runtime.getURL("popup.html?full=1"));
+    return;
+  }
+
+  const NATIVE_HOST = "tech.CELLS.hive_wallet";
+  const PROVIDER_VERSION = "CELLS-hive-wallet-provider/v1";
+  const INTERNAL_ORIGIN = "CELLS-extension://wallet-popup";
+  const HIVE_WALLET_URL = "CELLS-hive://open?route=%2Fsettings%2Fwallet";
+  const ACCOUNT_URL = "https://CELLS.tech/account/";
+
+  const useHiveButton = document.getElementById("use-hive");
+  const openHiveButton = document.getElementById("open-hive");
+  const stateLabel = document.getElementById("state-label");
+  const addressElement = document.getElementById("wallet-address");
+  const siteElement = document.getElementById("requesting-site");
+  const noticeElement = document.getElementById("notice");
+
+  let walletAddress = "";
+
+  const parameters = (() => {
+    const queryIndex = window.location.hash.indexOf("?");
+    return new URLSearchParams(
+      queryIndex >= 0 ? window.location.hash.slice(queryIndex + 1) : ""
+    );
+  })();
+
+  const normalizeOrigin = (value) => {
+    if (!value) return "";
+    const parsed = new URL(value);
+    const localHttp =
+      parsed.protocol === "http:" &&
+      ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+    if (parsed.protocol !== "https:" && !localHttp) return "";
+    return parsed.origin;
+  };
+
+  const requestingOrigin = (() => {
+    try {
+      return normalizeOrigin(parameters.get("origin"));
+    } catch {
+      return "";
+    }
+  })();
+
+  const setNotice = (message, state = "info") => {
+    noticeElement.textContent = message || "";
+    noticeElement.dataset.state = state;
+  };
+
+  const shortenAddress = (address) =>
+    address && address.length > 24
+      ? `${address.slice(0, 12)}...${address.slice(-10)}`
+      : address || "";
+
+  const sendNative = (origin, method, params, timeoutMs = 120000) =>
+    new Promise((resolve) => {
+      let settled = false;
+      let port;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        port?.disconnect();
+        resolve({ ok: false, error: "CELLS Hive did not answer" });
+      }, timeoutMs);
+      const finish = (response) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(response || { ok: false, error: "CELLS Hive did not answer" });
+        port?.disconnect();
+      };
+      try {
+        port = chrome.runtime.connectNative(NATIVE_HOST);
+        port.onMessage.addListener((response) => finish(response));
+        port.onDisconnect.addListener(() => {
+          const runtimeError = chrome.runtime.lastError;
+          finish({
+            ok: false,
+            error: runtimeError?.message || "Start CELLS Hive to continue",
+          });
+        });
+        port.postMessage({
+          version: PROVIDER_VERSION,
+          id: crypto.randomUUID(),
+          origin,
+          method,
+          params,
+        });
+      } catch (error) {
+        finish({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+
+  const requestInternal = (method, params, timeoutMs) =>
+    sendNative(INTERNAL_ORIGIN, method, params, timeoutMs);
+
+  const refreshWallet = async () => {
+    useHiveButton.disabled = true;
+    stateLabel.textContent = "Checking CELLS Hive...";
+    addressElement.textContent = "";
+    walletAddress = "";
+    if (requestingOrigin) {
+      siteElement.textContent = `Requested by ${new URL(requestingOrigin).hostname}`;
+    } else {
+      siteElement.textContent = "Opened directly from the CELLS Wallet extension";
+    }
+
+    const ping = await requestInternal("CELLS_ping", undefined, 5000);
+    if (!ping?.ok) {
+      stateLabel.textContent = "CELLS Hive is not running";
+      setNotice("Start Hive, then select Open wallet management.", "error");
+      return;
+    }
+
+    const info = await requestInternal("CELLS_getWalletInfo", undefined, 5000);
+    walletAddress =
+      info?.ok && info.result?.ready ? info.result.address || "" : "";
+    if (!walletAddress) {
+      stateLabel.textContent = "Wallet setup is needed";
+      setNotice("Create, import, or unlock your wallet in CELLS Hive.", "error");
+      return;
+    }
+
+    stateLabel.textContent = "Active Hive wallet";
+    addressElement.textContent = shortenAddress(walletAddress);
+    addressElement.title = walletAddress;
+    setNotice(
+      requestingOrigin
+        ? "Use this wallet, then approve the website in Hive."
+        : "Your wallet is ready. Open a supported website to connect it.",
+      "success"
+    );
+    useHiveButton.disabled = false;
+  };
+
+  const openAccountLogin = async (loginMethod) => {
+    const loginLabel = loginMethod === "telegram" ? "Telegram" : "email";
+    setNotice(`Opening secure ${loginLabel} login...`);
+    const target = new URL(ACCOUNT_URL);
+    target.searchParams.set("login", loginMethod);
+    target.searchParams.set("source", "extension");
+    await chrome.tabs.create({ url: target.toString() });
+  };
+
+  const openHiveWallet = async () => {
+    const response = await requestInternal("CELLS_openWallet", undefined, 5000);
+    if (!response?.ok) await chrome.tabs.create({ url: HIVE_WALLET_URL });
+  };
+
+  document
+    .getElementById("telegram-login")
+    .addEventListener("click", () => void openAccountLogin("telegram"));
+
+  useHiveButton.addEventListener("click", async () => {
+    if (!walletAddress) return;
+    if (!requestingOrigin) {
+      setNotice("Open a supported website and select Connect CELLS Wallet.");
+      return;
+    }
+
+    useHiveButton.disabled = true;
+    setNotice("Approve this website in CELLS Hive.");
+    const response = await sendNative(
+      requestingOrigin,
+      "CELLS_requestAccounts",
+      undefined
+    );
+    if (!response?.ok) {
+      setNotice(
+        response?.error || "The website connection was not approved.",
+        "error"
+      );
+      useHiveButton.disabled = false;
+      return;
+    }
+
+    const accounts = Array.isArray(response.result) ? response.result : [];
+    if (!accounts.includes(walletAddress)) {
+      setNotice(
+        "Hive returned a different active wallet. Refresh and try again.",
+        "error"
+      );
+      useHiveButton.disabled = false;
+      return;
+    }
+    setNotice("Wallet connected. Return to the requesting website.", "success");
+    useHiveButton.textContent = "Wallet Connected";
+  });
+
+  openHiveButton.addEventListener("click", async () => {
+    setNotice("Opening CELLS Hive...");
+    await openHiveWallet();
+    setTimeout(() => void refreshWallet(), 800);
+  });
+
+  void refreshWallet();
+})();

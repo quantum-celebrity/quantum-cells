@@ -1,0 +1,50 @@
+"""Push fixed CELLS.service and restart (uses CELLS_VPS_PASS)."""
+import os
+import sys
+from pathlib import Path
+
+import paramiko
+
+from _deploy_host import host as _host, port as _port, require_root_user as _require_root_user, user as _user
+
+HOST = _host()
+USER = _user()
+PORT = _port()
+SERVICE = Path(__file__).resolve().parent.parent / "config" / "CELLS.service"
+
+
+def main() -> int:
+    _require_root_user("remote_fix_service_paramiko.py")
+    pw = os.environ.get("CELLS_VPS_PASS") or (sys.argv[1] if len(sys.argv) > 1 else "")
+    if not pw:
+        print("Set CELLS_VPS_PASS", file=sys.stderr)
+        return 1
+    c = paramiko.SSHClient()
+    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c.connect(HOST, port=PORT, username=USER, password=pw, timeout=30, allow_agent=False, look_for_keys=False)
+    raw = SERVICE.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    sftp = c.open_sftp()
+    try:
+        with sftp.open("/etc/systemd/system/CELLS.service", "wb") as f:
+            f.write(raw)
+    finally:
+        sftp.close()
+    for cmd in (
+        "systemctl daemon-reload",
+        "systemctl restart CELLS",
+        "sleep 2",
+        "systemctl status CELLS --no-pager -l",
+        "ldd /opt/CELLS/CELLS 2>&1 | head -20",
+    ):
+        _, out, err = c.exec_command(cmd, timeout=60)
+        o = out.read().decode() + err.read().decode()
+        if o.strip():
+            print(o)
+    st = c.exec_command("systemctl is-active CELLS", timeout=10)[1].read().decode().strip()
+    c.close()
+    print("--- is-active:", st, "---")
+    return 0 if st == "active" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

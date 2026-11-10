@@ -1,0 +1,217 @@
+# External transparency probe.
+#
+# Every 30 minutes (and on demand via workflow_dispatch), build cmd/trustcheck
+# from the current main and point it at the live reference validator
+# (https://api.qsdm.tech by default). The binary validates every §8.5.x
+# contract on /api/v1/trust/attestations/{summary,recent}:
+#
+#   * scope_note is verbatim
+#   * fresh_within parses as a time.Duration
+#   * ngc_service_status is in {healthy,degraded,outage}
+#   * last_checked_at is RFC3339 and within 1h of the runner's clock
+#   * ratio is consistent with attested/total_public (within 0.01)
+#   * recent.count matches the slice length and is <= summary.attested
+#   * every recent row redacts node_id_prefix with an ellipsis, uses a
+#     valid region enum, and ages monotonically
+#
+# The intent is that if we ever silently break the transparency surface
+# (schema drift, accidental cache, aggregator deadlock), this job turns
+# red within 30 minutes without anyone having to remember to look at the
+# dashboard. Failures also page via GitHub's built-in watch/notification
+# plumbing, which is cheaper than standing up our own external cron.
+#
+# This workflow only READS the public endpoints; it has no VPS credentials
+# and is safe to run from any fork targeting any QSDM-shaped validator via
+# the TRUSTCHECK_BASE input. The default target is the reference node we
+# operate.
+
+name: Trust transparency external probe
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize runs per ref so an in-flight probe never races a scheduled
+  # one -- the last scheduled probe is the authoritative "is the surface
+  # healthy right now" signal.
+  group: trustcheck-external-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  # 30-minute cadence. Tight enough that a silent regression is seen within
+  # the next redeploy window; loose enough that we don't spam the node with
+  # ~50 probes/day just to catch the rare incident.
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base URL to probe (default: https://api.qsdm.tech)"
+        required: false
+        default: "https://api.qsdm.tech"
+      allow_warmup:
+        description: "Treat '503 warming up' as pass (for right after a redeploy)"
+        required: false
+        default: "false"
+      allow_disabled:
+        description: "Treat '404 endpoint disabled' as pass"
+        required: false
+        default: "false"
+      min_attested:
+        description: "Minimum summary.attested floor (0 = disabled). Default 2 matches our deployed redundancy (DO BLR1 + OCI SGP1); lower to 0 during single-sidecar maintenance."
+        required: false
+        default: "2"
+      check_mining_path:
+        description: "Assert the mining work endpoint is reachable end to end (relay -> home gateway -> validator). Set false only while that path is knowingly down."
+        required: false
+        default: "true"
+  push:
+    branches:
+      - main
+    # Self-edits to this file or to the tool itself should trigger a run
+    # after those edits land. This is a live production health probe, so it
+    # must not make a pull request red because a public endpoint is briefly
+    # slow or redeploying; cmd/trustcheck's fixture integration test covers
+    # the implementation on every pull request.
+    paths:
+      - "QSDM/source/cmd/trustcheck/**"
+      - ".github/workflows/trustcheck-external.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      # trustcheck is deliberately stdlib-only (see the package doc) so
+      # CGO_ENABLED=0 keeps the build hermetic -- liboqs is not needed here.
+      - name: Build trustcheck
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/trustcheck" ./cmd/trustcheck
+          ls -l "$GITHUB_WORKSPACE/trustcheck"
+
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          # schedule + push + pull_request events carry no `inputs.*`, so
+          # fall back to the reference validator + strict defaults.
+          base='${{ inputs.base }}'
+          allow_warmup='${{ inputs.allow_warmup }}'
+          allow_disabled='${{ inputs.allow_disabled }}'
+          min_attested='${{ inputs.min_attested }}'
+          [ -z "$base" ] && base="https://api.qsdm.tech"
+          [ -z "$allow_warmup" ] && allow_warmup="false"
+          [ -z "$allow_disabled" ] && allow_disabled="false"
+          # Default floor when the workflow is triggered outside
+          # workflow_dispatch (schedule, push, pull_request). 2 matches
+          # the deployed "primary validator + second independent sidecar"
+          # invariant we set up on 2026-04-23; if we ever intentionally
+          # drop to one source, bump this back to 0 in the same PR so
+          # the probe stops flagging the expected state.
+          [ -z "$min_attested" ] && min_attested="2"
+          # Defaults ON outside workflow_dispatch. Every other assertion in
+          # this job reads a surface the public validator serves directly,
+          # so all of them stay green while the mining and write path is
+          # dead -- that combination held for three weeks in Aug 2026 while
+          # /api/v1/mining/* returned 502 on every request. Set the input to
+          # "false" only while that path is knowingly down for maintenance,
+          # and restore it in the same PR.
+          check_mining_path='${{ inputs.check_mining_path }}'
+          [ -z "$check_mining_path" ] && check_mining_path="true"
+          echo "base=$base"                             >> "$GITHUB_OUTPUT"
+          echo "allow_warmup=$allow_warmup"             >> "$GITHUB_OUTPUT"
+          echo "allow_disabled=$allow_disabled"         >> "$GITHUB_OUTPUT"
+          echo "min_attested=$min_attested"             >> "$GITHUB_OUTPUT"
+          echo "check_mining_path=$check_mining_path"   >> "$GITHUB_OUTPUT"
+
+      # The contract checks decide the job's colour. The attestation-redundancy
+      # floor is reported in the next step as a warning instead: since October
+      # 2026 the reference node has reported fewer attested sources than the
+      # floor on every run (attested 0 < 2), so a floor failure kept this job
+      # permanently red, and a permanently red job hides a real breakage of
+      # the transparency contract. The floor stays visible on every run; when
+      # the second independent source is back, it can return to this step.
+      - name: trustcheck (human-readable checklist, contract)
+        env:
+          BASE: ${{ steps.inputs.outputs.base }}
+          ALLOW_WARMUP: ${{ steps.inputs.outputs.allow_warmup }}
+          ALLOW_DISABLED: ${{ steps.inputs.outputs.allow_disabled }}
+          CHECK_MINING_PATH: ${{ steps.inputs.outputs.check_mining_path }}
+        run: |
+          set -e
+          args=( --base "$BASE" --timeout 15s )
+          [ "$ALLOW_WARMUP" = "true" ]    && args+=( --allow-warmup )
+          [ "$ALLOW_DISABLED" = "true" ]  && args+=( --allow-disabled )
+          [ "$CHECK_MINING_PATH" = "true" ] && args+=( --check-mining-path )
+          echo "::notice title=trustcheck target::$BASE"
+          # Human-readable run (renders nicely in the job log).
+          "$GITHUB_WORKSPACE/trustcheck" "${args[@]}"
+
+      - name: Attestation redundancy floor (reported, does not fail the job)
+        id: floor
+        if: always() && steps.inputs.outputs.min_attested != '' && steps.inputs.outputs.min_attested != '0'
+        continue-on-error: true
+        env:
+          BASE: ${{ steps.inputs.outputs.base }}
+          ALLOW_WARMUP: ${{ steps.inputs.outputs.allow_warmup }}
+          ALLOW_DISABLED: ${{ steps.inputs.outputs.allow_disabled }}
+          MIN_ATTESTED: ${{ steps.inputs.outputs.min_attested }}
+        run: |
+          set +e
+          args=( --base "$BASE" --timeout 15s --min-attested "$MIN_ATTESTED" )
+          [ "$ALLOW_WARMUP" = "true" ]    && args+=( --allow-warmup )
+          [ "$ALLOW_DISABLED" = "true" ]  && args+=( --allow-disabled )
+          "$GITHUB_WORKSPACE/trustcheck" "${args[@]}"
+          code=$?
+          if [ "$code" != 0 ]; then
+            echo "::warning title=Attestation redundancy below floor::$BASE reports fewer than $MIN_ATTESTED attested sources (see the min-attested-floor row above). The transparency contract itself is checked in the previous step."
+          fi
+          exit $code
+
+      - name: trustcheck (machine-readable, for artifact)
+        if: always()
+        # The artifact keeps the whole picture, the floor included; the job's
+        # colour comes from the contract step above.
+        continue-on-error: true
+        env:
+          BASE: ${{ steps.inputs.outputs.base }}
+          ALLOW_WARMUP: ${{ steps.inputs.outputs.allow_warmup }}
+          ALLOW_DISABLED: ${{ steps.inputs.outputs.allow_disabled }}
+          MIN_ATTESTED: ${{ steps.inputs.outputs.min_attested }}
+          CHECK_MINING_PATH: ${{ steps.inputs.outputs.check_mining_path }}
+        run: |
+          set +e
+          args=( --base "$BASE" --timeout 15s --json )
+          [ "$ALLOW_WARMUP" = "true" ]    && args+=( --allow-warmup )
+          [ "$ALLOW_DISABLED" = "true" ]  && args+=( --allow-disabled )
+          [ "$CHECK_MINING_PATH" = "true" ] && args+=( --check-mining-path )
+          if [ -n "$MIN_ATTESTED" ] && [ "$MIN_ATTESTED" != "0" ]; then
+            args+=( --min-attested "$MIN_ATTESTED" )
+          fi
+          "$GITHUB_WORKSPACE/trustcheck" "${args[@]}" > trustcheck.json
+          code=$?
+          echo "trustcheck-exit-code=$code"
+          # Make the JSON visible in the log, truncated if huge.
+          head -c 8192 trustcheck.json
+          echo
+          # Bubble the exit code up so the step still fails on a contract
+          # violation even though we disabled errexit for the command.
+          exit $code
+
+      - name: Upload trustcheck JSON
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trustcheck-${{ github.run_id }}-${{ github.run_attempt }}
+          path: trustcheck.json
+          if-no-files-found: ignore
+          retention-days: 30

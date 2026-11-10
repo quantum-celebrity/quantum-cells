@@ -1,0 +1,1016 @@
+# Release workflow — publishes container images AND reproducible Go
+# binaries to a GitHub Release on every semver tag (e.g. `git tag v0.1.0
+# && git push origin v0.1.0`).
+#
+# Major Update Phase 2.3 split the node into validator and miner
+# profiles, and later phases added the external scraper (trustcheck)
+# and the genesis-ceremony dry-run tool. Every one of those needs a
+# predictable, signable release artefact — not only the legacy
+# qsdm node image.
+#
+# Artefact layout per tag:
+#
+#   Container images (pushed to GHCR):
+#     ghcr.io/<owner>/qsdm:<semver>      — legacy name, Dockerfile
+#     ghcr.io/<owner>/qsdm-validator:<semver> — CPU-only validator image
+#     ghcr.io/<owner>/qsdm-miner:<semver>     — GPU miner image (CUDA / NVIDIA)
+#
+# NOTE: the short-lived `qsdm-miner-console` image (CPU-only, distroless)
+# has been retired as part of the NVIDIA-lock pivot; see
+# nvidia_locked_qsdm_blockchain_architecture.md and the deprecation
+# banner in cmd/qsdmminer-console/main.go.
+#
+#   Binaries (attached to the GitHub Release as assets):
+#     qsdm-validator-<tag>-linux-amd64.tar.gz — SQLite validator + safe updater/rollback
+#     qsdm-validator-<tag>-windows-amd64.zip   — SQLite validator + safe updater/rollback
+#     qsdmcli-<os>-<arch>[.exe]               — operator wallet and signed-action CLI
+#     qsdm-home-gateway-<os>-<arch>[.exe]     — outbound-only public gateway
+#     qsdmminer-console-<os>-<arch>[.exe]    — friendly console miner (wizard + live panel); ONLY shipped miner since v0.3.2 (NVIDIA-locked v2 protocol)
+#     trustcheck-<os>-<arch>[.exe]           — black-box transparency scraper
+#     genesis-ceremony-<os>-<arch>[.exe]     — mainnet genesis dry-run tool
+#     SHA256SUMS                             — canonical hashes over all of the above
+#
+#   NOT shipped (kept in-tree for audit / local-devnet builds only):
+#     cmd/qsdmminer  — v1 CPU reference miner. Mainnet rejects v1 proofs
+#                       at the verifier (FORK_V2_HEIGHT=0), so distributing
+#                       a v1-only binary would mis-route operators into a
+#                       guaranteed-rejection loop. An operator who needs
+#                       it for local-devnet bring-up or audit can `go build
+#                       ./cmd/qsdmminer` from source. See
+#                       QSDM/docs/docs/MINER_QUICKSTART.md "Appendix: v1
+#                       audit path".
+#
+# Reproducibility: utility binaries are static CGO_ENABLED=0 builds. Native
+# validator packages intentionally use CGO_ENABLED=1 for SQLite durability.
+# Both paths use `-trimpath`, stripped symbol/DWARF tables, pinned Go metadata,
+# checksums, and keyless release signatures.
+name: Release container
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allows tag owners to re-run the release manually without having
+  # to push a new tag if a transient infra failure drops one asset.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to re-release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write # needed to upload release assets
+  packages: write # needed to push to ghcr.io
+  id-token: write # needed for cosign keyless signing (Sigstore OIDC)
+  attestations: write # needed for `gh attestation` provenance
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Go binaries — cross-compiled, -trimpath, stripped. Uploaded to the
+  # GitHub Release via gh release upload.
+  # ---------------------------------------------------------------------------
+  binaries:
+    name: binaries (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: darwin
+            arch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/resolve-release-tag.sh
+
+      - name: Resolve build metadata (git SHA, UTC build date)
+        id: meta
+        # The release workflow is the only place GitSHA and BuildDate
+        # get injected into binaries, so `--version` output from a
+        # tagged artefact reliably identifies the exact commit +
+        # build-time pair that produced it. Dev builds (local `go
+        # build`, `go run`) keep their "dev"/"unknown" sentinels.
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA:0:7}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "Building with SHA=${SHA} DATE=${DATE} TAG=${RELEASE_TAG}"
+
+      - name: Build reproducible binaries
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          BUILD_SHA: ${{ steps.meta.outputs.sha }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          set -euo pipefail
+          # Five public release binaries are shipped from this job:
+          # qsdmcli, qsdm-home-gateway, qsdmminer-console, trustcheck, and
+          # genesis-ceremony. All five
+          # cross-compile cleanly to every matrix target (CGO=0, stdlib
+          # + a few small pure-Go deps: golang.org/x/crypto for the
+          # ceremony, golang.org/x/term for the console's TTY detection,
+          # BurntSushi/toml for ~/.qsdm/miner.toml persistence).
+          #
+          # cmd/qsdmminer is INTENTIONALLY excluded from the public
+          # release matrix as of v0.3.2. The mainnet is v2 NVIDIA-
+          # locked (FORK_V2_HEIGHT=0, see MINING_PROTOCOL_V2.md §10),
+          # so a v1 reference miner shipped as a downloadable artefact
+          # would mis-route operators into a guaranteed-rejection
+          # loop. The binary stays in-tree (./cmd/qsdmminer) for
+          # protocol audit, replay, and local-devnet bring-up; an
+          # operator who needs it can `go build ./cmd/qsdmminer`.
+          # See QSDM/docs/docs/MINER_QUICKSTART.md "Appendix: v1 audit
+          # path" for the rationale and reproducible build instructions.
+          #
+          # -ldflags -X embeds the release tag, short git SHA, and
+          # build date into pkg/buildinfo so every binary's --version
+          # output maps back to a specific commit + release pair.
+          # All five release artefacts consume these same vars (see
+          # cmd/qsdmcli, cmd/qsdm-home-gateway, cmd/qsdmminer-console,
+          # cmd/trustcheck, cmd/genesis-ceremony — each has a --version flag
+          # wired to pkg/buildinfo.String).
+          mkdir -p /tmp/artefacts
+          suffix="${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+
+          LDFLAGS="-s -w \
+            -X github.com/blackbeardONE/QSDM/pkg/buildinfo.Version=${RELEASE_TAG} \
+            -X github.com/blackbeardONE/QSDM/pkg/buildinfo.GitSHA=${BUILD_SHA} \
+            -X github.com/blackbeardONE/QSDM/pkg/buildinfo.BuildDate=${BUILD_DATE}"
+
+          go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "/tmp/artefacts/qsdmcli-${suffix}" ./cmd/qsdmcli
+
+          go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "/tmp/artefacts/qsdm-home-gateway-${suffix}" ./cmd/qsdm-home-gateway
+
+          go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "/tmp/artefacts/qsdmminer-console-${suffix}" ./cmd/qsdmminer-console
+
+          go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "/tmp/artefacts/trustcheck-${suffix}" ./cmd/trustcheck
+
+          go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "/tmp/artefacts/genesis-ceremony-${suffix}" ./cmd/genesis-ceremony
+
+          ls -la /tmp/artefacts
+
+      # Audit row infra-06 (scripts/check_binary_strip.py): every Go
+      # binary shipped to customers from this matrix MUST be built
+      # with -trimpath -ldflags='-s -w'. The build step above is
+      # supposed to do that, but a future contributor refactoring
+      # LDFLAGS could silently drop the strip flags and ship an
+      # unstripped artefact to a tagged release — leaking function
+      # names + source paths into pprof/debugger snapshots, and
+      # inflating download sizes ~40% (~32 MB stripped vs ~45.6 MB
+      # unstripped, observed in the f8c1c90 BLR1 deploy incident
+      # that authored this lint).
+      #
+      # The lint is exercised on every matrix cell, which is the
+      # correct coverage shape because:
+      #
+      #   linux/amd64   -> ELF; canonical `file --brief` path
+      #                    asserts ", stripped"
+      #   linux/arm64   -> ELF; canonical path same as above
+      #   darwin/amd64  -> Mach-O; non-ELF skip path returns exit 0
+      #                    with `not an ELF binary (skipped)`
+      #   darwin/arm64  -> Mach-O; same skip path
+      #   windows/amd64 -> PE; same skip path
+      #
+      # Both code paths in check_binary_strip.py are therefore
+      # exercised by CI on the actual customer-facing artefacts —
+      # the canonical detection path on the ELF cells, the
+      # documented skip path on the Mach-O / PE cells. A future
+      # contributor who tightens the skip path into a
+      # multi-platform-breaking rule will be caught by the darwin
+      # / windows cells failing red.
+      #
+      # Run BEFORE SHA256SUMS so a regression-introduced
+      # unstripped binary never gets its hash computed and signed,
+      # avoiding a half-baked release where the .sig + .pem
+      # certificates point at an artefact the lint would have
+      # rejected.
+      - name: Verify binary strip state (audit row infra-06)
+        run: |
+          set -euo pipefail
+          suffix="${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          python scripts/check_binary_strip.py \
+            "/tmp/artefacts/qsdmcli-${suffix}" \
+            "/tmp/artefacts/qsdm-home-gateway-${suffix}" \
+            "/tmp/artefacts/qsdmminer-console-${suffix}" \
+            "/tmp/artefacts/trustcheck-${suffix}" \
+            "/tmp/artefacts/genesis-ceremony-${suffix}"
+
+      - name: Smoke-check --version on a native-arch artefact
+        # Only the linux/amd64 matrix cell runs the native binary —
+        # cross-compiled cells cannot exec the binary they produced.
+        # This catches the (easy-to-regress) case where --version
+        # prints "dev"/"unknown" despite the ldflags injection
+        # working — it means a cmd/ main forgot to wire pkg/buildinfo.
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          BUILD_SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          suffix="${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          for bin in qsdmcli qsdm-home-gateway qsdmminer-console trustcheck genesis-ceremony; do
+            out="$(/tmp/artefacts/${bin}-${suffix} --version)"
+            echo "${bin}: ${out}"
+            echo "${out}" | grep -Fq "$RELEASE_TAG" \
+              || { echo "FAIL: ${bin} --version missing tag $RELEASE_TAG"; exit 1; }
+            echo "${out}" | grep -Fq "$BUILD_SHA" \
+              || { echo "FAIL: ${bin} --version missing git SHA"; exit 1; }
+          done
+
+      - name: Compute SHA256SUMS for this matrix cell
+        run: |
+          cd /tmp/artefacts
+          sha256sum ./* > "SHA256SUMS-${{ matrix.os }}-${{ matrix.arch }}"
+          cat "SHA256SUMS-${{ matrix.os }}-${{ matrix.arch }}"
+
+      - name: Upload artefacts (for the aggregator job)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            /tmp/artefacts/qsdmcli-*
+            /tmp/artefacts/qsdm-home-gateway-*
+            /tmp/artefacts/qsdmminer-console-*
+            /tmp/artefacts/trustcheck-*
+            /tmp/artefacts/genesis-ceremony-*
+            /tmp/artefacts/SHA256SUMS-*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Production validator packages are deliberately separate from the static
+  # utility-binary matrix above. Validators require SQLite, so these native
+  # amd64 builds keep CGO enabled. The dilithium_circl tag supplies the same
+  # ML-DSA-87 wire format without shipping a host-specific liboqs DLL/SO.
+  validator-packages:
+    name: validator package (${{ matrix.os }}/amd64)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Windows CGO toolchain
+        id: msys2
+        if: matrix.os == 'windows'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/resolve-release-tag.sh
+
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        run: |
+          echo "sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux validator (CGO + SQLite)
+        if: matrix.os == 'linux'
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "1"
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          BUILD_SHA: ${{ steps.meta.outputs.sha }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w \
+            -X github.com/blackbeardONE/QSDM/pkg/buildinfo.Version=${RELEASE_TAG} \
+            -X github.com/blackbeardONE/QSDM/pkg/buildinfo.GitSHA=${BUILD_SHA} \
+            -X github.com/blackbeardONE/QSDM/pkg/buildinfo.BuildDate=${BUILD_DATE}"
+          go build -trimpath -tags "validator_only,dilithium_circl" \
+            -ldflags="${LDFLAGS}" -o "${RUNNER_TEMP}/qsdm-validator" ./cmd/qsdm
+          "${RUNNER_TEMP}/qsdm-validator" --version | tee "${RUNNER_TEMP}/validator-version.txt"
+          grep -Fq "$RELEASE_TAG" "${RUNNER_TEMP}/validator-version.txt"
+          grep -Fq "$BUILD_SHA" "${RUNNER_TEMP}/validator-version.txt"
+          python ../../scripts/check_binary_strip.py "${RUNNER_TEMP}/qsdm-validator"
+
+      - name: Build Windows validator (CGO + SQLite)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        working-directory: QSDM/source
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          BUILD_SHA: ${{ steps.meta.outputs.sha }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msys2Root = '${{ steps.msys2.outputs.msys2-location }}'
+          $mingw = Join-Path $msys2Root 'ucrt64\bin'
+          $gcc = Join-Path $mingw 'gcc.exe'
+          if (-not (Test-Path -LiteralPath $gcc -PathType Leaf)) {
+            throw "MSYS2 UCRT64 gcc is unavailable at $gcc."
+          }
+          $env:PATH = "$mingw;$env:PATH"
+          $env:CC = $gcc
+          $env:CGO_ENABLED = '1'
+          $compiler = ((& $gcc --version 2>&1) | Select-Object -First 1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $compiler) {
+            throw 'MSYS2 UCRT64 gcc could not execute in PowerShell.'
+          }
+          Write-Host "Using $compiler"
+          $tag = $env:RELEASE_TAG
+          $sha = $env:BUILD_SHA
+          $date = $env:BUILD_DATE
+          $ldflags = "-s -w -extldflags=-Wl,--stack,33554432 -X github.com/blackbeardONE/QSDM/pkg/buildinfo.Version=$tag -X github.com/blackbeardONE/QSDM/pkg/buildinfo.GitSHA=$sha -X github.com/blackbeardONE/QSDM/pkg/buildinfo.BuildDate=$date"
+          $output = Join-Path $env:RUNNER_TEMP 'qsdm-validator.exe'
+          & go build -trimpath -tags 'validator_only,dilithium_circl' -ldflags $ldflags -o $output .\cmd\qsdm
+          if ($LASTEXITCODE -ne 0) { throw "go build failed with exit code $LASTEXITCODE" }
+          $version = ((& $output --version 2>&1) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'qsdm-validator.exe --version failed' }
+          Write-Host $version
+          if ($version -notmatch [regex]::Escape($tag) -or $version -notmatch [regex]::Escape($sha)) {
+            throw "version output does not contain release metadata: $version"
+          }
+          & python ..\..\scripts\check_binary_strip.py $output
+          if ($LASTEXITCODE -ne 0) { throw 'binary strip check failed' }
+
+      - name: Stage Linux package
+        if: matrix.os == 'linux'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          folder="qsdm-validator-${tag}-linux-amd64"
+          stage="${RUNNER_TEMP}/validator-package/${folder}"
+          assets="${RUNNER_TEMP}/validator-assets"
+          mkdir -p "$stage" "$assets"
+          cp "${RUNNER_TEMP}/qsdm-validator" "$stage/qsdm-validator"
+          cp QSDM/deploy/validator-package/install-or-update.sh "$stage/"
+          cp QSDM/deploy/validator-package/rollback.sh "$stage/"
+          cp QSDM/deploy/validator-package/README.md "$stage/"
+          cp QSDM/docs/docs/SIGNED_CONSENSUS_ROLLOUT.md "$stage/"
+          cp QSDM/config/qsdm.toml.example "$stage/"
+          chmod 0755 "$stage/qsdm-validator" "$stage/install-or-update.sh" "$stage/rollback.sh"
+          (
+            cd "$stage"
+            sha256sum qsdm-validator install-or-update.sh rollback.sh README.md SIGNED_CONSENSUS_ROLLOUT.md qsdm.toml.example > SHA256SUMS.txt
+          )
+          tar -C "${RUNNER_TEMP}/validator-package" -czf "$assets/${folder}.tar.gz" "$folder"
+          (
+            cd "$assets"
+            sha256sum "${folder}.tar.gz" > SHA256SUMS-validator-linux-amd64
+          )
+
+      - name: Stage Windows package
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $folderName = "qsdm-validator-$tag-windows-amd64"
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'validator-package'
+          $stage = Join-Path $packageRoot $folderName
+          $assets = Join-Path $env:RUNNER_TEMP 'validator-assets'
+          New-Item -ItemType Directory -Force -Path $stage, $assets | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'qsdm-validator.exe') (Join-Path $stage 'qsdm-validator.exe')
+          Copy-Item QSDM\deploy\validator-package\install-or-update.ps1 $stage
+          Copy-Item QSDM\deploy\validator-package\rollback.ps1 $stage
+          Copy-Item QSDM\deploy\validator-package\README.md $stage
+          Copy-Item QSDM\docs\docs\SIGNED_CONSENSUS_ROLLOUT.md $stage
+          Copy-Item QSDM\config\qsdm.toml.example $stage
+          $names = @('qsdm-validator.exe', 'install-or-update.ps1', 'rollback.ps1', 'README.md', 'SIGNED_CONSENSUS_ROLLOUT.md', 'qsdm.toml.example')
+          $lines = foreach ($name in $names) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $stage $name)).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), $lines, [Text.UTF8Encoding]::new($false))
+          $archive = Join-Path $assets "$folderName.zip"
+          Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            (Join-Path $assets 'SHA256SUMS-validator-windows-amd64'),
+            "$archiveHash  $folderName.zip`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Upload validator package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-validator-${{ matrix.os }}-amd64
+          path: ${{ runner.temp }}/validator-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Source SBOM. Generated once per release and attached to every artefact
+  # type below (binaries + each container image), so reviewers can audit
+  # the dependency tree of any release without rebuilding from source.
+  #
+  # We use anchore/sbom-action (production-stable, used by kubernetes,
+  # buildpacks, jenkins, etc.) which wraps Syft and emits SPDX 2.3.
+  # ---------------------------------------------------------------------------
+  source-sbom:
+    name: source SBOM (SPDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate release tag checkout
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/resolve-release-tag.sh
+
+      - name: Generate SBOM for QSDM/source (full Go module + transitive deps)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: QSDM/source
+          format: spdx-json
+          output-file: /tmp/qsdm-source-sbom.spdx.json
+
+      - name: Upload SBOM artefact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qsdm-source-sbom
+          path: /tmp/qsdm-source-sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Aggregator: download every matrix cell, produce one canonical
+  # SHA256SUMS, sign every binary keylessly with cosign (Sigstore OIDC),
+  # and attach everything (binaries + .sig + .pem certs + SBOM) to the
+  # GitHub Release.
+  #
+  # Operator verification (no secrets required, only `cosign`):
+  #
+  #   cosign verify-blob \
+  #     --certificate qsdmminer-console-linux-amd64.pem \
+  #     --signature   qsdmminer-console-linux-amd64.sig \
+  #     --certificate-identity-regexp 'https://github.com/.+/.github/workflows/release-container.yml@refs/tags/v.+' \
+  #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  #     qsdmminer-console-linux-amd64
+  #
+  # The matching certificate proves the release was minted by THIS workflow
+  # at THIS tag — a stolen NPM_TOKEN / DOCKERHUB_TOKEN cannot forge it.
+  # ---------------------------------------------------------------------------
+  release-assets:
+    name: attach binaries + SBOM + signatures to release
+    needs: [binaries, validator-packages, source-sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install cosign (keyless Sigstore signer)
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.6.2
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/resolve-release-tag.sh
+
+      - name: Download all matrix artefacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: binaries-*
+          path: /tmp/assets
+          merge-multiple: true
+
+      - name: Download source SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: qsdm-source-sbom
+          path: /tmp/assets
+
+      - name: Consolidate SHA256SUMS
+        run: |
+          cd /tmp/assets
+          # Join per-cell hash files into one canonical list sorted
+          # lexically so operators can diff across releases cleanly.
+          cat SHA256SUMS-* | sort > SHA256SUMS
+          rm -f SHA256SUMS-*
+          # Hash the SBOM too so a tampered SBOM is also caught.
+          sha256sum qsdm-source-sbom.spdx.json >> SHA256SUMS
+          echo "=== Final SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Cosign-sign every binary + the SBOM (keyless / OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          cd /tmp/assets
+          for f in qsdm-validator-* qsdmcli-* qsdm-home-gateway-* qsdmminer-console-* trustcheck-* genesis-ceremony-* SHA256SUMS qsdm-source-sbom.spdx.json; do
+            # Skip already-produced .sig / .pem so a re-run is idempotent.
+            case "$f" in
+              *.sig|*.pem) continue ;;
+            esac
+            echo "==> cosign sign-blob $f"
+            cosign sign-blob \
+              --yes \
+              --output-signature   "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+          ls -la
+
+      - name: Attach assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="$RELEASE_TAG"
+          # Create the release if it doesn't already exist (re-run
+          # from workflow_dispatch is a no-op against an existing
+          # release; upload --clobber replaces assets in place).
+          # NOTE: `gh release create --verify-tag` was removed because the
+          # gh CLI's tag verification needs to be run from inside a git
+          # repository, but `gh release upload` (the line below) runs
+          # from /tmp/assets after we cd into it. The tag is *already*
+          # pushed (it's what triggered this workflow), so the
+          # verification was always redundant. Pass --repo explicitly
+          # so neither gh call needs to be inside a git working tree.
+          REPO_FLAG=(--repo "$GH_REPOSITORY")
+          if ! gh release view "$TAG" "${REPO_FLAG[@]}" >/dev/null 2>&1; then
+            gh release create "$TAG" "${REPO_FLAG[@]}" \
+              --title "$TAG" \
+              --notes "Automated release by .github/workflows/release-container.yml. SBOM (SPDX 2.3) and per-asset cosign keyless signatures attached. See CHANGELOG.md."
+          fi
+          cd /tmp/assets
+          # NOTE: the previous version of this command listed
+          # `qsdmminer-console-* trustcheck-* genesis-ceremony-*
+          #  qsdm-source-sbom.spdx.json SHA256SUMS *.sig *.pem`
+          # which double-matched every binary's sibling .sig / .pem
+          # (qsdmminer-console-linux-amd64.sig matched both
+          # `qsdmminer-console-*` AND `*.sig`). gh release upload then
+          # tried to upload the same file twice and the GitHub API
+          # rejected the second attempt with HTTP 422
+          # "ReleaseAsset.name already exists" (despite --clobber, which
+          # only de-duplicates against the existing release, not against
+          # earlier names in the same call). Listing the directory once
+          # with a single glob avoids the duplicate-match entirely;
+          # /tmp/assets contains only the exact set of release
+          # artefacts at this point.
+          ls -1
+          gh release upload "$TAG" "${REPO_FLAG[@]}" --clobber ./*
+
+  # ---------------------------------------------------------------------------
+  # Container images.
+  # ---------------------------------------------------------------------------
+  ghcr-legacy:
+    name: ghcr qsdm (legacy image name)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/resolve-release-tag.sh
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Install cosign (keyless image signer)
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.6.2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR is case-sensitive. docker/metadata-action auto-lowercases
+      # the image namespace per OCI convention, so `docker/build-push-action`
+      # pushes to ghcr.io/<lowercased-owner>/qsdm. Any subsequent
+      # command that references the same image MUST use the same
+      # lowercased form -- otherwise the registry returns "manifest
+      # unknown" (observed on the first v0.3.0 release run as a syft
+      # exit 1, and on the s76 re-run as a docker pull exit 1, both
+      # because `${{ github.repository_owner }}` is the original-cased
+      # "blackbeardONE" while the pushed image lives at "blackbeardone").
+      - name: Compute lowercased image base
+        id: imgbase
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${OWNER_LC}/qsdm" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta (qsdm legacy)
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.imgbase.outputs.ref }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.tag.outputs.tag }}
+
+      - name: Build and push (legacy qsdm name)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: QSDM
+          file: QSDM/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=qsdm
+          cache-to: type=gha,mode=max,scope=qsdm
+
+      - name: Pull built image into local docker daemon for syft
+        # docker/build-push-action with push: true uses the
+        # docker-container buildx driver, which does NOT make the
+        # resulting image visible to the local docker daemon. Pulling
+        # by digest from the lowercased ref lets anchore/sbom-action's
+        # syft scan locally without registry I/O or URL reformatting
+        # (registry: prefix + digest is rejected by syft v1.42.3).
+        run: |
+          set -euo pipefail
+          docker pull "${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}"
+
+      # Container-image vulnerability scan (audit row supply-03,
+      # category: supply_chain). Trivy walks the image filesystem,
+      # extracts the OS package metadata + Go module manifests
+      # (CGO_ENABLED=0 means the Go binary's stdlib is reported via
+      # the embedded buildinfo section), and matches each entry
+      # against the Trivy CVE database.
+      #
+      # Gate is intentionally narrow:
+      #   - severity HIGH,CRITICAL  -> ignore LOW/MEDIUM noise
+      #   - ignore-unfixed=true     -> tolerate distro-package CVEs
+      #                                 with no upstream fix (we
+      #                                 cannot patch what does not
+      #                                 yet exist; an unfixed CRITICAL
+      #                                 is reported in the table but
+      #                                 does NOT fail the job)
+      #   - exit-code 1             -> any HIGH+/fixable finding
+      #                                 fails the release before it
+      #                                 is signed or pushed to GHCR
+      # An operator who needs to ship a release while a fix is in
+      # flight adds the CVE to QSDM/.trivyignore (one CVE-id per
+      # line) and opens a follow-up issue documenting the waiver
+      # timeline. The .trivyignore file does not exist yet because
+      # the current image set has no waivers.
+      - name: Scan image for OS + Go vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 10m
+
+      - name: Generate image SBOM (SPDX) and attach to image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: /tmp/qsdm-image-sbom.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 30
+
+      - name: Cosign-sign image (keyless Sigstore OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          # steps.meta.outputs.tags is a NEWLINE-separated multi-line
+          # string (one ref per tag pattern). The shell `for X in ...`
+          # construct does not accept embedded newlines as separators
+          # in this position, so the previous form
+          #   for tag in ${{ steps.meta.outputs.tags }}; do ... done
+          # produced
+          #   "syntax error near unexpected token `ghcr.io/.../...:0.3'"
+          # the moment the tags expand on multiple lines. Pipe the list
+          # into `while read` instead.
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAGS" | while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "==> cosign sign ${tag}@${DIGEST}"
+            cosign sign --yes "${tag}@${DIGEST}"
+          done
+
+      - name: Attach SBOM as cosign attestation
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          DIGEST_REF="${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}"
+          cosign attest --yes \
+            --predicate /tmp/qsdm-image-sbom.spdx.json \
+            --type spdxjson \
+            "$DIGEST_REF"
+
+  ghcr-validator:
+    name: ghcr qsdm-validator (CPU-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/resolve-release-tag.sh
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.6.2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # See ghcr-legacy job for the GHCR case-sensitivity rationale.
+      - name: Compute lowercased image base
+        id: imgbase
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${OWNER_LC}/qsdm-validator" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta (qsdm-validator)
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.imgbase.outputs.ref }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.tag.outputs.tag }}
+
+      - name: Build and push validator image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: QSDM
+          file: QSDM/Dockerfile.validator
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=qsdm-validator
+          cache-to: type=gha,mode=max,scope=qsdm-validator
+
+      - name: Pull built image into local docker daemon for syft
+        run: |
+          set -euo pipefail
+          docker pull "${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}"
+
+      # See ghcr-legacy job for the full rationale of the Trivy
+      # gate (audit row supply-03 / category supply_chain). The
+      # validator image runs CPU-only (no CUDA), so its attack
+      # surface is exactly the qsdm Go binary plus whatever the
+      # base image in QSDM/Dockerfile.validator contributes -- the
+      # smallest of the three release images.
+      - name: Scan image for OS + Go vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 10m
+
+      - name: Generate image SBOM (SPDX) and attach
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: /tmp/qsdm-validator-sbom.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 30
+
+      - name: Cosign-sign validator image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAGS" | while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            cosign sign --yes "${tag}@${DIGEST}"
+          done
+
+      - name: Attach SBOM as cosign attestation
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          DIGEST_REF="${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}"
+          cosign attest --yes \
+            --predicate /tmp/qsdm-validator-sbom.spdx.json \
+            --type spdxjson \
+            "$DIGEST_REF"
+
+  ghcr-miner:
+    name: ghcr qsdm-miner (GPU miner runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/resolve-release-tag.sh
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.6.2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # See ghcr-legacy job for the GHCR case-sensitivity rationale.
+      - name: Compute lowercased image base
+        id: imgbase
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${OWNER_LC}/qsdm-miner" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta (qsdm-miner)
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.imgbase.outputs.ref }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.tag.outputs.tag }}
+
+      - name: Build and push miner image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: QSDM
+          file: QSDM/Dockerfile.miner
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=qsdm-miner
+          cache-to: type=gha,mode=max,scope=qsdm-miner
+
+      - name: Pull built image into local docker daemon for syft
+        run: |
+          set -euo pipefail
+          docker pull "${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}"
+
+      # See ghcr-legacy job for the full rationale of the Trivy
+      # gate (audit row supply-03 / category supply_chain). The
+      # miner image carries the CUDA / NVIDIA driver stack on top
+      # of the qsdm Go binary, so its attack surface is the largest
+      # of the three release images and the most likely to surface
+      # a fixable HIGH+ CVE on a base-image roll. Operators who hit
+      # a fail here have two clean options: (a) bump the CUDA base
+      # image in QSDM/Dockerfile.miner to the next NVIDIA-published
+      # tag, or (b) waive the specific CVE in QSDM/.trivyignore with
+      # a follow-up issue. Do NOT broaden severity / ignore-unfixed
+      # here as a workaround -- that drops the gate for every image.
+      - name: Scan image for OS + Go vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 10m
+
+      - name: Generate image SBOM (SPDX) and attach
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: /tmp/qsdm-miner-sbom.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 30
+
+      - name: Cosign-sign miner image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAGS" | while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            cosign sign --yes "${tag}@${DIGEST}"
+          done
+
+      - name: Attach SBOM as cosign attestation
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          DIGEST_REF="${{ steps.imgbase.outputs.ref }}@${{ steps.build.outputs.digest }}"
+          cosign attest --yes \
+            --predicate /tmp/qsdm-miner-sbom.spdx.json \
+            --type spdxjson \
+            "$DIGEST_REF"

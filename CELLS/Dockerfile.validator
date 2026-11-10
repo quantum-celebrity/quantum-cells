@@ -1,0 +1,109 @@
+# Dockerfile.validator — CPU-only CELLS validator node
+# =====================================================
+# This image builds the validator-only profile of the CELLS binary, i.e.
+# `go build -tags validator_only`. The binary:
+#
+#   - Refuses to start if node.role == "miner" or node.mining_enabled == true
+#     (see pkg/mining/roleguard/roleguard_validator.go).
+#   - Is NOT linked against CUDA, cuDNN, or any GPU runtime. This is the image
+#     we recommend for VPS operators and for the public "run a validator"
+#     quickstart in CELLS/docs/docs/NODE_ROLES.md.
+#
+# Build:
+#   docker build -f CELLS/Dockerfile.validator -t CELLS/validator:latest CELLS/
+#
+# Notes:
+#   - Base is Alpine to keep the final image small (~40-60 MB).
+#   - CGO is still required because pkg/crypto links against liboqs for the
+#     post-quantum signature primitives (ML-DSA-87). liboqs itself is
+#     CPU-only; it is fine to include in a validator image.
+
+# ---- builder stage ----------------------------------------------------------
+FROM golang:1.26.10-alpine AS builder
+
+# Refresh CA certs and package index before installing anything.
+RUN apk update && apk add --no-cache \
+    ca-certificates \
+    gcc \
+    musl-dev \
+    cmake \
+    make \
+    git \
+    sqlite-dev \
+    openssl-dev
+
+# Build & install liboqs (pinned to main; CI should pin a tag for release).
+WORKDIR /tmp
+RUN git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git && \
+    cd liboqs && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON .. && \
+    make -j$(nproc) && \
+    make install && \
+    rm -rf /tmp/liboqs
+
+# Build CELLS validator binary (validator_only build profile).
+WORKDIR /app
+COPY source ./source
+RUN cd source && \
+    for attempt in 1 2 3; do \
+        go mod download && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        sleep $((attempt * 5)); \
+    done
+
+RUN cd source && CGO_ENABLED=1 \
+    CGO_CFLAGS="-I/usr/local/include" \
+    CGO_LDFLAGS="-L/usr/local/lib -loqs -lssl -lcrypto" \
+    go build -tags validator_only \
+        -o ../CELLS-validator ./cmd/CELLS
+
+# ---- runtime stage ---------------------------------------------------------
+# Pin to Alpine 3.23 (minor-version pin, patch auto-pickup) instead of
+# alpine:latest. Surfaces by Trivy DS-0001 in the periodic
+# .github/workflows/security-scan-containers.yml run; matches the
+# minor-version pinning convention already used in Dockerfile.miner
+# (nvidia/cuda:12.5.0-runtime-ubuntu22.04). The patch level is
+# intentionally left floating so apk-side CVE fixes get pulled on
+# every rebuild without a Dockerfile bump.
+FROM alpine:3.23
+
+RUN apk update && apk add --no-cache \
+    ca-certificates \
+    sqlite \
+    libstdc++ \
+    openssl \
+    wget
+
+COPY --from=builder /usr/local/lib/liboqs.so* /usr/local/lib/
+COPY --from=builder /app/CELLS-validator /usr/local/bin/CELLS-validator
+
+# Legacy-name symlink so existing orchestration that runs `CELLS`
+# still works against the role-scoped validator image; see
+# REBRAND_NOTES.md. (The rebrand commit's search-and-replace left
+# a duplicate symlink line here that aborted the docker build with
+# "File exists" — collapsed back to a single ln.)
+RUN ln -s /usr/local/bin/CELLS-validator /usr/local/bin/CELLS
+
+WORKDIR /app
+
+# libp2p, API, dashboard, log viewer.
+EXPOSE 4001 8080 8081 9000
+
+ENV CGO_ENABLED=1
+ENV LD_LIBRARY_PATH=/usr/local/lib
+# Force validator role; operators can still override via config file but the
+# validator_only build will refuse any other role at startup.
+ENV CELLS_NODE_ROLE=validator
+ENV CELLS_MINING_ENABLED=false
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+  CMD wget -q -O- http://127.0.0.1:8080/api/v1/health/live > /dev/null || exit 1
+
+# Minimal non-root user for the runtime stage. The data directory (SQLite /
+# Scylla client state, logs) is expected to be mounted from a volume.
+RUN addgroup -S CELLS && adduser -S -G CELLS CELLS && \
+    mkdir -p /app/data && chown -R CELLS:CELLS /app
+USER CELLS
+
+CMD ["CELLS-validator"]

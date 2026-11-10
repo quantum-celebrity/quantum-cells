@@ -1,0 +1,557 @@
+# API reference
+
+The public HTTP API of the CELLS pilot network. Every endpoint on this page can
+be called from the internet today. Examples are real responses from the live
+network (October 2026), trimmed for length.
+
+> [!NOTE]
+> CELLS is a pilot network (pre-mainnet) with a single block producer during
+> recovery. While the recovery lasts, the API accepts reads, signed wallet
+> transfers, signed task actions, miner enrollments and mining submissions;
+> other writes are paused. See [Network status](NETWORK_STATUS.md).
+
+## Base URL
+
+```text
+https://api.CELLS.tech/api/v1
+```
+
+`https://CELLS.tech/api/v1` serves the same read endpoints for pages on
+CELLS.tech. **Mining endpoints are served only on `api.CELLS.tech`.**
+
+| Convention | Detail |
+|---|---|
+| Format | JSON (`Content-Type: application/json`) unless noted. Request bodies are limited to 64 KiB on the public write routes. |
+| Authentication | None for the endpoints on this page. Writes are authorised by an ML-DSA-87 signature inside the request body, not by a login. |
+| Addresses | 64 lowercase hex characters: `hex(sha256(ML-DSA-87 public key))`. |
+| Amounts | Fields named `*_cell` or `balance`/`amount` are CELL (8 decimals). Fields named `*_dust` are integers; 1 CELL = 100,000,000 dust. |
+| Heights and times | Block heights are integers. Timestamps are RFC 3339; `/chain/blocks` uses the server's local offset, the other endpoints use UTC (`Z`). |
+| Versioning | All routes live under `/api/v1`; see `GET /versions` and [API versioning](API_VERSIONING.md). |
+
+### Rate limits
+
+Limits are per client IP address. When you exceed one you get **HTTP 429**,
+sometimes with a `Retry-After` header; wait and retry with backoff.
+
+| Group | Limit |
+|---|---|
+| `/status`, `/versions`, `/chain/blocks`, `/chain/parents`, `/tasks*` | 600 requests per minute |
+| Most other read endpoints | 30 requests per minute (the node's limit for callers without a login; the 100-per-minute default applies too) |
+| `POST /wallet/submit-signed` | 10 requests per minute |
+| Mining endpoints on `api.CELLS.tech` | Limited per IP at the edge (bursts allowed); `POST /mining/submit` about 60 per minute |
+
+Health endpoints and reads of `/trust/*` and `/audit/*` are not rate-limited by
+the node. Do not poll faster than you need: a new block arrives about every
+10 seconds.
+
+### Errors
+
+Most errors use this JSON shape:
+
+```json
+{ "error": "Bad Request", "message": "recipient must be a lowercase 64-character wallet address", "status": 400 }
+```
+
+Some endpoints answer differently, so check the HTTP status first:
+
+- mining, receipt and block endpoints may return a **plain-text** body;
+- a paused mining service returns `503 {"error":"mining_unavailable","detail":"…"}` with `Retry-After`;
+- routes paused during the pilot return `503 {"status":"read_only","message":"…"}`;
+- unknown or blocked paths return an HTML 404 or 405 page.
+
+| Status | Meaning |
+|---|---|
+| 200 / 202 | OK / accepted for the next block |
+| 400 | Malformed request or failed validation |
+| 401 | The route needs operator credentials and is not public |
+| 402 | Not enough CELL for amount + fee |
+| 404 | Not found |
+| 405 | Wrong HTTP method |
+| 409 | Duplicate transaction, or a nonce replay or gap |
+| 422 | Signature does not verify, or a transfer without valid Proof-of-Entanglement parents |
+| 429 | Rate limit |
+| 503 | Paused during the pilot, or the service is busy; retry later |
+
+## Endpoint summary
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/status` | Node, chain, supply, consensus and mining flags |
+| GET | `/health`, `/health/live`, `/health/ready` | Health checks |
+| GET | `/versions` | API version catalogue |
+| GET | `/mining/blocks` | Recent block headers |
+| GET | `/chain/blocks` | Full blocks with transactions |
+| GET | `/receipts`, `/receipts/{tx_id}` | Transaction receipts |
+| GET | `/chain/parents` | Proof-of-Entanglement parents for the next transfer |
+| GET | `/mining/emission` | Supply and reward schedule |
+| GET | `/wallet/balance` | CELL balance of an address |
+| GET | `/wallet/nonce` | Last used nonce of an address |
+| GET | `/mining/account` | Balance and nonce in one call |
+| POST | `/wallet/submit-signed` | Submit an ML-DSA-87 signed transfer |
+| GET | `/wallet/recovery/capsules`, `/wallet/recovery/capsules/{locator}`, `/wallet/recovery/nonce` | Encrypted recovery capsules (read) |
+| GET | `/mining/work` | Current mining work (`api.CELLS.tech` only) |
+| GET | `/mining/challenge` | Fresh signed challenge for attestation |
+| POST | `/mining/submit` | Submit a mining proof (`api.CELLS.tech` only) |
+| GET | `/mining/enrollments`, `/mining/enrollment/{node_id}` | Miner enrollment registry |
+| POST | `/mining/enroll`, `/mining/unenroll` | Submit a signed miner enrollment or unenrollment (CELLS Hive does this for you) |
+| GET | `/tasks`, `/tasks/state`, `/tasks/{task_id}`, `/tasks/actions` | Task registry (read) |
+| POST | `/tasks/actions/submit-signed` | Submit an ML-DSA signed task action (open since 2026-10-15) |
+| GET | `/streams`, `/streams/{stream_id}`, `/streams/nonce` | CELL Streams (read) |
+| GET | `/trust/attestations/summary`, `/trust/attestations/recent` | Attestation transparency |
+| GET | `/audit/summary`, `/audit/items`, `/audit/badge.svg` | Internal checklist |
+| GET | `/referrals/reward-pool`, `/referrals/status` | Referral pool status |
+
+## Status and health
+
+### `GET /status`
+
+The single best endpoint for "what is the network doing". Also described field by
+field on [Network status](NETWORK_STATUS.md).
+
+```bash
+curl -s https://api.CELLS.tech/api/v1/status
+```
+
+```json
+{
+  "node_id": "12D3KooWHT2APYkMStuaiLZvto7ZmrPmUag4TStT7MryGn69feum",
+  "version": "hardened-legacy-20261014-d7ffcd4-hl2-edge-go1269-ids",
+  "git_sha": "d7ffcd4e80f69c3db3f2bbcf4c7f34e08cc49d25",
+  "chain_tip": "…",
+  "peers": 0,
+  "node_role": "validator",
+  "network": "CELLS · CELL",
+  "coin": { "name": "Cell", "symbol": "CELL", "decimals": 8, "smallest_unit": "dust" },
+  "tokenomics": {
+    "cap_dust": 9000000000000000,
+    "cap_cell": "90000000.00000000",
+    "emitted_cell": "3045139.…",
+    "block_reward_cell": "3.56490987",
+    "current_epoch": 0,
+    "next_halving_height": 12623041,
+    "target_block_time_seconds": 10,
+    "blocks_per_epoch": 12623040
+  },
+  "task_actions_ready": true,
+  "consensus_auth": {
+    "signed_consensus_supported": true,
+    "require_signed_votes": true,
+    "signed_message_activation_height": 827000,
+    "signed_consensus_active": true,
+    "unsigned_consensus_traffic_accepted": false,
+    "poe_activation_height": 816600,
+    "poe_active": true,
+    "edge_relay_only_activation_height": 833800,
+    "edge_relay_only_active": true,
+    "task_action_signatures_active": true,
+    "tx_content_root_active": true
+  },
+  "mining": {
+    "protocol_versions_accepted": [2],
+    "fork_v2_active": true,
+    "fork_v2_tc_active": false,
+    "attestation_types_required": ["nvidia-cc-v1", "nvidia-hmac-v1"],
+    "min_enroll_stake_dust": 1000000000,
+    "enrollment_contract": "CELLS/enroll/v2",
+    "signed_enrollment_required": true,
+    "deferred_bond_from_rewards": true
+  }
+}
+```
+
+Sample from mid-October 2026. `chain_tip` and the amounts change every block
+(about 3.0 million CELL had been emitted), so read them live; `build_date` and
+`uptime` are left out above.
+
+`tokenomics.blocks_per_epoch` is the **halving** epoch (12,623,040 blocks, about
+four years). It is not the same as the mining epoch in `/mining/work`.
+
+#### The `consensus_auth` block
+
+It reports which consensus rules the node enforces. Each rule has an
+activation height; `*_active` turns `true` once the chain reaches it. All rules
+in one table: [Consensus rules](CONSENSUS_RULES.md).
+
+| Field | Live value | Meaning |
+|---|---|---|
+| `require_signed_votes`, `signed_message_activation_height`, `signed_consensus_active` | `true`, `827000`, `true` | Every BFT vote and consensus message must carry a valid ML-DSA signature from block 827,000. |
+| `unsigned_consensus_traffic_accepted` | `false` | Unsigned consensus traffic is refused. |
+| `poe_activation_height`, `poe_active` | `816600`, `true` | Transfers must name committed parent cells ([Proof-of-Entanglement](PROOF_OF_ENTANGLEMENT.md)). |
+| `edge_relay_only_activation_height`, `edge_relay_only_active` | `833800`, `true` | Paid edge tasks settle only through an authorized settlement relay. |
+| `task_action_signatures_active` | `true` | Task actions must carry a valid ML-DSA signature (from block 625,000). |
+| `tx_content_root_active` | `true` | The block's transaction root commits transaction contents, not only IDs (from block 625,000). |
+| `ed25519_tx_accepted` | `false` | Transactions signed with Ed25519 are refused; ML-DSA-87 is the only accepted transaction signature. |
+| `stream_ed25519_retirement_height`, `stream_ed25519_session_keys_retired` | `0`, `false` | From this height a CELL stream open, which registers an Ed25519 session key, is refused; streams opened earlier can still take receipts, settle and close. `0`: no height is set. |
+
+### `GET /health`, `GET /health/live`, `GET /health/ready`
+
+```json
+{"status":"healthy","product":"CELLS","version":"hardened-legacy-20261014-d7ffcd4-hl2-edge-go1269-ids","git_sha":"d7ffcd4e80f69c3db3f2bbcf4c7f34e08cc49d25","…":"…"}
+```
+
+`/health/live` returns `{"status":"alive",…}`. `/health/ready` returns
+`{"status":"ready","checks":{"storage":"ok","wallet_service":"ok"}}`, or HTTP 503
+when storage is not ready.
+
+### `GET /versions`
+
+```json
+{"current":"v1","versions":[{"name":"v1","prefix":"/api/v1","status":"active"}]}
+```
+
+## Blocks and transactions
+
+### `GET /mining/blocks`
+
+Recent block headers, newest last. Query: `from`, `to` (heights), `limit`
+(default 20, max 200).
+
+```bash
+curl -s "https://api.CELLS.tech/api/v1/mining/blocks?limit=3"
+```
+
+```json
+{
+  "tip": 755940, "from": 755938, "to": 755940,
+  "headers": [
+    {
+      "height": 755940,
+      "hash": "841ad935f29bca0a84232b875b2576583a672a5d24a172194efd895c2a84eb4c",
+      "prev_hash": "112f9d90145acd60a25a4e2d8ce5094516f46f5863cffebae645366b9ff8f30d",
+      "state_root": "595e6f74257d225f39155d1b4617764f77396527ec79052aea914d3db80345a6",
+      "tx_root": "670cfebaab21130148ad8c414fca03b4afee957603c5dcac30c6b2532f9386eb",
+      "tx_count": 1,
+      "timestamp": "2026-10-04T12:05:11Z",
+      "producer_id": "1cf60b16cf9aee5e8eaf67a8518a2b2ba7bc54f2dd607f05bc5a861b7a94c859"
+    }
+  ]
+}
+```
+
+### `GET /chain/blocks`
+
+Full blocks including transactions and the producer's block signature. Query:
+`from`, `to`, `limit` (default 16, max 64). Responses can be large.
+
+```json
+{
+  "tip": 755941, "from": 755941, "to": 755941,
+  "blocks": [{
+    "height": 755941,
+    "hash": "15b625ee5f5b2d87d11633da20af83bda630a52980fceb4d40f63180f4a4754b",
+    "prev_hash": "841ad935…eb4c",
+    "timestamp": "2026-10-04T14:05:22.091217912+02:00",
+    "transactions": [{
+      "ID": "solo-heartbeat-2203456-1791115521997698505",
+      "Sender": "CELLS-system-funder", "Recipient": "CELLS-system-funder",
+      "Amount": 0, "Fee": 0, "Nonce": 2203456
+    }],
+    "state_root": "bfce3feb…916f",
+    "total_fees": 0, "gas_used": 0,
+    "producer_id": "1cf60b16…c859",
+    "producer_auth": { "public_key": "…" }
+  }]
+}
+```
+
+Blocks without user activity carry a zero-value producer heartbeat transaction,
+as above.
+
+### `GET /receipts` and `GET /receipts/{tx_id}`
+
+Receipts for recent transactions (query `from`, `to`, `limit`), or for one
+transaction id. An unknown id returns a plain-text 404.
+
+```json
+{
+  "tx_id": "solo-heartbeat-2203456-1791115521997698505",
+  "block_height": 755941,
+  "block_hash": "15b625ee5f5b2d87d11633da20af83bda630a52980fceb4d40f63180f4a4754b",
+  "status": 1,
+  "gas_used": 0,
+  "fee": 0,
+  "logs": [{ "topic": "TxApplied", "data": { "amount": 0, "recipient": "CELLS-system-funder", "sender": "CELLS-system-funder" }, "index": 0 }],
+  "timestamp": "2026-10-04T12:05:22.093619088Z",
+  "index_in_block": 0
+}
+```
+
+Use `/receipts/{tx_id}` to follow a transfer you submitted. (`/transactions` and
+`/transactions/{id}` exist in the code but need operator credentials.)
+
+### `GET /chain/parents`
+
+The [Proof-of-Entanglement](PROOF_OF_ENTANGLEMENT.md) parent source. Wallets
+call it just before signing a transfer and copy `parents` into
+`parent_cells`. `parents` holds the node's two newest committed transaction
+IDs, read at its durable tip. Optional `limit` (default 8, maximum 32) sets
+the length of `recent`. Returns 503 until the node has two committed
+transactions.
+
+| Field | Meaning |
+|---|---|
+| `tip` | Height the parents were read at |
+| `window_blocks` | Reference window: parents must be committed within the last 8,640 blocks (about 24 hours) |
+| `min_parents`, `max_parents` | A transfer names 2 to 10 parents |
+| `parents` | The IDs to copy into `parent_cells` |
+| `recent` | Recent committed transaction IDs with their heights |
+| `poe_activation_height`, `poe_active` | `816600` and `true` on the live network |
+
+The sample below was taken before activation, so it still shows
+`poe_activation_height: 0`.
+
+```json
+{
+  "tip": 805400,
+  "poe_activation_height": 0,
+  "poe_active": false,
+  "min_parents": 2,
+  "max_parents": 10,
+  "window_blocks": 8640,
+  "parents": ["solo-heartbeat-2253090-1791611907090994535", "solo-heartbeat-2253089-1791611897111559959"],
+  "recent": [{"id": "solo-heartbeat-2253090-1791611907090994535", "height": 805400}]
+}
+```
+
+### `GET /mining/emission`
+
+```json
+{
+  "chain_tip": 755941,
+  "mining_cap_dust": 9000000000000000,
+  "blocks_per_epoch": 12623040,
+  "target_block_time_seconds": 10,
+  "current_epoch": 0,
+  "block_reward_dust": 356490987,
+  "block_reward_cell": "3.56490987",
+  "emitted_dust": 269486153203767,
+  "emitted_cell": "2694861.53203767",
+  "remaining_dust": 8730513846796233,
+  "next_halving_height": 12623041,
+  "next_halving_eta_seconds": 118671000
+}
+```
+
+## Wallet
+
+### `GET /wallet/balance?address={address}`
+
+```json
+{"address":"5d28b82565421e3666ef7a493e0d39fc89d3450009a32cbda72aa89c7cb820e7","balance":20.494531481334427,"source":"mining-ledger"}
+```
+
+`balance` is in CELL. `source` says which ledger answered (`mining-ledger` is the
+chain account store).
+
+### `GET /wallet/nonce?sender={address}`
+
+The query parameter is **`sender`** (not `address`). `nonce` is the last nonce
+already used; sign your next transfer with `next`.
+
+```json
+{"sender":"5d28b82565421e3666ef7a493e0d39fc89d3450009a32cbda72aa89c7cb820e7","nonce":1,"next":2}
+```
+
+### `GET /mining/account?address={address}`
+
+Balance and nonce in one call:
+
+```json
+{"address":"5d28b825…20e7","balance":20.494531481334427,"nonce":1,"present":true}
+```
+
+### `POST /wallet/submit-signed`
+
+Submits a CELL transfer that you signed yourself with ML-DSA-87. No login is
+needed: the signature authorises the transfer. CELLS Hive, the
+[web wallet](WEB_WALLET.md) and `CELLScli` build this envelope for you.
+
+Request body:
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | Unique transaction id chosen by the client |
+| `sender` | string | Must equal `hex(sha256(public_key))` |
+| `recipient` | string | 64 lowercase hex characters |
+| `amount` | number | CELL, greater than 0 |
+| `fee` | number | CELL, 0 or more |
+| `geotag` | string | Optional, may be empty |
+| `parent_cells` | array of strings | **Required.** Proof-of-Entanglement parents: copy `parents` from `GET /chain/parents`. Since block 816,600, 2-10 transactions committed in the last 8,640 blocks ([details](PROOF_OF_ENTANGLEMENT.md)). A transfer without them is refused with HTTP 422. |
+| `nonce` | integer | Required, must be `next` from `/wallet/nonce` |
+| `timestamp` | string | RFC 3339 |
+| `public_key` | string | Hex ML-DSA-87 public key (not signed) |
+| `signature` | string | Hex ML-DSA-87 signature |
+
+What is signed: the JSON encoding of the envelope with `signature` set to `""`
+and `public_key` removed, as Go `encoding/json` writes it, with the fields in
+this order: `id`, `sender`, `recipient`, `amount`, `fee`, `geotag`,
+`parent_cells`, `nonce` (left out when 0), `signature`, `timestamp`.
+Third-party signers must reproduce it byte for byte;
+see [Signed transfers](V040_WALLET_SEND_DESIGN.md) and
+[Replay protection](V041_REPLAY_PROTECTION_DESIGN.md).
+
+Responses:
+
+| Status | Body | Meaning |
+|---|---|---|
+| 202 | `{"transaction_id":"…","status":"pending","broadcast":"…"}` | Queued for the next block. Follow it with `/receipts/{tx_id}`. |
+| 409 | `{"transaction_id":"…","status":"duplicate",…}` | Same transaction already submitted |
+| 409 | error JSON, `nonce replay` / `nonce gap` | Fetch `/wallet/nonce` again and re-sign |
+| 400 | error JSON | Validation failed (for example nonce 0, bad address or hex) |
+| 402 | error JSON | Balance below amount + fee |
+| 422 | error JSON | Signature does not verify |
+| 422 | error JSON starting `proof-of-entanglement:` | Missing or invalid parents. Enforced by consensus from block 816,600 (the API began refusing at 816,240). Fetch `/chain/parents` and sign again with fresh parents at the same nonce |
+| 503 | error JSON | Transaction queue full; retry after the next block |
+
+### Wallet recovery capsules
+
+`GET /wallet/recovery/capsules?owner={address}`,
+`GET /wallet/recovery/capsules/{locator}` and
+`GET /wallet/recovery/nonce?sender={address}` read the encrypted recovery
+capsules used by Hive's recovery-phrase feature
+(see [Wallet recovery](WALLET_RECOVERY.md)). Registering new capsules is
+paused during the pilot.
+
+## Mining
+
+These endpoints are used by CELLS Hive and the command-line miner. Most users do
+not need to call them directly; see [Mining today](MINING_TODAY.md). The proof
+format is defined in [Mining protocol v2](MINING_PROTOCOL_V2.md). Base URL:
+`https://api.CELLS.tech/api/v1`; every mining route is rate-limited per IP.
+
+| Method | Path | Status today |
+|---|---|---|
+| GET | `/mining/work` | Live on `api.CELLS.tech` |
+| GET | `/mining/challenge` | Live |
+| POST | `/mining/submit` | Live on `api.CELLS.tech` for enrolled miners |
+| GET | `/mining/enrollments`, `/mining/enrollment/{node_id}` | Live |
+| POST | `/mining/enroll`, `/mining/unenroll` | Live: enrollment reopened on 2026-10-17 (CELLS Hive builds and submits both) |
+
+### `GET /mining/work`
+
+The current work package. Optional query `height`. The work-set fields are
+described in Mining protocol v2 and are left out below.
+
+```json
+{"epoch":12,"height":755942,"header_hash":"a1cedad2…d080","difficulty":"16777216","blocks_per_epoch":60480,"…":"…"}
+```
+
+Here `blocks_per_epoch` is the **mining** epoch (60,480 blocks), not the halving
+epoch in `/status`. When mining is closed the endpoint returns
+`503 {"error":"mining_unavailable",…}`.
+
+### `GET /mining/challenge`
+
+A fresh, signed, single-use challenge that the miner binds into its attestation.
+Not cacheable (`Cache-Control: no-store`); it expires after about 60 seconds.
+
+```json
+{"nonce":"b144c302a35ee8e28f88d09203255f9de150c771552eb5f77fc8a5d89a34986b","issued_at":1791115543,"signer_id":"validator-483c814995ccf802","signature":"eab7de98d392e3a869fa06b744e77f6c9184d294a03c1dc6448ced7cfe92d093"}
+```
+
+### `POST /mining/submit`
+
+Body: one proof as canonical JSON per Mining protocol v2, including its
+`attestation` object (`type` is `nvidia-hmac-v1` or `nvidia-cc-v1`). The
+`miner_addr` must be the owner of an active enrollment. Hive 1.4.22 also adds
+the owner's ML-DSA-87 signature.
+
+| Status | Body |
+|---|---|
+| 200 | `{"accepted":true,"proof_id":"…"}` |
+| 400 | `{"accepted":false,"reject_reason":"…","detail":"…"}` |
+| 429 | Rate limit |
+| 503 | `{"error":"mining_unavailable",…}`: mining window closed |
+
+### `GET /mining/enrollments` and `GET /mining/enrollment/{node_id}`
+
+The enrollment registry. List query: `cursor`, `limit`, `phase`
+(`active`, `pending_unbond`, `revoked`). Private enrollment keys are never
+returned.
+
+```json
+{
+  "records": [{
+    "node_id": "clore-3090-01",
+    "owner": "5d28b82565421e3666ef7a493e0d39fc89d3450009a32cbda72aa89c7cb820e7",
+    "gpu_uuid": "GPU-0856d89a-074f-adbd-781d-1f5e7673d569",
+    "stake_dust": 1000000000,
+    "bond_mode": "mining_rewards",
+    "required_stake_dust": 1000000000,
+    "bond_remaining_dust": 0,
+    "fully_bonded": true,
+    "enrolled_at_height": 326831,
+    "phase": "active",
+    "slashable": true
+  }],
+  "next_cursor": "hive-2696v3-0b65af9f0525",
+  "has_more": true,
+  "total_matches": 55
+}
+```
+
+## Tasks and streams
+
+The task routes below are public reads. Since 15 October 2026 signed task
+actions can also be submitted through `POST /tasks/actions/submit-signed`
+(full path `/api/v1/tasks/actions/submit-signed`). Notes:
+
+- The envelope must be ML-DSA signed by the sender, with
+  `sender == hex(sha256(public_key))`, as for wallet transfers. Task-action
+  signatures have been a consensus rule since block 625,000.
+- Built-in system task IDs are reserved: only the project's owner key can
+  register them. A catalog action from any other key that uses one is refused.
+- Paid resource work (the Edge Pool CPU, GPU and RAM tasks) is in an
+  operator-only test and is not yet open to other miners. From block 833,800
+  those tasks settle only through an authorized settlement relay.
+- Signed stream actions are still paused.
+
+Request format and catalog actions: [Task registry](CELLS_TASK_REGISTRY.md).
+
+| Endpoint | Returns |
+|---|---|
+| `GET /tasks` | Task catalogue from the chain: `runtime`, `catalog_source`, `catalog_state_root`, `tasks[]` |
+| `GET /tasks/state` | On-chain task state (stakes, participants, submissions). Can be large. |
+| `GET /tasks/{task_id}` | One task (`/state` and `/submissions` sub-paths are also available) |
+| `GET /tasks/actions` | Task action log (query `limit`, `task_id`, `sender`) |
+| `GET /streams` | CELL Streams (query `payer`, `provider`, `status`, `service_id`) |
+| `GET /streams/{stream_id}` | One stream |
+| `GET /streams/nonce?sender={address}` | Next stream action nonce |
+
+See [Task registry](CELLS_TASK_REGISTRY.md) and [CELL Streams](CELL_STREAMS.md).
+
+## Transparency
+
+| Endpoint | Returns |
+|---|---|
+| `GET /trust/attestations/summary` | How many public nodes have a fresh NVIDIA attestation, with a scope note |
+| `GET /trust/attestations/recent` | Recent attestations (query `limit`) |
+| `GET /audit/summary`, `GET /audit/items`, `GET /audit/badge.svg` | The project's **internal, self-maintained checklist**. It is not an independent audit. |
+| `GET /referrals/reward-pool` | Referral pool state (currently `enabled: false`) |
+
+## Not public
+
+These exist in the source code but are not reachable for public clients during
+the pilot. They are listed so nobody builds on them by mistake:
+
+- Login and accounts (`/auth/*`): new registration is disabled during
+  recovery and the API has no public login. The optional CELLS Account at
+  `https://CELLS.tech/api/account/` uses wallet sign-in; see [CELLS Account](CELLS_ACCOUNT.md).
+- Operator routes that need credentials: `/transactions*`, `/network/topology`,
+  `/governance/*`, `/attest/recent-rejections`, `/mining/slash*`, `/tokens/*`,
+  `/contracts/*`, `/bridge/*`, `/wallet/send`, `/validator/*`, `/monitoring/*`.
+- Administrative routes (`/api/admin/*`) and certificate issuance are not exposed.
+- No public metrics endpoint.
+
+## Machine-readable spec
+
+[`openapi.yaml`](openapi.yaml) describes every route the node in this
+repository registers under `/api/v1`, with parameters and request and
+response schemas taken from the handler code. Each operation carries
+`x-CELLS-access` (`public`, `authenticated` for routes that need a login,
+`operator` or `closed`), and `x-CELLS-follower: refused` marks the writes a
+read-only follower node answers with 503. The operator-only admin API under
+`/api/admin/` is left out. The test `TestOpenAPIMatchesRegisteredRoutes` in
+`CELLS/source/pkg/api` fails when the file and the registered routes drift
+apart. The file describes the code; for what the live pilot network accepts
+today, this page is right.

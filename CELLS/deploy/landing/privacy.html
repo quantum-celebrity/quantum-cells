@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#061116" />
+  <title>Privacy | CELLS</title>
+  <meta name="description" content="How CELLS Hive, CELLS Account, and CELLS.tech handle wallet, identity, and operational data." />
+  <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/brand/favicon-16.png" />
+  <link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <link rel="stylesheet" href="/assets/site.css" />
+<link rel="stylesheet" href="/assets/site-shell.css" />
+  <link rel="stylesheet" href="/assets/legal.css" />
+</head>
+<body data-page="privacy">
+<header id="site-header"></header>
+<script src="/assets/site-shell.js"></script>
+  <main id="main" class="legal-main">
+    <div class="legal-intro">
+      <p class="legal-eyebrow">PRIVACY</p>
+      <h1>Private keys stay with you.</h1>
+      <p class="legal-lead">This page explains the data handled by CELLS Hive, the optional CELLS Account service, and reference services at CELLS.tech.</p>
+      <p class="legal-updated">Last updated: August 3, 2026</p>
+    </div>
+    <div class="legal-content">
+      <section>
+        <h2>Data kept on your computer</h2>
+        <p>Hive stores settings, task state, logs, encrypted wallet material, and optional Relay credentials in your operating system's application-data directory. Wallet private keys, keystore JSON, passphrases, and recovery phrases are not CELLS Account data.</p>
+        <p>Hive analytics are disabled and Hive contains no advertising tracker.</p>
+      </section>
+      <section>
+        <h2>Optional account data</h2>
+        <p>When you choose CELLS Account, the service processes an email address and/or Telegram OpenID identity, creates a browser session, and stores public wallet addresses you explicitly link. You may attach both sign-in methods to one profile; CELLS rejects identities already owned by another profile instead of silently merging accounts.</p>
+        <ul>
+          <li>Identity display values are encrypted at rest.</li>
+          <li>Login tokens and session tokens are stored as keyed hashes.</li>
+          <li>Email uses a short-lived one-time link. No reusable account password is stored.</li>
+          <li>A wallet is linked only after Hive approves an ML-DSA ownership signature.</li>
+        </ul>
+        <p><strong>CELLS Account cannot sign, spend CELL, or recover a wallet.</strong></p>
+      </section>
+      <section>
+        <h2>Network and ledger data</h2>
+        <p>Features you start may send public wallet addresses and keys, signed transactions, task actions, mining proofs, resource descriptions, workload receipts, chain requests, and integration-link proofs. Reference infrastructure may retain ordinary security logs such as source IP, request time, endpoint, status, and rate-limit events.</p>
+        <p>Accepted transactions and proofs are replicated ledger records and generally cannot be deleted without invalidating the ledger.</p>
+      </section>
+      <section>
+        <h2>Your choices</h2>
+        <p>CELLS Account is optional. You can use the self-custody wallet and Hive without an account profile. From the account dashboard you can unlink public wallets, sign out other browsers, or delete the account identity and its public wallet links. Account deletion does not delete Hive, wallet keys, CELL, or accepted ledger records.</p>
+        <p>For account-data access questions, contact <a href="mailto:ops@CELLS.tech">ops@CELLS.tech</a> from a verified identity associated with the account. Never email a wallet secret or backup.</p>
+      </section>
+      <section>
+        <h2>Security reports</h2>
+        <p>Do not put exploit details, credentials, personal data, or wallet secrets in a public issue. Use the repository's private GitHub Security reporting channel.</p>
+        <div class="legal-actions"><a class="site-btn site-btn-solid" href="https://github.com/blackbeardONE/CELLS/security" rel="noopener" target="_blank">Private security report</a><a class="site-btn site-btn-ghost" href="/support.html">Support</a></div>
+      </section>
+    </div>
+  </main>
+<footer id="site-footer"></footer>
+</body>
+</html>

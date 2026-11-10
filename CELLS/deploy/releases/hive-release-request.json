@@ -1,0 +1,18 @@
+{
+  "schema": "CELLS.hive.release-request.v1",
+  "version": "1.4.17",
+  "tag": "hive-v1.4.17",
+  "source_commit": "bfd7b0531ba7b32ecd29f56c12a1c231203683da",
+  "windows": {
+    "run_id": 31454203484,
+    "artifact": "CELLS-hive-1.4.17-windows-UNSIGNED",
+    "evidence_artifact": "CELLS-hive-1.4.17-windows-build-evidence"
+  },
+  "linux": {
+    "run_id": 31454203475,
+    "artifact": "CELLS-hive-linux-bfd7b0531ba7b32ecd29f56c12a1c231203683da"
+  },
+  "wallet_extension": {
+    "artifact": "CELLS-hive-wallet-extension-bfd7b0531ba7b32ecd29f56c12a1c231203683da"
+  }
+}

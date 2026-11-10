@@ -1,0 +1,77 @@
+# Minimal Prometheus 2.x config for CELLS dashboard metrics + example alert rules.
+# Keep this file in the same directory as alerts_CELLS.example.yml (rule_files are relative to this file).
+#
+# Run (adjust paths):
+#   prometheus --config.file=prometheus.CELLS.example.yml
+#
+# Before use: replace DASHBOARD_HOST, DASHBOARD_PORT, ALERTMANAGER_HOST, and PASTE_METRICS_SCRAPE_SECRET_HERE.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+# Alertmanager wiring. Alerts that fire from `rule_files` below
+# are forwarded here for routing/templating/notification — the
+# config that ships with the repo is at
+# ../alertmanager/alertmanager.example.yml.
+#
+# Replace ALERTMANAGER_HOST:9093 with the actual host:port of
+# your Alertmanager. If you don't run Alertmanager, comment out
+# this entire block — Prometheus will still evaluate the rules,
+# but firing alerts go nowhere.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - ALERTMANAGER_HOST:9093
+
+rule_files:
+  - "alerts_CELLS.example.yml"
+
+scrape_configs:
+  - job_name: CELLS-dashboard
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: /api/metrics/prometheus
+    scheme: http
+    static_configs:
+      - targets:
+          - DASHBOARD_HOST:DASHBOARD_PORT
+    authorization:
+      type: Bearer
+      credentials: PASTE_METRICS_SCRAPE_SECRET_HERE
+
+  # Peer-attester (Public Challenge Issuer) scrape. Each [[peer]]
+  # in /opt/CELLS/peer_signers.toml that is also reachable over
+  # the reverse tunnel gets one of these blocks. The target is
+  # the PUBLIC HTTPS path (NOT the relay's 127.0.0.1:7710
+  # directly) so every scrape validates the full Caddy -> relay
+  # -> yamux tunnel -> home attester chain. If the chain breaks,
+  # the scrape fails, up=0, and the CELLSPeerAttesterAbsent alert
+  # fires after 5m. See CELLS/docs/docs/runbooks/DEPLOYMENT_TOPOLOGY.md.
+  #
+  # Copy + edit this stanza per peer attester you allowlist:
+  #   - job_name: CELLS-peer-attester-<slot>   <- must match the
+  #                                              regex in
+  #                                              CELLSPeerAttesterAbsent's
+  #                                              expr (CELLS-peer-attester-.+).
+  #   - replace 'PUBLIC_HOST' with the public hostname Caddy
+  #     terminates TLS on (e.g. api.CELLS.tech).
+  #   - replace '<slot>' with the entry from the relay slot
+  #     allowlist (relay_slots.toml).
+  #   - paste the peer's signer_id + slot + role labels so
+  #     dashboards / alerts can drill down by peer attester.
+  - job_name: CELLS-peer-attester-blackbeard-3050
+    scrape_interval: 30s
+    scrape_timeout: 15s
+    metrics_path: /attest/blackbeard-3050/metrics
+    scheme: https
+    static_configs:
+      - targets:
+          - PUBLIC_HOST                  # e.g. api.CELLS.tech
+        labels:
+          peer_signer_id: 'attester-12a0d1aa082b7e28'
+          peer_slot:      'blackbeard-3050'
+          peer_role:      'pci'
+          peer_arch:      'ampere'
+          peer_gpu:       'rtx-3050'

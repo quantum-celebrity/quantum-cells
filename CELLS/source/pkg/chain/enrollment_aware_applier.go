@@ -1,0 +1,865 @@
+package chain
+
+// enrollment_aware_applier.go: a StateApplier shim that routes
+// enrollment-tagged transactions (ContractID == enrollment.ContractID)
+// through an EnrollmentApplier and falls back to the underlying
+// *AccountStore for ordinary transfers.
+//
+// Scope of this commit (Phase 2c-vii, block-apply wiring for the
+// simple single-validator path):
+//
+//   - EnrollmentAwareApplier implements pkg/chain.StateApplier
+//     so it can be passed directly to NewBlockProducer.
+//   - Height threading is done via a caller-supplied HeightFn so
+//     the shim has no back-reference to *BlockProducer and stays
+//     independently testable. The canonical wiring is
+//     `HeightFn: func() uint64 { return bp.TipHeight() + 1 }`
+//     set AFTER the producer is constructed (BlockProducer has no
+//     circular dep on this type).
+//
+//     IMPORTANT: use BlockProducer.TipHeight, NOT ChainHeight.
+//     HeightFn is invoked from inside bp.applier.ApplyTx, which
+//     runs while ProduceBlock already holds bp.mu; calling
+//     ChainHeight from that context deadlocks (non-reentrant
+//     mutex). TipHeight is lock-free and specifically designed
+//     for this call site.
+//   - Sweep is a separate public call intended to run once per
+//     sealed block, after the block's transactions are applied.
+//     The canonical wiring is via BlockProducer.OnSealedBlock,
+//     either with the SealedBlockHook helper on this type:
+//
+//	    bp.OnSealedBlock = aware.SealedBlockHook(nil)
+//
+//     or by passing a custom error handler:
+//
+//	    bp.OnSealedBlock = aware.SealedBlockHook(func(h uint64, err error) {
+//	        log.Printf("sweep at height %d failed: %v", h, err)
+//	    })
+//
+//     Operators that need fully custom sweep policy can still
+//     call Sweep(h) directly from their own finalisation logic.
+//
+// Explicitly out of scope for this file:
+//
+//   - Mempool admission gate. Stateless validation
+//     (ValidateEnrollFields / ValidateUnenrollFields) lives in
+//     pkg/mining/enrollment/admit.go and is wired via
+//     mempool.SetAdmissionChecker, independently of this shim.
+//
+// Updates from prior phases:
+//
+//   - ChainReplayApplier IS now satisfied. ChainReplayClone +
+//     RestoreFromChainReplay deep-copy both the AccountStore
+//     and the EnrollmentState (the latter via the optional
+//     enrollment.CloneableState contract; *InMemoryState
+//     satisfies it). Pre-seal BFT and TryAppendExternalBlock
+//     therefore work end-to-end with enrollment txs.
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"sync"
+	"sync/atomic"
+
+	"github.com/blackbeardONE/CELLS/pkg/governance/chainparams"
+	"github.com/blackbeardONE/CELLS/pkg/mempool"
+	"github.com/blackbeardONE/CELLS/pkg/mining/enrollment"
+	"github.com/blackbeardONE/CELLS/pkg/mining/slashing"
+)
+
+// EnrollmentAwareApplier is a StateApplier that dispatches on
+// tx.ContractID. Construct via NewEnrollmentAwareApplier.
+//
+// The shim is concurrency-safe because both AccountStore and
+// InMemoryState (the typical EnrollmentStateMutator) hold their
+// own locks; the only mutable field owned by the shim is the
+// optional height provider, which is guarded by mu.
+type EnrollmentAwareApplier struct {
+	accounts   *AccountStore
+	enrollment *EnrollmentApplier
+	slasher    *SlashApplier
+	gov        *GovApplier
+	tasks      *TaskStateStore
+	streams    *StreamStateStore
+	recovery   *RecoveryCapsuleStateStore
+	tokens     *CELLS20StateStore
+
+	mu         sync.RWMutex
+	heightFn   func() uint64
+	rootHeight atomic.Uint64
+}
+
+// NewEnrollmentAwareApplier wires the router. `accounts` is
+// required. `ea` may be nil, in which case the shim behaves
+// exactly like the bare AccountStore (enrollment txs are
+// rejected with ErrNotEnrollmentTx-style errors; this is the
+// recommended form for nodes that have NOT activated the v2
+// enrollment feature yet).
+//
+// Panics on nil `accounts` because a missing account store is a
+// programming error at boot, not a per-tx condition.
+func NewEnrollmentAwareApplier(accounts *AccountStore, ea *EnrollmentApplier) *EnrollmentAwareApplier {
+	if accounts == nil {
+		panic("chain: NewEnrollmentAwareApplier requires non-nil *AccountStore")
+	}
+	return &EnrollmentAwareApplier{
+		accounts:   accounts,
+		enrollment: ea,
+	}
+}
+
+// SetHeightFn installs (or clears) the block-height provider.
+// `fn == nil` disables the provider and causes enrollment
+// txs to be rejected with a clear error rather than applied at
+// an undefined height. The canonical wiring is:
+//
+//	bp := chain.NewBlockProducer(pool, aware, cfg)
+//	aware.SetHeightFn(func() uint64 { return bp.TipHeight() + 1 })
+//
+// Post-construction installation is intentional: BlockProducer
+// is built AFTER the applier, so the closure over bp must be
+// deferred.
+//
+// MUST be lock-free. HeightFn is invoked from inside ApplyTx
+// while ProduceBlock holds bp.mu; any function that re-enters
+// bp.mu (e.g. bp.ChainHeight, bp.LatestBlock) will deadlock.
+// Use bp.TipHeight, which is backed by atomic.Uint64.
+func (a *EnrollmentAwareApplier) SetHeightFn(fn func() uint64) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.heightFn = fn
+}
+
+// SetStateRootHeight tells StateRoot which block height is being committed.
+// BlockProducer calls this before every consensus StateRoot read so gated root
+// upgrades can activate at a shared height without changing the StateApplier
+// interface used across the codebase.
+func (a *EnrollmentAwareApplier) SetStateRootHeight(height uint64) {
+	if a == nil {
+		return
+	}
+	a.rootHeight.Store(height)
+}
+
+// ApplyTx implements StateApplier. Routes on tx.ContractID:
+//
+//   - enrollment.ContractID → EnrollmentApplier.ApplyEnrollmentTx
+//     using the current height from HeightFn.
+//   - anything else → AccountStore.ApplyTx (the plain transfer path).
+//
+// When the enrollment applier is nil but an enrollment tx is
+// received, the tx is REJECTED with ErrEnrollmentNotWired so it
+// never silently apples to the account store (which would
+// ignore the Payload and apply it as a zero-amount transfer,
+// corrupting nonce ordering on replay).
+func (a *EnrollmentAwareApplier) ApplyTx(tx *mempool.Tx) error {
+	if a == nil {
+		return errors.New("chain: nil EnrollmentAwareApplier")
+	}
+	if tx == nil {
+		return errors.New("chain: nil tx")
+	}
+	if enrollment.IsContractID(tx.ContractID) {
+		if a.enrollment == nil {
+			return ErrEnrollmentNotWired
+		}
+		h, ok := a.currentHeight()
+		if !ok {
+			return ErrEnrollmentHeightUnset
+		}
+		return a.enrollment.ApplyEnrollmentTx(tx, h)
+	}
+	if tx.ContractID == MiningRewardContractID {
+		if a.enrollment == nil {
+			return ErrEnrollmentNotWired
+		}
+		return a.enrollment.ApplyMiningRewardTx(tx)
+	}
+	if tx.ContractID == slashing.ContractID {
+		if a.slasher == nil {
+			return ErrSlashingNotWired
+		}
+		h, ok := a.currentHeight()
+		if !ok {
+			return ErrEnrollmentHeightUnset
+		}
+		return a.slasher.ApplySlashTx(tx, h)
+	}
+	if tx.ContractID == chainparams.ContractID {
+		if a.gov == nil {
+			return ErrGovernanceNotWired
+		}
+		h, ok := a.currentHeight()
+		if !ok {
+			return ErrEnrollmentHeightUnset
+		}
+		return a.gov.ApplyGovTx(tx, h)
+	}
+	if tx.ContractID == TaskContractID {
+		tasks := a.TaskStateStore()
+		if tasks == nil {
+			return ErrTaskStateNotWired
+		}
+		// Refuse rather than default to height 0. The three branches above
+		// already do this; this one discarded the bool, and the consequence
+		// was specific to what the height is used for here. h feeds the
+		// activation gate in VerifyTaskActionSignature, whose rule is
+		// "required at or above height H". Height 0 is below every non-zero
+		// H, so an unwired heightFn made the unsigned-refusal silently
+		// inert -- the gate reported no error for the one input it exists
+		// to reject, at every height, forever. A misconfiguration that
+		// disables an authentication check is the fail-open shape this
+		// audit names in 8b; it is not acceptable in the fix for it.
+		//
+		// h also feeds ApplyEconomicTxAtHeight, so a nil heightFn was
+		// already applying height-dependent economics at 0 on this path.
+		// Refusing is consistent with the siblings and strictly safer.
+		h, ok := a.currentHeight()
+		if !ok {
+			return ErrEnrollmentHeightUnset
+		}
+		// Authenticate before applying. Admission verified this envelope at
+		// the HTTP boundary and then discarded the proof, so until now
+		// nothing re-checked it here -- and admission is not a consensus
+		// rule. A present signature is always verified; an absent one is
+		// refused only at or above the configured activation height, so
+		// historical unsigned actions still replay.
+		action, decErr := DecodeTaskActionTx(tx)
+		if decErr != nil {
+			return decErr
+		}
+		if err := VerifyTaskActionSignature(action, tx.Signature, tx.PublicKey, h); err != nil {
+			return err
+		}
+		return tasks.ApplyEconomicTxAtHeight(tx, a.accounts, h)
+	}
+	if tx.ContractID == StreamContractID {
+		streams := a.StreamStateStore()
+		if streams == nil {
+			return ErrStreamStateNotWired
+		}
+		// Ed25519 session keys are retired from the configured height
+		// (stream_ed25519_retirement.go): a stream open in a block at or
+		// above it is refused before anything is charged. With no height
+		// configured (the default) this branch is skipped and nothing
+		// changes. A tx that does not decode is refused by ApplyEconomicTx
+		// with the same decode error, as before.
+		if StreamEd25519RetirementHeight() != 0 {
+			if action, decErr := DecodeStreamActionTx(tx); decErr == nil && action.Action == StreamActionOpen {
+				h, ok := a.currentHeight()
+				if !ok {
+					return ErrEnrollmentHeightUnset
+				}
+				if err := checkStreamEd25519Retirement(action, h); err != nil {
+					return err
+				}
+			}
+		}
+		return streams.ApplyEconomicTx(tx, a.accounts)
+	}
+	if tx.ContractID == RecoveryCapsuleContractID {
+		recovery := a.RecoveryCapsuleStateStore()
+		if recovery == nil {
+			return ErrRecoveryCapsuleStateNotWired
+		}
+		return recovery.ApplyEconomicTx(tx, a.accounts)
+	}
+	if tx.ContractID == CELLS20ContractID {
+		// CELLS-20 tokens (CELLS20.go) from the activation height on. Below
+		// it, and always while no height is set, the transaction is not
+		// intercepted: it takes the plain transfer path below, exactly as
+		// on a node without CELLS-20, so this code turns no block that is
+		// valid today into an invalid one. Admission
+		// (CELLS20AdmissionChecker) refuses token transactions until the
+		// activation height, so this node never relays or includes one.
+		active, h, err := CELLS20RulesAt(a.NextBlockHeight)
+		if err != nil {
+			return err
+		}
+		if active {
+			tokens := a.CELLS20StateStore()
+			if tokens == nil {
+				return ErrCELLS20StateNotWired
+			}
+			return tokens.ApplyEconomicTxAtHeight(tx, a.accounts, h)
+		}
+	}
+	if tx.ContractID == WalletTransferContractID {
+		return ApplyWalletTransferTx(a.accounts, tx)
+	}
+	return a.accounts.ApplyTx(tx)
+}
+
+// SetTaskStateStore installs (or clears) the CELLS task-action
+// state store. Task txs use the CELLS/tasks/v1 ContractID and
+// are rejected with ErrTaskStateNotWired until this store is
+// attached.
+func (a *EnrollmentAwareApplier) SetTaskStateStore(tasks *TaskStateStore) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tasks = tasks
+}
+
+// TaskStateStore returns the configured task-action state store,
+// or nil if task actions are not wired on this node.
+func (a *EnrollmentAwareApplier) TaskStateStore() *TaskStateStore {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.tasks
+}
+
+// SetStreamStateStore installs (or clears) the CELLS/streams/v1 state store.
+// Stream transactions fail closed until a store is attached.
+func (a *EnrollmentAwareApplier) SetStreamStateStore(streams *StreamStateStore) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.streams = streams
+}
+
+// StreamStateStore returns the configured CELL stream state store.
+func (a *EnrollmentAwareApplier) StreamStateStore() *StreamStateStore {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.streams
+}
+
+// SetRecoveryCapsuleStateStore installs (or clears) the encrypted legacy
+// wallet recovery-capsule state store.
+func (a *EnrollmentAwareApplier) SetRecoveryCapsuleStateStore(recovery *RecoveryCapsuleStateStore) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.recovery = recovery
+}
+
+// RecoveryCapsuleStateStore returns the configured recovery-capsule store.
+func (a *EnrollmentAwareApplier) RecoveryCapsuleStateStore() *RecoveryCapsuleStateStore {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.recovery
+}
+
+// SetCELLS20StateStore installs (or clears) the CELLS-20 token state store.
+// Token transactions fail closed until a store is attached.
+func (a *EnrollmentAwareApplier) SetCELLS20StateStore(tokens *CELLS20StateStore) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tokens = tokens
+}
+
+// CELLS20StateStore returns the configured CELLS-20 token state store.
+func (a *EnrollmentAwareApplier) CELLS20StateStore() *CELLS20StateStore {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.tokens
+}
+
+// NextBlockHeight is the height of the block the next applied transaction
+// belongs to, from the installed height source (normally tip + 1). ok is
+// false when no source is installed.
+func (a *EnrollmentAwareApplier) NextBlockHeight() (uint64, bool) {
+	if a == nil {
+		return 0, false
+	}
+	return a.currentHeight()
+}
+
+// CELLS20Height is the height a token transaction is applied at, or the
+// refusal: switched off, below the activation height, or no height source.
+func (a *EnrollmentAwareApplier) CELLS20Height() (uint64, error) {
+	return CELLS20HeightFrom(a.NextBlockHeight)
+}
+
+// CheckCELLS20Tx reports whether tx would apply in the next block on the
+// current state: the activation height, every stateless check and the
+// signature, the token rules, and the sender's CELL account (it must exist,
+// carry tx's nonce and cover the fee). It changes nothing.
+func (a *EnrollmentAwareApplier) CheckCELLS20Tx(tx *mempool.Tx) error {
+	if a == nil {
+		return errors.New("chain: nil EnrollmentAwareApplier")
+	}
+	tokens := a.CELLS20StateStore()
+	if tokens == nil {
+		return ErrCELLS20StateNotWired
+	}
+	if _, err := a.CELLS20Height(); err != nil {
+		return err
+	}
+	return tokens.CheckEconomicTx(tx, a.accounts)
+}
+
+// SetGovApplier installs (or clears) the governance applier.
+// Opt-in — callers that don't set it reject all gov txs with
+// ErrGovernanceNotWired, matching the slashing opt-in pattern.
+//
+// The gov applier MUST share the same *AccountStore as this
+// shim's enrollment / slashing appliers, otherwise routing
+// would debit fees from one ledger and bump nonces on another.
+// The constructor does not (cannot) enforce this — it's a
+// wiring invariant the caller owns. Production wiring uses a
+// single *AccountStore passed to all three appliers.
+func (a *EnrollmentAwareApplier) SetGovApplier(ga *GovApplier) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.gov = ga
+}
+
+// GovApplier returns the configured governance applier, or nil
+// if governance is not wired on this node.
+func (a *EnrollmentAwareApplier) GovApplier() *GovApplier {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.gov
+}
+
+// SetSlashApplier installs (or clears) the slashing applier.
+// Opt-in — callers that don't set it reject all slash txs with
+// ErrSlashingNotWired, matching the enrollment opt-in pattern.
+//
+// The slash applier MUST share the same *AccountStore and
+// EnrollmentState (via its SlasherStateMutator contract) as
+// this shim's enrollment applier, otherwise routing would read
+// from one state tree and mutate another. The constructor does
+// not (cannot) enforce this — it's a wiring invariant the caller
+// owns. Production wiring uses a single *enrollment.InMemoryState
+// passed to both NewEnrollmentApplier and NewSlashApplier.
+func (a *EnrollmentAwareApplier) SetSlashApplier(sa *SlashApplier) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.slasher = sa
+}
+
+// SlashApplier returns the configured slashing applier, or nil
+// if slashing is not wired on this node.
+func (a *EnrollmentAwareApplier) SlashApplier() *SlashApplier {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.slasher
+}
+
+// StateRoot implements StateApplier. Legacy roots remain byte-for-byte stable
+// while their corresponding feature state is empty. Enrollment state is folded
+// only after EnrollmentStateRootActivationHeight so rollout can be coordinated
+// across every validator before block roots change.
+func (a *EnrollmentAwareApplier) StateRoot() string {
+	if a == nil || a.accounts == nil {
+		return ""
+	}
+	accountRoot := a.accounts.StateRoot()
+	tasks := a.TaskStateStore()
+	root := accountRoot
+	if tasks != nil && tasks.Count() > 0 {
+		h := sha256.New()
+		h.Write([]byte("accounts:"))
+		h.Write([]byte(accountRoot))
+		h.Write([]byte("\ntasks:"))
+		h.Write([]byte(tasks.StateRoot()))
+		root = hex.EncodeToString(h.Sum(nil))
+	}
+	streams := a.StreamStateStore()
+	if streams != nil && streams.Count() > 0 {
+		h := sha256.New()
+		h.Write([]byte("state:"))
+		h.Write([]byte(root))
+		h.Write([]byte("\nstreams:"))
+		h.Write([]byte(streams.StateRoot()))
+		root = hex.EncodeToString(h.Sum(nil))
+	}
+	recovery := a.RecoveryCapsuleStateStore()
+	if recovery != nil && recovery.Count() > 0 {
+		h := sha256.New()
+		h.Write([]byte("state:"))
+		h.Write([]byte(root))
+		h.Write([]byte("\nwallet-recovery:"))
+		h.Write([]byte(recovery.StateRoot()))
+		root = hex.EncodeToString(h.Sum(nil))
+	}
+	// CELLS-20 tokens join the root once the first token exists, so every
+	// block before it keeps its root.
+	tokens := a.CELLS20StateStore()
+	if tokens != nil && tokens.Count() > 0 {
+		h := sha256.New()
+		h.Write([]byte("state:"))
+		h.Write([]byte(root))
+		h.Write([]byte("\nCELLS-20:"))
+		h.Write([]byte(tokens.StateRoot()))
+		root = hex.EncodeToString(h.Sum(nil))
+	}
+	if enrollmentStateRootActiveAt(a.rootHeight.Load()) {
+		if enrollmentRoot := a.enrollmentStateRoot(); enrollmentRoot != "" {
+			h := sha256.New()
+			h.Write([]byte("state:"))
+			h.Write([]byte(root))
+			h.Write([]byte("\nenrollment:"))
+			h.Write([]byte(enrollmentRoot))
+			root = hex.EncodeToString(h.Sum(nil))
+		}
+	}
+	return root
+}
+
+func (a *EnrollmentAwareApplier) enrollmentStateRoot() string {
+	if a == nil {
+		return ""
+	}
+	type stateRooter interface {
+		StateRoot() string
+	}
+	a.mu.RLock()
+	var rooter stateRooter
+	if a.enrollment != nil {
+		rooter, _ = a.enrollment.State.(stateRooter)
+	}
+	if rooter == nil && a.slasher != nil {
+		rooter, _ = a.slasher.State.(stateRooter)
+	}
+	a.mu.RUnlock()
+	if rooter == nil {
+		return ""
+	}
+	return rooter.StateRoot()
+}
+
+// Sweep releases every enrollment whose unbond window matures
+// at `height`, crediting each record's stake back to its owner.
+// Intended to be called exactly once per sealed block, AFTER
+// the block's transactions have been applied.
+//
+// Returns the list of releases (for receipts / monitoring) and
+// any error from the underlying state. A nil enrollment applier
+// returns (nil, nil) so callers can Sweep unconditionally from
+// their block-finalisation path without branching.
+func (a *EnrollmentAwareApplier) Sweep(height uint64) ([]enrollment.UnbondRelease, error) {
+	if a == nil || a.enrollment == nil {
+		return nil, nil
+	}
+	return a.enrollment.SweepMaturedEnrollments(height)
+}
+
+// SealedBlockHook returns a function suitable for assignment to
+// BlockProducer.OnSealedBlock that automatically invokes
+// Sweep(blk.Height) after every sealed block. Pass `onErr` to
+// observe sweep failures (which are otherwise swallowed because
+// the post-seal hook contract has no error path); nil drops
+// errors silently, matching the legacy OnSealed behaviour.
+//
+// The returned hook is concurrency-safe (BlockProducer fires it
+// outside bp.mu, and Sweep takes its own locks via the
+// EnrollmentApplier / EnrollmentState).
+//
+// If the shim has no enrollment applier wired, the hook is a
+// no-op and never calls onErr — installing it on a v1-only node
+// is therefore safe and idempotent.
+func (a *EnrollmentAwareApplier) SealedBlockHook(onErr func(height uint64, err error)) func(*Block) {
+	return func(blk *Block) {
+		if a == nil || a.enrollment == nil || blk == nil {
+			return
+		}
+		if _, err := a.Sweep(blk.Height); err != nil && onErr != nil {
+			onErr(blk.Height, err)
+		}
+	}
+}
+
+// Accounts exposes the underlying account store for callers
+// that need to observe balance state directly (e.g. tests,
+// genesis wiring, wallet RPC). NOT for general mutation — use
+// the ApplyTx path so enrollment routing stays consistent.
+func (a *EnrollmentAwareApplier) Accounts() *AccountStore {
+	if a == nil {
+		return nil
+	}
+	return a.accounts
+}
+
+// EnrollmentApplier returns the configured enrollment applier,
+// or nil if enrollment is not wired on this node.
+func (a *EnrollmentAwareApplier) EnrollmentApplier() *EnrollmentApplier {
+	if a == nil {
+		return nil
+	}
+	return a.enrollment
+}
+
+// currentHeight reads the configured height provider. Returns
+// (0, false) if no provider is set, which ApplyTx surfaces as
+// ErrEnrollmentHeightUnset so misconfiguration is loud rather
+// than silently stamping every enroll with height 0.
+func (a *EnrollmentAwareApplier) currentHeight() (uint64, bool) {
+	a.mu.RLock()
+	fn := a.heightFn
+	a.mu.RUnlock()
+	if fn == nil {
+		return 0, false
+	}
+	return fn(), true
+}
+
+// Sentinel errors returned by ApplyTx when enrollment routing
+// is impossible. Both are surfaced as tx-level rejections (not
+// panics) because they describe misconfiguration that should be
+// visible in block receipts and fixable without restarting.
+var (
+	// ErrEnrollmentNotWired is returned when a tx tagged as an
+	// enrollment transaction arrives at a node that has no
+	// EnrollmentApplier configured. Typical cause: a v2-aware
+	// miner submitted against a v1-only validator.
+	ErrEnrollmentNotWired = errors.New("chain: enrollment tx received but no EnrollmentApplier is wired")
+
+	// ErrEnrollmentHeightUnset is returned when an enrollment
+	// tx is received but no HeightFn has been installed on the
+	// EnrollmentAwareApplier. This is strictly a wiring bug
+	// (the post-construction SetHeightFn call was missed) and
+	// always fatal for the offending tx.
+	ErrEnrollmentHeightUnset = errors.New("chain: EnrollmentAwareApplier has no HeightFn set")
+
+	// ErrSlashingNotWired is returned when a slash tx arrives
+	// at a node that has no SlashApplier configured. Symmetric
+	// to ErrEnrollmentNotWired; typical cause is a v2-aware
+	// peer submitting to a validator that hasn't enabled
+	// slashing yet.
+	ErrSlashingNotWired = errors.New("chain: slash tx received but no SlashApplier is wired")
+
+	// ErrGovernanceNotWired is returned when a gov tx arrives
+	// at a node that has no GovApplier configured. Symmetric
+	// to ErrSlashingNotWired; typical cause is a multisig
+	// authority submitting against a validator that hasn't
+	// enabled the v2 governance surface yet.
+	ErrGovernanceNotWired = errors.New("chain: gov tx received but no GovApplier is wired")
+
+	// ErrTaskStateNotWired is returned when a CELLS/tasks/v1
+	// tx arrives at a node that has no TaskStateStore configured.
+	ErrTaskStateNotWired = errors.New("chain: task action tx received but no TaskStateStore is wired")
+
+	// ErrStreamStateNotWired is returned when a CELLS/streams/v1 transaction
+	// arrives at a node that has no StreamStateStore configured.
+	ErrStreamStateNotWired = errors.New("chain: CELL stream tx received but no StreamStateStore is wired")
+
+	// ErrRecoveryCapsuleStateNotWired is returned when a signed recovery
+	// capsule transaction reaches a node that has not installed its store.
+	ErrRecoveryCapsuleStateNotWired = errors.New("chain: wallet recovery capsule tx received but no RecoveryCapsuleStateStore is wired")
+
+	// ErrCELLS20StateNotWired is returned when a CELLS-20 token transaction
+	// reaches a node that has not installed its store.
+	ErrCELLS20StateNotWired = errors.New("chain: CELLS-20 token tx received but no CELLS20StateStore is wired")
+)
+
+// Compile-time interface assertions.
+var (
+	_ StateApplier       = (*EnrollmentAwareApplier)(nil)
+	_ ChainReplayApplier = (*EnrollmentAwareApplier)(nil)
+)
+
+// ChainReplayClone implements ChainReplayApplier. Returns a new
+// EnrollmentAwareApplier whose AccountStore and EnrollmentState
+// are deep copies of the receiver's. Mutations on the clone do
+// NOT affect the live applier; abandoning the clone (no Restore)
+// is the speculative-rollback path.
+//
+// Panics if the wired EnrollmentStateMutator does not satisfy
+// enrollment.CloneableState — that's a wiring bug that must
+// surface at boot or BFT-replay setup, not silently degrade
+// finality. Production wiring uses *enrollment.InMemoryState
+// (or any future state implementation that adds Clone/Restore).
+func (a *EnrollmentAwareApplier) ChainReplayClone() ChainReplayApplier {
+	if a == nil {
+		return nil
+	}
+	clone := &EnrollmentAwareApplier{
+		accounts: a.accounts.Clone(),
+	}
+	clone.rootHeight.Store(a.rootHeight.Load())
+	// Clone the enrollment state exactly once and share it
+	// between the enrollment applier and the slasher so both
+	// routes see a single consistent snapshot. If they each
+	// got a fresh clone, enroll/unenroll and slash would
+	// diverge on the same speculative block.
+	var sharedMutator EnrollmentStateMutator
+	if a.enrollment != nil {
+		ces, ok := a.enrollment.State.(enrollment.CloneableState)
+		if !ok {
+			panic("chain: EnrollmentAwareApplier.ChainReplayClone: " +
+				"wired EnrollmentStateMutator does not implement " +
+				"enrollment.CloneableState — speculative replay is unsafe")
+		}
+		stateClone := ces.Clone()
+		clonedMutator, ok := stateClone.(EnrollmentStateMutator)
+		if !ok {
+			panic("chain: EnrollmentAwareApplier.ChainReplayClone: " +
+				"cloned state does not satisfy EnrollmentStateMutator")
+		}
+		sharedMutator = clonedMutator
+		clone.enrollment = NewEnrollmentApplier(clone.accounts, sharedMutator)
+	}
+	// Mirror the slasher against the cloned account store and
+	// the same state snapshot. Dispatcher + RewardBPS are
+	// deterministic / stateless so they pass through by value.
+	a.mu.RLock()
+	liveSlasher := a.slasher
+	liveTasks := a.tasks
+	liveStreams := a.streams
+	liveRecovery := a.recovery
+	liveTokens := a.tokens
+	clone.heightFn = a.heightFn
+	a.mu.RUnlock()
+	if liveTasks != nil {
+		clone.tasks = liveTasks.ChainReplayClone().(*TaskStateStore)
+	}
+	if liveStreams != nil {
+		clone.streams = liveStreams.ChainReplayClone().(*StreamStateStore)
+	}
+	if liveRecovery != nil {
+		clone.recovery = liveRecovery.ChainReplayClone().(*RecoveryCapsuleStateStore)
+	}
+	if liveTokens != nil {
+		clone.tokens = liveTokens.ChainReplayClone().(*CELLS20StateStore)
+	}
+	if liveSlasher != nil {
+		sm, ok := sharedMutator.(SlasherStateMutator)
+		if !ok {
+			// If enrollment was NOT wired but slashing was,
+			// we must clone the slasher's own state. This
+			// path is atypical (slashing without enrollment
+			// is nonsensical) but we defend against it.
+			if sharedMutator == nil {
+				if ces, ok := liveSlasher.State.(enrollment.CloneableState); ok {
+					clonedState := ces.Clone()
+					if m, ok := clonedState.(SlasherStateMutator); ok {
+						sm = m
+					}
+				}
+			}
+			if sm == nil {
+				panic("chain: EnrollmentAwareApplier.ChainReplayClone: " +
+					"wired SlasherStateMutator cannot be cloned")
+			}
+		}
+		clone.slasher = NewSlashApplier(
+			clone.accounts,
+			sm,
+			liveSlasher.Dispatcher,
+			liveSlasher.RewardBPS,
+		)
+	}
+	return clone
+}
+
+// RestoreFromChainReplay implements ChainReplayApplier. Replaces
+// the receiver's contents with those of `from`, which MUST be a
+// snapshot returned by ChainReplayClone on the same applier
+// (or one in the same family — same concrete EnrollmentState
+// type). Errors on type mismatch.
+//
+// Used as the abort path for TryAppendExternalBlock when live
+// apply diverges from the replay state root, and for any
+// operator-driven rollback. Atomic: AccountStore restore is
+// done first; if it fails, the EnrollmentState is not touched.
+func (a *EnrollmentAwareApplier) RestoreFromChainReplay(from ChainReplayApplier) error {
+	if a == nil {
+		return errors.New("chain: nil EnrollmentAwareApplier on RestoreFromChainReplay")
+	}
+	other, ok := from.(*EnrollmentAwareApplier)
+	if !ok || other == nil {
+		return errors.New("chain: RestoreFromChainReplay expects *EnrollmentAwareApplier snapshot")
+	}
+	if err := a.accounts.RestoreFromChainReplay(other.accounts); err != nil {
+		return err
+	}
+	if a.enrollment != nil || other.enrollment != nil {
+		if a.enrollment == nil || other.enrollment == nil {
+			return errors.New("chain: RestoreFromChainReplay enrollment applier presence mismatch")
+		}
+		srcState, ok := other.enrollment.State.(enrollment.CloneableState)
+		if !ok {
+			return errors.New("chain: source enrollment state does not implement enrollment.CloneableState")
+		}
+		dstState, ok := a.enrollment.State.(enrollment.CloneableState)
+		if !ok {
+			return errors.New("chain: live enrollment state does not implement enrollment.CloneableState")
+		}
+		if err := dstState.Restore(srcState); err != nil {
+			return err
+		}
+	}
+	liveTasks := a.TaskStateStore()
+	otherTasks := other.TaskStateStore()
+	if (liveTasks == nil) != (otherTasks == nil) {
+		return errors.New("chain: RestoreFromChainReplay task state presence mismatch")
+	}
+	if liveTasks != nil {
+		if err := liveTasks.RestoreFromChainReplay(otherTasks); err != nil {
+			return err
+		}
+	}
+	liveStreams := a.StreamStateStore()
+	otherStreams := other.StreamStateStore()
+	if (liveStreams == nil) != (otherStreams == nil) {
+		return errors.New("chain: RestoreFromChainReplay stream state presence mismatch")
+	}
+	if liveStreams != nil {
+		if err := liveStreams.RestoreFromChainReplay(otherStreams); err != nil {
+			return err
+		}
+	}
+	liveRecovery := a.RecoveryCapsuleStateStore()
+	otherRecovery := other.RecoveryCapsuleStateStore()
+	if (liveRecovery == nil) != (otherRecovery == nil) {
+		return errors.New("chain: RestoreFromChainReplay recovery capsule state presence mismatch")
+	}
+	if liveRecovery != nil {
+		if err := liveRecovery.RestoreFromChainReplay(otherRecovery); err != nil {
+			return err
+		}
+	}
+	liveTokens := a.CELLS20StateStore()
+	otherTokens := other.CELLS20StateStore()
+	if (liveTokens == nil) != (otherTokens == nil) {
+		return errors.New("chain: RestoreFromChainReplay CELLS-20 token state presence mismatch")
+	}
+	if liveTokens != nil {
+		if err := liveTokens.RestoreFromChainReplay(otherTokens); err != nil {
+			return err
+		}
+	}
+	a.rootHeight.Store(other.rootHeight.Load())
+	return nil
+}

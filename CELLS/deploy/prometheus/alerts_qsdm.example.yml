@@ -1,0 +1,3244 @@
+# Example Prometheus alerting rules for CELLS dashboard metrics (CELLS_*).
+# Load with rule_files in prometheus.yml, or use a Prometheus Operator PrometheusRule CRD.
+#
+# Adjust thresholds and `for:` to your fleet; many counters are monotonic — use rate().
+
+groups:
+  # -----------------------------------------------------------------
+  # NVIDIA-lock + NGC submission gate (operator-policy enforcement)
+  # -----------------------------------------------------------------
+  # NVIDIA-lock has two enforcement points: the HTTP
+  # gate (state-changing API → 403 if no qualifying
+  # proof) and the P2P gate (libp2p tx → silent drop
+  # post-consensus if no qualifying proof). Both
+  # consult the same proof ring (populated by the
+  # NGC submission gate below). Toggles are
+  # independent: CELLS_NVIDIA_LOCK_ENABLED for HTTP,
+  # CELLS_NVIDIA_LOCK_GATE_P2P for P2P. Detail strings
+  # in NvidiaLockProofOK (pkg/monitoring/nvidia_lock.go)
+  # name the four canonical failure modes (no bundles,
+  # no qualifying proof, NodeID mismatch, HMAC fail).
+  # The NGC submission alerts further down catch
+  # failures at the per-request gate that feeds the
+  # proof ring — sustained NGC rejects are the
+  # canonical upstream cause of NVIDIA-lock alerts.
+  - name: CELLS-nvidia-lock
+    rules:
+      - alert: CELLSNvidiaLockHTTPBlocksSpike
+        expr: rate(CELLS_nvidia_lock_http_blocks_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          # Mode A in OPERATOR_HYGIENE_INCIDENT.md —
+          # the HTTP NVIDIA-lock gate is returning
+          # 403s on state-changing API calls at >0.5/s
+          # sustained (≈150 failures in 5m). Each 403
+          # carries a typed detail message naming
+          # which guard tripped; the runbook §3.1
+          # triage table maps the four canonical
+          # detail substrings ({"no NGC proof bundles
+          # ingested", "no qualifying proof within
+          # window", "matching CELLS_node_id /
+          # CELLSplus_node_id", "valid CELLS_proof_hmac
+          # / CELLSplus_proof_hmac"}) to {sidecar not
+          # posting, bundle policy fail, NodeID
+          # mismatch, HMAC drift}. Cross-references
+          # NGC_SUBMISSION_INCIDENT.md as the
+          # upstream cause when the proof ring is
+          # empty because ingest is rejecting.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/OPERATOR_HYGIENE_INCIDENT.md#31-mode-a--CELLSnvidialockhttpblocksspike"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-operator-hygiene-incident.json"
+          summary: "{{ $labels.instance }}: elevated NVIDIA-lock HTTP 403 rate"
+          description: |
+            CELLS_nvidia_lock_http_blocks_total is incrementing
+            at >0.5/s sustained. State-changing API calls are
+            being rejected by the HTTP NVIDIA-lock gate. The
+            403 response body contains a typed detail message
+            naming the failure mode — capture one and match
+            against the triage table:
+              "no NGC proof bundles ingested" ⇒ sidecar isn't
+                  posting OR CELLS_NGC_INGEST_SECRET unset
+              "no qualifying proof within window" ⇒ bundle's
+                  architecture/gpu_fingerprint policy failed
+              "matching CELLS_node_id" ⇒ CELLS_NVIDIA_LOCK_EXPECTED_NODE_ID
+                  ≠ CELLS_NGC_PROOF_NODE_ID
+              "valid CELLS_proof_hmac" ⇒ HMAC secret rotated
+                  on one side only
+
+      - alert: CELLSNvidiaLockP2PRejects
+        expr: increase(CELLS_nvidia_lock_p2p_rejects_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          # Mode B in OPERATOR_HYGIENE_INCIDENT.md —
+          # the P2P NVIDIA-lock gate dropped at least
+          # one inbound libp2p tx in 15m. Runs AFTER
+          # consensus validation, so the dropped tx
+          # had already passed WASM preflight, submesh
+          # policy, AND consensus — the lock is the
+          # final gate before storage. A single drop
+          # fires the alert. Toggles are independent
+          # of the HTTP gate: an operator can run with
+          # CELLS_NVIDIA_LOCK_ENABLED=0 (HTTP open) and
+          # CELLS_NVIDIA_LOCK_GATE_P2P=1 (P2P locked),
+          # or vice versa. The runbook §3.2 maps
+          # {Mode A also firing, Mode A flat /
+          # Mode B alone, chain-height correlated,
+          # fresh-validator unintended-gate} to the
+          # right action. The libp2p drop is silent —
+          # producers have no client-visible signal,
+          # so the alert IS the operator's only handle.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/OPERATOR_HYGIENE_INCIDENT.md#32-mode-b--CELLSnvidialockp2prejects"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-operator-hygiene-incident.json"
+          summary: "{{ $labels.instance }}: P2P transactions rejected by NVIDIA-lock gate"
+          description: |
+            CELLS_nvidia_lock_p2p_rejects_total has incremented
+            in the last 15m. The P2P NVIDIA-lock gate
+            (CELLS_NVIDIA_LOCK_GATE_P2P) dropped libp2p txs
+            post-consensus because no qualifying NGC proof
+            was in the ring. P2P drops are silent — the
+            producer has no client-visible signal. Triage:
+              - If Mode A (NVIDIA-lock HTTP) is also firing,
+                shared root: the proof ring is broken. Triage
+                Mode A first; B clears as a follow-on.
+              - If Mode A is flat, the HTTP gate is disabled
+                but P2P is enabled. Confirm the asymmetric
+                toggle is intentional.
+              - If unintended (env-var typo), set
+                CELLS_NVIDIA_LOCK_GATE_P2P=0 and restart.
+
+      # ---------------------------------------------------------------
+      # NGC submission gate — challenge issuance + proof ingest
+      # ---------------------------------------------------------------
+      # GET /monitoring/ngc-challenge mints a fresh
+      # (nonce, issued_at, signature) triple per call;
+      # rate-limited at 15 req/IP/min in
+      # pkg/api/security.go:getEndpointLimit. POST
+      # /monitoring/ngc-proof ingests the signed
+      # CUDA-proof bundle; rate-limited at 30 req/IP/min,
+      # nine closed-enum reject reasons in
+      # pkg/monitoring/ngc_ingest_metrics.go
+      # (ingest_disabled / unauthorized / body_read /
+      # body_too_large / invalid_json / missing_cuda_hash
+      # / nonce / hmac / other). These two alerts catch
+      # failures at the per-request submission gate;
+      # sustained rejects here are the canonical
+      # upstream cause of TRUST_INCIDENT.md Modes A/B/D
+      # (no accepted bundles → trust attested drops →
+      # CELLS.tech badge degraded).
+      - alert: CELLSNGCChallengeRateLimited
+        expr: increase(CELLS_ngc_challenge_rate_limited_total[10m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          # Mode A in NGC_SUBMISSION_INCIDENT.md — a
+          # sidecar (or a third-party probe) hit the
+          # 15-req/IP/min cap on /ngc-challenge and
+          # got 429 at least 6× in 10m. The validator
+          # returns Retry-After on every 429, so a
+          # well-behaved client backs off immediately;
+          # sustained hits mean the client ignored
+          # Retry-After OR retries without jitter. The
+          # runbook §3.1 source-distribution table
+          # forks {single known sidecar, single
+          # unknown IP, fleet-wide bursts, chain-event
+          # correlated} into one of {operator
+          # outreach, firewall block, sidecar release
+          # rollback, nonce-TTL extension}. Explicitly
+          # anti-patterns silently raising the per-IP
+          # cap to silence the alert.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/NGC_SUBMISSION_INCIDENT.md#31-mode-a--CELLSngcchallengeratelimited"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-ngc-submission-incident.json"
+          summary: "{{ $labels.instance }}: sustained 429s on /monitoring/ngc-challenge"
+          description: |
+            CELLS_ngc_challenge_rate_limited_total has incremented
+            >5 times in 10m, sustained 5m. The per-IP cap is 15
+            req/min; sustained hits mean a sidecar is polling
+            without jitter or ignoring Retry-After. Triage:
+              - Identify the offending IP from access logs
+                (the rate limit is per-IP).
+              - Compare rate(CELLS_ngc_challenge_rate_limited_total)
+                vs. rate(CELLS_ngc_challenge_issued_total) — the
+                healthy ratio is rate_limited << issued.
+              - If the offender is a known sidecar, pin its
+                version against the reference scripts in
+                apps/CELLS-nvidia-ngc/scripts (which jitter
+                ±30s in a 60–120s cycle).
+              - If unknown, add to upstream firewall block list.
+
+      - alert: CELLSNGCProofIngestRejectBurst
+        expr: sum(increase(CELLS_ngc_proof_ingest_rejected_total[10m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          # Mode B in NGC_SUBMISSION_INCIDENT.md — the
+          # canonical upstream cause for trust
+          # degradation. The summed-rate expression
+          # means a multi-reason failure trips the
+          # alert just as easily as a single dominant
+          # reason — intentional, because most real
+          # incidents (rotated secret, malformed
+          # bundle release, clock-skew event) cause
+          # two or three reject_reasons to spike
+          # together. The runbook §3.2 maps each of
+          # nine closed-enum reasons to a probable
+          # cause + action, and groups them into
+          # mitigation classes: auth/secret drift
+          # (hmac, unauthorized), payload shape
+          # (body_too_large, missing_cuda_hash,
+          # invalid_json), replay/timing (nonce,
+          # body_read), config (ingest_disabled —
+          # silence on validators not supposed to be
+          # trust peers), and bug (other). The
+          # cascade map in §4 explicitly hands off to
+          # TRUST_INCIDENT.md Modes A/B/D when those
+          # fire alongside.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/NGC_SUBMISSION_INCIDENT.md#32-mode-b--CELLSngcproofingestrejectburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-ngc-submission-incident.json"
+          summary: "{{ $labels.instance }}: sustained POST /monitoring/ngc-proof rejections"
+          description: |
+            CELLS_ngc_proof_ingest_rejected_total summed across
+            all reject reasons exceeded 10 in 10m, sustained 5m.
+            This is the canonical UPSTREAM CAUSE for trust
+            degradation — sustained Mode B precedes
+            CELLSTrustNoAttestationsAccepted /
+            CELLSTrustIngestRejectRateElevated /
+            CELLSTrustNGCServiceDegraded by 5–20 min.
+            Triage: decompose by reason FIRST. The dominant
+            reason names the cause:
+              topk(3, sum by (reason)
+                (rate(CELLS_ngc_proof_ingest_rejected_total[10m])))
+            Reason → cause mapping (see runbook §3.2 table
+            for full triage):
+              hmac           ⇒ secret rotation hit one side only
+              nonce          ⇒ clock skew / retry loop / pool overflow
+              unauthorized   ⇒ third-party probe OR auth misconfig
+              body_too_large ⇒ sidecar release payload regression
+              missing_cuda_hash / invalid_json ⇒ sidecar serializer bug
+              ingest_disabled ⇒ CELLS_NGC_INGEST_SECRET unset (not a
+                                fault if this validator isn't a trust peer)
+              other          ⇒ closed-enum gap; file P3.
+
+  # -----------------------------------------------------------------
+  # Submesh policy gate (per-tx route + size enforcement)
+  # -----------------------------------------------------------------
+  # The submesh policy gate sits UPSTREAM of validation
+  # (pkg/submesh/manager.go via cmd/CELLS/transaction/
+  # transaction.go for libp2p, pkg/api/handlers.go for
+  # HTTP). Transactions that fail the gate are dropped
+  # before validation runs — they don't increment
+  # CELLS_transactions_invalid_total. Two failure modes,
+  # captured by two error types:
+  #
+  #   ErrSubmeshNoRoute:
+  #     fee/geotag did not match any submesh route
+  #     loaded from cfg.SubmeshConfigPath. Most often
+  #     a client-side config drift (fee tier client
+  #     thinks valid is no longer in the loaded
+  #     submesh_config) OR validator-side reload that
+  #     tightened the route set.
+  #
+  #   ErrSubmeshPayloadTooLarge:
+  #     route matched but the message exceeded the
+  #     matched submesh's max_tx_size. Most often a
+  #     client-side framing change (new field /
+  #     larger encoding) OR validator-side reload
+  #     that lowered max_tx_size.
+  #
+  # Five counters distinguish the path (libp2p vs API
+  # wallet vs API privileged) and the reason (route vs
+  # size). Privileged paths use the strictest
+  # max_tx_size across all submeshes and have no route
+  # check.
+  - name: CELLS-submesh
+    rules:
+      - alert: CELLSSubmeshP2PRejects
+        # ANY route OR size reject in 15m, sustained 5m.
+        # Threshold is intentionally aggressive: libp2p
+        # rejects are silent (fire-and-forget; producer
+        # gets no feedback), so the alert IS the
+        # operator's only signal that a population of
+        # peers is being permanently dropped at the gate.
+        expr: increase(CELLS_submesh_p2p_reject_route_total[15m]) > 0 or increase(CELLS_submesh_p2p_reject_size_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          # Mode A in SUBMESH_POLICY_INCIDENT.md — P2P
+          # path. Triage matrix in §3.1 maps the dominant
+          # counter ({route_total only, size_total only,
+          # both}) and the source distribution ({single
+          # peer, fleet-wide}) to one of {client-config
+          # drift, validator-config reload regression,
+          # in-flight client migration}. The runbook
+          # explicitly says NOT to silence the alert
+          # without identifying the producer — libp2p has
+          # no client-visible response, so silencing
+          # leaves a population permanently unable to
+          # participate.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SUBMESH_POLICY_INCIDENT.md#31-mode-a--CELLSsubmeshp2prejects"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-submesh-policy-incident.json"
+          summary: "{{ $labels.instance }}: P2P transactions dropped by submesh policy gate"
+          description: |
+            CELLS_submesh_p2p_reject_route_total or
+            CELLS_submesh_p2p_reject_size_total has been
+            incrementing for 5m+. P2P txs are dropped
+            silently (libp2p fire-and-forget); producers
+            have no client-visible signal that their
+            txs are being rejected, so the alert IS the
+            operator's only handle.
+            Triage:
+              - Decompose by reason:
+                rate(CELLS_submesh_p2p_reject_route_total[15m])
+                rate(CELLS_submesh_p2p_reject_size_total[15m])
+              - route_total dominant ⇒ client fee/geotag
+                drift OR validator submesh_config reload
+                tightened routes.
+              - size_total dominant ⇒ client framing
+                drift OR max_tx_size lowered on the
+                matched submesh.
+              - Cross-check CELLS_quarantine_submeshes:
+                sustained policy hits eventually
+                trigger per-submesh isolation
+                (QUARANTINE_INCIDENT.md cascade).
+
+      - alert: CELLSSubmeshAPISustained422
+        # ≥5 API rejects (any of wallet route + wallet
+        # size + privileged size) over 10m, sustained
+        # 5m. Summed-counter expression with a small
+        # threshold gives noise immunity: a single
+        # mistuned client doesn't trip it but a
+        # sustained mis-rollout does. API rejects ARE
+        # client-visible (HTTP 422), so unlike Mode A
+        # the producer knows — but if they're retrying
+        # without fixing the underlying cause, the
+        # alert paints.
+        expr: |
+          (
+            increase(CELLS_submesh_api_wallet_reject_route_total[10m])
+            + increase(CELLS_submesh_api_wallet_reject_size_total[10m])
+            + increase(CELLS_submesh_api_privileged_reject_size_total[10m])
+          ) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          # Mode B in SUBMESH_POLICY_INCIDENT.md — API
+          # path. Triage matrix in §3.2 forks on the
+          # dominant counter: wallet_reject_route_total
+          # ⇒ stale wallet client, wallet_reject_size_total
+          # ⇒ wallet release added a memo/metadata field,
+          # privileged_reject_size_total ⇒ service-account
+          # producer hit a payload-size regression. The
+          # runbook explicitly anti-patterns raising the
+          # privileged max_tx_size to silence one bad
+          # producer (it's a global change affecting
+          # every privileged caller).
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SUBMESH_POLICY_INCIDENT.md#32-mode-b--CELLSsubmeshapisustained422"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-submesh-policy-incident.json"
+          summary: "{{ $labels.instance }}: sustained HTTP 422s from submesh policy gate"
+          description: |
+            ≥5 API submesh-policy rejects over 10m,
+            summed across CELLS_submesh_api_wallet_reject_*
+            and CELLS_submesh_api_privileged_reject_size_total.
+            API clients receive HTTP 422 directly so the
+            producer knows; the alert paints because
+            they're retrying without fixing the
+            underlying cause.
+            Triage:
+              - Decompose by endpoint:
+                rate(CELLS_submesh_api_wallet_reject_route_total[10m])
+                rate(CELLS_submesh_api_wallet_reject_size_total[10m])
+                rate(CELLS_submesh_api_privileged_reject_size_total[10m])
+              - wallet_route ⇒ stale wallet client OR
+                submesh_config dropped a route the
+                wallet was using.
+              - wallet_size ⇒ wallet release attaching
+                memos / metadata OR max_tx_size lowered.
+              - privileged_size ⇒ mint / token-create
+                caller above the strictest cap (most
+                often a service-account producer
+                payload-size regression).
+
+  # -----------------------------------------------------------------
+  # Throughput sentinel — the chain's "silent failure" detector
+  # -----------------------------------------------------------------
+  # Most chain-failure modes have a louder signal
+  # (consensus stalls trip mining-liveness;
+  # quarantine triggers trip the quarantine cluster;
+  # trust degradation trips the trust cluster). This
+  # rule catches the residual case where the chain
+  # LOOKS healthy from outside (peers connected,
+  # mempool churning, /metrics returning data) but
+  # isn't doing useful work — the validator is
+  # admitting txs but losing 100% of them somewhere
+  # in the six-gate dispatch pipeline (parse → WASM
+  # preflight → submesh policy → consensus →
+  # NVIDIA-lock P2P → storage). Without this alert
+  # the operator could miss it for hours.
+  - name: CELLS-throughput
+    rules:
+      - alert: CELLSNoTransactionsStored
+        expr: rate(CELLS_transactions_stored_total[30m]) == 0 and rate(CELLS_transactions_processed_total[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          # Mode D in OPERATOR_HYGIENE_INCIDENT.md —
+          # the throughput-divergence sentinel. The
+          # runbook §3.4 documents the six-gate
+          # dispatch pipeline and maps {dominant
+          # submesh reject counter, dominant
+          # nvidia-lock P2P reject counter, invalid
+          # climbing without subsystem signal, all
+          # counters flat with only processed
+          # climbing, processed climbing without any
+          # invalid signal} to {submesh policy fail
+          # fleet-wide, NVIDIA-lock P2P all-reject,
+          # WASM preflight or consensus regression,
+          # storage backend erroring, parse-stage
+          # silent drop}. Cross-references
+          # SUBMESH_POLICY_INCIDENT.md (alternate
+          # gate cause), OPERATOR_HYGIENE Mode B
+          # (NVIDIA-lock P2P gate cause), and
+          # MINING_LIVENESS.md (when storage failures
+          # wedge block production).
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/OPERATOR_HYGIENE_INCIDENT.md#34-mode-d--CELLSnotransactionsstored"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-operator-hygiene-incident.json"
+          summary: "{{ $labels.instance }}: transactions processed but none stored"
+          description: |
+            Validator is admitting inbound P2P txs but storing
+            zero of them for 30m. Every tx is being dropped
+            somewhere in the six-gate dispatch pipeline (parse
+            → WASM preflight → submesh policy → consensus →
+            NVIDIA-lock P2P → storage). Triage by reading which
+            counter is climbing:
+              CELLS_submesh_p2p_reject_*    ⇒ submesh policy
+              CELLS_nvidia_lock_p2p_rejects ⇒ NVIDIA-lock P2P
+              CELLS_transactions_invalid    ⇒ WASM or consensus
+              all flat                     ⇒ storage backend
+                                             erroring (check
+                                             logs for "Failed
+                                             to store transaction")
+            See OPERATOR_HYGIENE_INCIDENT.md §3.4 for the full
+            decomposition.
+
+  # -----------------------------------------------------------------
+  # Trust / attestation transparency (Major Update §8.5)
+  # -----------------------------------------------------------------
+  # These alerts consume the canonical CELLS_* series. They are safe to
+  # load on legacy-only or dual-emit scrapers because dual-emit
+  # (pkg/monitoring/prometheus_prefix_migration.go) publishes both
+  # prefixes by default. If your fleet has already flipped to CELLS_*
+  # only, nothing changes; if it is still on CELLS_* only, swap the
+  # prefix in expr: once.
+  #
+  # The /api/v1/trust/attestations/summary HTTP endpoint is NOT itself
+  # a Prometheus metric, so we alert on the underlying counter
+  # (CELLS_ngc_proof_ingest_accepted_total) instead: if no accepted
+  # proof bundle arrived for 20 min, the summary's "attested" ratio
+  # will have fallen to 0 regardless of how many validators are live,
+  # which is the operator-visible symptom.
+  - name: CELLS-trust-transparency
+    rules:
+      - alert: CELLSTrustNoAttestationsAccepted
+        # Rate == 0 across a 20-minute window = no sidecar (or any
+        # peer) is successfully attesting. Because the freshness window
+        # on /trust/attestations/summary is 15 m by default, 20 m
+        # guarantees the transparency badge has already flipped to
+        # degraded before this alert fires.
+        expr: sum(rate(CELLS_ngc_proof_ingest_accepted_total[20m])) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          # Mode A is the entry point of the canonical
+          # trust-degradation cascade — sidecar stops
+          # posting → counter flatlines → service status
+          # degraded → newest sample ages out → attested
+          # drops below floor. The runbook's §4 cascade
+          # map walks the typical 30–40m progression so
+          # an operator hit by 4 alerts at once knows
+          # they're one incident.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/TRUST_INCIDENT.md#31-mode-a--CELLStrustnoattestationsaccepted"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-trust-incident.json"
+          summary: "No accepted NGC proof bundles for 20 minutes"
+          description: |
+            /api/v1/trust/attestations/summary will report attested=0 until a
+            miner or sidecar posts a fresh bundle. Common causes:
+              - The refresh loop (Windows Scheduled Task "CELLS-NGC-Attest",
+                apps/CELLS-nvidia-ngc/scripts/attest-from-env-file.ps1)
+                stopped because the host is off / the secret rotated.
+              - Sidecar containers (docker compose --profile gpu) crashed;
+                check CELLS_ngc_proof_ingest_rejected_total by reason.
+              - The node has CELLS_NGC_INGEST_SECRET unset, which
+                disables the ingest route; the counter then stays pinned
+                at zero by design.
+
+      - alert: CELLSTrustIngestRejectRateElevated
+        # Accepted vs rejected ratio: if rejects outpace accepts over 10 m,
+        # something is misaligned (secret rotated on one side, clock skew,
+        # replay-nonce expired). Use >1.0 so a single rejected probe does
+        # not fire the page.
+        expr: |
+          sum(rate(CELLS_ngc_proof_ingest_rejected_total[10m]))
+          >
+          1 + sum(rate(CELLS_ngc_proof_ingest_accepted_total[10m]))
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          # Mode B's triage is reason-driven: hmac_mismatch
+          # = secret rotation (operationally most common),
+          # invalid_nonce = clock skew or slow network,
+          # unauthorized = third-party probe. The runbook
+          # table maps every closed-enum reason to a
+          # cause and an action.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/TRUST_INCIDENT.md#32-mode-b--CELLStrustingestrejectrateelevated"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-trust-incident.json"
+          summary: "NGC ingest rejections outpacing acceptances"
+          description: |
+            Break out CELLS_ngc_proof_ingest_rejected_total by reason.
+            "hmac_mismatch" / "invalid_nonce" usually means a secret
+            drifted between node and sidecar; "unauthorized" is a third
+            party probing the endpoint.
+
+  # -----------------------------------------------------------------
+  # Trust / attestation redundancy (direct gauges, Major Update §8.5.4)
+  # -----------------------------------------------------------------
+  # The rules above alert on the underlying counter (proofs flowing at
+  # all). These rules alert on the aggregator-level view: how many
+  # *distinct* attestation sources are currently inside fresh_within,
+  # and how fresh the newest one is. Both are exposed by the
+  # TrustMetricsCollector in pkg/api/trust_metrics.go and are the exact
+  # numbers rendered on the CELLS.tech/trust.html pill.
+  #
+  # Mirror of the external CI side: .github/workflows/trustcheck-external.yml
+  # passes --min-attested 2 to cmd/trustcheck. These rules enforce the
+  # same floor from inside Prometheus, so Alertmanager pages whether
+  # the operator's CI runs fire or not (or when CI is off-hours).
+  #
+  # IMPORTANT: every expression is gated on CELLS_trust_warm == 1. The
+  # aggregator publishes 0 for attested/ratio/last_attested_seconds
+  # during the ~1 Refresh tick of warm-up after a restart, and a naive
+  # "attested < 2" rule would fire on every redeploy. Gating on warm
+  # lets redeploys complete silently and only alerts when a warm
+  # aggregator reports insufficient redundancy.
+  - name: CELLS-trust-redundancy
+    rules:
+      - alert: CELLSTrustAttestationsBelowFloor
+        # One-source operation is legitimate for a single-node bring-up
+        # but once you have stood up N >= 2 sources you want a page the
+        # moment that number drops. 10m of for: gives a sidecar one
+        # full attestation cadence to recover before pinging a human.
+        expr: CELLS_trust_warm == 1 and CELLS_trust_attested < 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          # Mode C is the internal twin of the external
+          # cmd/trustcheck --min-attested 2 CI probe. The
+          # runbook surfaces the LocalDistinctAttestationSource
+          # NodeID-collision case explicitly — two sidecars
+          # with the same CELLS_NGC_PROOF_NODE_ID dedupe to
+          # one source, which can fire this alert even when
+          # both sidecars are healthy and posting.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/TRUST_INCIDENT.md#33-mode-c--CELLStrustattestationsbelowfloor"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-trust-incident.json"
+          summary: "{{ $labels.instance }}: only {{ $value }} fresh attestation source(s)"
+          description: |
+            /api/v1/trust/attestations/summary reports attested={{ $value }}
+            (< 2). The external GitHub-Actions probe (.github/workflows/
+            trustcheck-external.yml with --min-attested 2) will also fail
+            on its next schedule. Common causes:
+              - One of the sidecars (Windows PC / VPS / OCI) is offline
+                or its systemd timer stopped.
+              - CELLS_NGC_PROOF_NODE_ID collision between sidecars
+                (they then collapse to a single attestation in the
+                aggregator — see pkg/api/handlers_trust.go
+                LocalDistinctAttestationSource).
+              - A rotated CELLS_NGC_INGEST_SECRET on one side; cross-
+                reference CELLS_ngc_proof_ingest_rejected_total by reason.
+
+      - alert: CELLSTrustNGCServiceDegraded
+        # Mirrors the string field ngc_service_status on the summary
+        # JSON. 0 here means either "degraded" or "outage". The
+        # aggregator sets this on its own classification of proof
+        # arrival cadence, so it fires before attested hits 0 in a
+        # slow-death scenario.
+        expr: CELLS_trust_warm == 1 and CELLS_trust_ngc_service_healthy == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          # Mode D is the leading-edge alert in the
+          # cascade — the aggregator's ngc_service_status
+          # classifier flips before the gauges underneath
+          # do, so this fires while modes C/E are still
+          # quiet. The runbook treats Mode D as a
+          # pre-warning trigger to identify the upstream
+          # cause (Modes A/B) rather than a thing to
+          # mitigate directly.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/TRUST_INCIDENT.md#34-mode-d--CELLStrustngcservicedegraded"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-trust-incident.json"
+          summary: "{{ $labels.instance }}: NGC service status is not 'healthy'"
+          description: |
+            /api/v1/trust/attestations/summary ngc_service_status is
+            either "degraded" or "outage" for 10+ minutes. The trust
+            pill on CELLS.tech will be amber/red. Check sidecar logs
+            and CELLS_ngc_proof_ingest_rejected_total first.
+
+      - alert: CELLSTrustLastAttestedStale
+        # Belt and braces for the attested<2 rule: even if we have two
+        # sources, if the newest one is >30m old the aggregator will
+        # eventually tip to attested=0 (fresh_within defaults to 15m).
+        # Alert halfway through the degradation window so an operator
+        # can act before the summary flips.
+        #
+        # time() - 0 during warm-up is a huge number, so we gate on
+        # CELLS_trust_last_attested_seconds > 0 as well.
+        expr: |
+          CELLS_trust_warm == 1
+          and CELLS_trust_last_attested_seconds > 0
+          and (time() - CELLS_trust_last_attested_seconds) > 1800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          # Mode E is the belt-and-braces alert: even if
+          # attested >= 2, a sample older than twice
+          # fresh_within means the source is about to age
+          # out. Threshold is calibrated to fire halfway
+          # through the degradation window so an operator
+          # has 30 minutes to act before Mode C fires.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/TRUST_INCIDENT.md#35-mode-e--CELLStrustlastattestedstale"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-trust-incident.json"
+          summary: "{{ $labels.instance }}: newest attestation is >30m old"
+          description: |
+            Newest attestation timestamp is {{ $value | humanizeDuration }}
+            ago (> 30m). fresh_within is 15m by default, so the summary
+            will flip to attested=0 shortly if no new proof arrives.
+            Check sidecar timers and CELLS_NGC_INGEST_SECRET alignment.
+
+      - alert: CELLSTrustAggregatorStale
+        # CELLS_trust_last_checked_seconds is the last Refresh() tick.
+        # If it stops advancing, the aggregator goroutine is wedged
+        # (not the proofs themselves — those are a separate path).
+        # Default refresh_interval is 10s, so >2m with no tick is
+        # unambiguously broken. Warm gate for the same reason as above.
+        expr: |
+          CELLS_trust_warm == 1
+          and CELLS_trust_last_checked_seconds > 0
+          and (time() - CELLS_trust_last_checked_seconds) > 120
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          # Mode F is the only critical-severity alert in
+          # the trust group. The aggregator goroutine is
+          # wedged — Refresh() ticks have stopped, so the
+          # Trust Panel and CELLS.tech badge can stay green
+          # while the pipeline is silently broken (false-
+          # confidence — the worst class of trust failure).
+          # Runbook calls out: capture a goroutine dump
+          # BEFORE restarting (state will be lost on
+          # restart, and the wedge is likely
+          # reproducible).
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/TRUST_INCIDENT.md#36-mode-f--CELLStrustaggregatorstale"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-trust-incident.json"
+          summary: "{{ $labels.instance }}: TrustAggregator Refresh() is stuck"
+          description: |
+            CELLS_trust_last_checked_seconds has not advanced in >2m
+            but refresh_interval is {{ with query "scalar(CELLS_trust_warm)" }}10s{{ end }}
+            by default. The aggregator ticker is wedged (probably a
+            blocked peer provider call or storage read). /api/v1/trust/
+            attestations/summary will go stale from a user perspective
+            regardless of how many proofs are arriving. Restart the
+            CELLS service and capture a goroutine dump.
+
+  # -----------------------------------------------------------------
+  # Quarantine subsystem (direct gauges, mirror of trust pattern)
+  # -----------------------------------------------------------------
+  # Companions to CELLS-submesh above. The CELLS-submesh rules
+  # alert on transaction-level rejection counters ("is the submesh
+  # policy ever kicking in?"). These rules alert on the aggregate
+  # quarantine state ("how many submeshes are currently isolated?") by
+  # consuming the CELLS_quarantine_* gauges emitted by
+  # pkg/quarantine/metrics.go. Together with the trust gauges above,
+  # Alertmanager sees both the attestation denominator and the fraction
+  # of the mesh that is in penalty — the two numbers that most often
+  # move in opposite directions during an incident.
+  #
+  # No warm-gate is needed here: the QuarantineManager is fully live
+  # from process start (no Refresh() equivalent), so zero values at
+  # t=0 are literally correct. The natural-zero denominator case is
+  # handled inside the collector (ratio returns 0 when tracked==0),
+  # so no alert can fire on an empty fleet.
+  - name: CELLS-quarantine
+    rules:
+      - alert: CELLSQuarantineAnySubmesh
+        # A single quarantined submesh for 10+ minutes is worth a
+        # page: auto-recovery (pkg/quarantine/auto_recovery.go) only
+        # activates when wired, and manual RemoveQuarantine is a
+        # decision a human should be making. This is intentionally
+        # chatty in multi-tenant deployments — tune the for: per env.
+        expr: CELLS_quarantine_submeshes > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          # Mode A is the per-submesh quarantine page —
+          # one or more submeshes have quarantined[k]=true
+          # for 10+ min. Runbook walks the closed-enum
+          # reject-reason → cause table. Auto-recovery is
+          # intentionally OFF in production (human review
+          # is the safer default), so the alert clears
+          # when the operator either fixes the upstream
+          # cause or calls RemoveQuarantine after
+          # confirming the policy hit has stopped.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/QUARANTINE_INCIDENT.md#31-mode-a--CELLSquarantineanysubmesh"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-quarantine-incident.json"
+          summary: "{{ $labels.instance }}: {{ $value }} submesh(es) currently quarantined"
+          description: |
+            The QuarantineManager has {{ $value }} submeshes with
+            quarantined[k]=true for 10+ minutes. Inspect
+            CELLS_submesh_p2p_reject_* counters and validator logs
+            for the offending submesh key. Resolve by fixing the
+            invalid-tx source, or call QuarantineManager.RemoveQuarantine
+            after confirming the underlying cause is cleared.
+
+      - alert: CELLSQuarantineMajorityIsolated
+        # Ratio-based escalation: if more than half of observed
+        # submeshes are quarantined, this is no longer a local policy
+        # hit but a systemic event (bad software rollout, rotated key,
+        # clock skew). The tracked>=4 guard stops flap on tiny fleets
+        # where one bad submesh out of two already crosses 0.5.
+        expr: |
+          CELLS_quarantine_submeshes_tracked >= 4
+          and CELLS_quarantine_submeshes_ratio > 0.5
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          # Mode B is critical-severity because >50% of
+          # tracked submeshes simultaneously quarantined
+          # is, by construction, NOT a per-submesh
+          # problem — single-rig issues affect one submesh
+          # at a time. The runbook's §3.2 decision tree
+          # walks the "what changed in the last hour"
+          # check (binary release / config push / NTP
+          # event / key rotation) before any
+          # RemoveQuarantine call, because a bulk-clear
+          # without root cause re-fires within 15 min
+          # and loses the diagnostic state of which
+          # submeshes triggered when.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/QUARANTINE_INCIDENT.md#32-mode-b--CELLSquarantinemajorityisolated"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-quarantine-incident.json"
+          summary: "{{ $labels.instance }}: majority of tracked submeshes quarantined ({{ $value | humanizePercentage }})"
+          description: |
+            {{ $value | humanizePercentage }} of the submeshes this
+            node has observed are currently quarantined. This is
+            almost never a per-submesh problem — suspect a bad
+            rollout, a policy-threshold misconfiguration, or a
+            validator-side bug mis-classifying valid transactions.
+            Cross-check CELLS_quarantine_threshold against the
+            rollout plan before unwinding quarantines.
+
+  # -----------------------------------------------------------------
+  # v2 mining — slashing
+  # -----------------------------------------------------------------
+  # Consumes the CELLS_slash_* counters emitted by
+  # pkg/monitoring/slashing_metrics.go (recorder pattern, recorded
+  # from pkg/chain/slash_apply.go). Together with the enrollment
+  # group below, these are the primary economic-safety pages for
+  # the v2 NVIDIA-locked mining protocol.
+  #
+  # Threshold rationale: a healthy fleet emits a handful of slashes
+  # per day at most — verifier disagreement rate floor + double-mine
+  # accidents combined. Anything above that signals coordinated
+  # cheating (which we WANT to slash, but operators want a heads-up)
+  # OR a verifier regression (false-positive slashes in CI of a new
+  # release). Either way the operator wants to know.
+  #
+  # All thresholds are a starting point — tune per-fleet after one
+  # week of baseline. The annotations name the underlying labelled
+  # series so the runbook query is one click away from the page.
+  - name: CELLS-v2-mining-slashing
+    rules:
+      - alert: CELLSMiningSlashApplied
+        # ANY successful slash is page-worthy until you have grown
+        # comfortable with the noise floor. Tune for: longer once
+        # baseline rate is known. Counter is monotonic — increase()
+        # gives the count over the lookback regardless of restarts.
+        expr: sum(increase(CELLS_slash_applied_total[15m])) >= 1
+        for: 1m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Mode A in SLASHING_INCIDENT.md — confirm + ratify
+          # path. Almost always benign (chain caught a cheater),
+          # but the runbook walks the receipt verification so
+          # the on-call doesn't reflexively page protocol-eng
+          # for a single legitimate slash.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SLASHING_INCIDENT.md#31-mode-a--CELLSminingslashapplied"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-slashing-incident.json"
+          summary: "{{ $labels.instance }}: slash transaction applied"
+          description: |
+            At least one CELLS_slash_applied_total has incremented
+            in the last 15m. Break out by kind:
+              sum by (kind) (increase(CELLS_slash_applied_total[15m]))
+            Cross-reference the transaction id via:
+              GET /api/v1/mining/slash/{tx_id}
+            (the CELLS CLI: `CELLScli slash-receipt <tx-id>`).
+            Confirm the offender's NodeID, EvidenceKind, and that
+            auto_revoked behaved as expected. If kind="forged-attestation"
+            in volume, suspect a CC-AIK verifier regression in the
+            release first (false positives) before assuming widespread
+            cheating.
+
+      - alert: CELLSMiningSlashedDustBurst
+        # Mass-slash event in CELL terms. 1 CELL = 1_000_000_000 dust.
+        # Threshold is 50 CELL drained in 15m — below
+        # MIN_ENROLL_STAKE * 5 — i.e. five rigs going down. Tune for
+        # your fleet size: a 1000-rig testnet might want 500 CELL,
+        # a single-validator devnet wants 10 CELL.
+        expr: sum(increase(CELLS_slash_drained_dust_total[15m])) > 5e10
+        for: 5m
+        labels:
+          severity: critical
+          subsystem: v2-mining
+        annotations:
+          # Mode B — the dangerous one. Could be a real cheat
+          # ring (ratify) OR a verifier regression (rollback).
+          # Runbook §3.2 walks the distinguishing query AND
+          # the verifier-rollback procedure. Wrong call here
+          # loses real money for honest miners; do not skip it.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SLASHING_INCIDENT.md#32-mode-b--CELLSminingslasheddustburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-slashing-incident.json"
+          summary: "{{ $labels.instance }}: >50 CELL slashed in 15m"
+          description: |
+            CELLS_slash_drained_dust_total has increased by
+            {{ humanize $value }} dust in 15m (>50 CELL). Multiple
+            rigs being slashed at once is almost never coincidental —
+            suspect either a coordinated cheat ring (great, ratify
+            and continue) OR a verifier regression that just shipped
+            in the latest release (bad, roll back).
+
+            Triage:
+              - Group by EvidenceKind:
+                  sum by (kind) (increase(CELLS_slash_drained_dust_total[15m]))
+                A single dominant kind = single-source bug.
+              - Compare against pre-release baseline:
+                  sum(rate(CELLS_slash_drained_dust_total[1d] offset 1d))
+              - Spot-check a recent slash receipt:
+                  CELLScli slash-receipt <tx-id>
+                If outcome=applied but the operator was clean, halt
+                rollout and roll back the verifier release.
+
+      - alert: CELLSMiningSlashRejectionsBurst
+        # Rejected slashes outpacing applied slashes signals one of:
+        #   - probe / DoS attack against the slashing endpoint
+        #   - slasher tooling emitting malformed evidence
+        #   - replay flood ("evidence_replayed" reason)
+        #   - mass attempts to slash unenrolled NodeIDs
+        # Break out by reason in the runbook query — the reason
+        # label is the quickest diagnostic.
+        expr: sum(increase(CELLS_slash_rejected_total[10m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Mode C — usually benign in isolation but a leading
+          # indicator of an attacker probing the admission gate
+          # before the real slash burst. Runbook §3.3 has the
+          # per-reason triage table.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SLASHING_INCIDENT.md#33-mode-c--CELLSminingslashrejectionsburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-slashing-incident.json"
+          summary: "{{ $labels.instance }}: ≥10 slash transactions rejected in 10m"
+          description: |
+            CELLS_slash_rejected_total grew by {{ $value }} in 10m.
+            Break out by reason:
+              sum by (reason) (increase(CELLS_slash_rejected_total[10m]))
+            Common reasons and what they mean:
+              evidence_replayed   — replay protection working;
+                                    likely a buggy slasher retrying.
+              verifier_failed     — evidence didn't pass the
+                                    EvidenceVerifier; either malformed
+                                    or a probe.
+              node_not_enrolled   — slash submitted against an
+                                    unknown NodeID; client bug or
+                                    spam.
+              insufficient_stake  — slash amount exceeded available
+                                    bond; clamp client-side.
+            Sustained "verifier_failed" with no applied slashes
+            suggests an outsider probing the endpoint — fine, but
+            consider rate-limiting upstream of admission.
+
+      - alert: CELLSMiningAutoRevokeBurst
+        # Surge of auto-revokes = many miners pushed under
+        # MIN_ENROLL_STAKE in a short window. Either coordinated
+        # stake-stripping attack OR a software bug that pushed
+        # everyone below the line. Either is severe.
+        expr: sum(increase(CELLS_slash_auto_revoked_total[15m])) >= 3
+        for: 5m
+        labels:
+          severity: critical
+          subsystem: v2-mining
+        annotations:
+          # Mode D — almost always escalates Mode B but worth
+          # paging on its own because it shows the slasher is
+          # pushing miners off the active set, not just
+          # debiting bonds. Runbook §3.4 covers the slash-
+          # arithmetic-bug and stake-stripping-attack
+          # branches that AREN'T just B in disguise.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SLASHING_INCIDENT.md#34-mode-d--CELLSminingautorevokeburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-slashing-incident.json"
+          summary: "{{ $labels.instance }}: ≥3 records auto-revoked by SlashApplier in 15m"
+          description: |
+            SlashApplier.RevokeIfUnderBonded fired for {{ $value }}
+            records in 15m. Each fire means the slashed miner's
+            remaining bond fell below mining.MinEnrollStakeDust
+            (10 CELL). Three+ in 15m is unusual — investigate
+            whether the slash amounts were correctly clamped to
+            individual rig stake or whether the ApplySlashTx path
+            is double-debiting.
+
+  # -----------------------------------------------------------------
+  # v2 mining — enrollment registry
+  # -----------------------------------------------------------------
+  # Consumes CELLS_enrollment_* gauges + counters emitted by
+  # pkg/monitoring/enrollment_metrics.go (callback-driven for the
+  # gauges, recorder for the counters). The gauges are the chain's
+  # economic-safety thermometer: active miners, bonded dust, pending
+  # unbond pressure.
+  - name: CELLS-v2-mining-enrollment
+    rules:
+      - alert: CELLSMiningRegistryEmpty
+        # Active enrollment count == 0 on a node that has been up
+        # long enough to have processed enrollments. Gated on
+        # CELLS_uptime_seconds > 600 so testnet bring-ups don't page
+        # while the first miner is still flashing their HMAC key.
+        # On a v1-only node this gauge is also 0 — but v1-only
+        # nodes don't load this rule group; deployments running
+        # only v1 should drop the CELLS-v2-mining-* groups.
+        expr: |
+          CELLS_enrollment_active_count == 0
+          and CELLS_process_uptime_seconds > 600
+        for: 15m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Deep-link to the Mode A subsection of the
+          # enrollment runbook. Mode A is the canonical "zero
+          # active records" page; if the registry is wedged
+          # rather than empty, the runbook redirects the
+          # operator to the chain-liveness runbook in step
+          # 3.1.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ENROLLMENT_INCIDENT.md#31-mode-a--CELLSminingregistryempty"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-enrollment-incident.json"
+          summary: "{{ $labels.instance }}: zero active enrollments for 15m"
+          description: |
+            CELLS_enrollment_active_count is 0 on a node that has
+            been up >10m. Either:
+              - All miners legitimately unenrolled (check
+                CELLS_unenrollment_applied_total rate over the last
+                hour).
+              - The mempool admission gate is rejecting every
+                enrollment (check CELLS_enrollment_rejected_total
+                by reason).
+              - The block producer stopped sealing — cross-check
+                with CELLSMiningChainStuck below.
+            Production v2 mainnet should never sit at active=0;
+            on testnet this may be acceptable during quiet periods.
+
+      - alert: CELLSMiningRegistryShrinkingFast
+        # Active count fell by >25% in 1h on a node that started
+        # with at least 4 active records (avoid flap on tiny
+        # fleets where one unenroll crosses 25%). Coordinated
+        # exit signals operator unrest, a chain incident, or a
+        # release regression that broke the miner binaries.
+        expr: |
+          (
+            (CELLS_enrollment_active_count offset 1h) - CELLS_enrollment_active_count
+          ) / (CELLS_enrollment_active_count offset 1h) > 0.25
+          and (CELLS_enrollment_active_count offset 1h) >= 4
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Mode B (shrinking-fast) decomposes the drop into
+          # voluntary / forced / sweep drivers. The runbook's
+          # Mode B redirects to SLASHING_INCIDENT.md if the
+          # forced-exit driver dominates — a coordinated
+          # cheat-ring incident is a different on-call than a
+          # voluntary release-regression exit.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ENROLLMENT_INCIDENT.md#32-mode-b--CELLSminingregistryshrinkingfast"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-enrollment-incident.json"
+          summary: "{{ $labels.instance }}: active enrollments fell {{ $value | humanizePercentage }} in 1h"
+          description: |
+            CELLS_enrollment_active_count dropped by {{ $value | humanizePercentage }}
+            in 1h (relative to the 1h-prior reading). Cross-correlate with:
+              - rate(CELLS_unenrollment_applied_total[1h])  — voluntary exits
+              - rate(CELLS_slash_applied_total[1h])         — forced exits
+              - rate(CELLS_enrollment_unbond_swept_total[1h]) — final-stage sweeps
+            If voluntary exits dominate, suspect either a release
+            regression (miners hitting a v2-incompatible build) or
+            an external incident (e.g. NVIDIA driver rollout). If
+            slash-driven, switch to the slashing-group runbook.
+
+      - alert: CELLSMiningPendingUnbondMajority
+        # More than half the bonded population is in pending_unbond.
+        # That's a coordinated-exit signal — single-rig issues
+        # never flip the ratio. The denominator guard keeps the
+        # ratio sane on tiny fleets.
+        expr: |
+          (
+            CELLS_enrollment_pending_unbond_count
+            /
+            (CELLS_enrollment_active_count + CELLS_enrollment_pending_unbond_count)
+          ) > 0.5
+          and (CELLS_enrollment_active_count + CELLS_enrollment_pending_unbond_count) >= 4
+        for: 30m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Mode C is the leading-indicator runbook entry —
+          # >50% of the population in pending_unbond means
+          # something upstream is going wrong. The runbook
+          # cross-references the slashing-rate and
+          # consensus-byzantine signals so operators can
+          # identify the upstream cause before the 7-day
+          # unbond window matures.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ENROLLMENT_INCIDENT.md#33-mode-c--CELLSminingpendingunbondmajority"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-enrollment-incident.json"
+          summary: "{{ $labels.instance }}: {{ $value | humanizePercentage }} of bonded miners pending unbond"
+          description: |
+            More than half of the bonded population is in the 7-day
+            unbond window. Compare:
+              CELLS_enrollment_pending_unbond_count
+              CELLS_enrollment_active_count
+              CELLS_enrollment_pending_unbond_dust  (CELL locked)
+              CELLS_enrollment_bonded_dust          (CELL active)
+            Coordinated exit usually precedes a fork-vote, a
+            client-software regression, or a known driver rollout
+            incompatibility. Investigate before the 7-day sweep
+            window closes — once balances credit back, recovery
+            requires re-enrollment with fresh bond.
+
+      - alert: CELLSMiningEnrollmentRejectionsBurst
+        # Rejected enrollments climbing fast = either a misconfigured
+        # client, a probe, or admission-gate regression.
+        expr: sum(increase(CELLS_enrollment_rejected_total[10m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Mode D maps every closed-enum reject reason to a
+          # cause + action row. Operators read the dominant
+          # `reason` label off the by-reason breakout query
+          # in the description and jump straight to the row
+          # in the runbook table.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ENROLLMENT_INCIDENT.md#34-mode-d--CELLSminingenrollmentrejectionsburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-enrollment-incident.json"
+          summary: "{{ $labels.instance }}: ≥20 enrollment rejections in 10m"
+          description: |
+            CELLS_enrollment_rejected_total grew by {{ $value }} in
+            10m. Break out by reason:
+              sum by (reason) (increase(CELLS_enrollment_rejected_total[10m]))
+            Common reasons:
+              insufficient_stake — client offered <10 CELL bond.
+              gpu_uuid_collision — two NodeIDs claimed the same GPU.
+              malformed_payload  — old client / canonicaljson drift.
+              duplicate_node_id  — re-enroll without unbond first.
+            Sustained "malformed_payload" after a release suggests
+            client-server skew — pin client minimum version in the
+            quickstart docs.
+
+      - alert: CELLSMiningBondedDustDropped
+        # Sudden drop in bonded dust = mass unbond OR mass slash.
+        # Threshold of 50 CELL — same calibration as the slash-burst
+        # rule so the two pages align in time-series view.
+        expr: |
+          (CELLS_enrollment_bonded_dust offset 30m) - CELLS_enrollment_bonded_dust > 5e10
+          and (CELLS_enrollment_bonded_dust offset 30m) > 0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Mode E covers the metric-callback regression
+          # branch explicitly: if the drop isn't accounted
+          # for by unenroll / slash / sweep rates, the
+          # runbook walks the operator through verifying the
+          # gauge against the live registry via
+          # /api/v1/mining/enrollments. Catches stale
+          # EnrollmentStateProvider closures that survive a
+          # partial restart.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ENROLLMENT_INCIDENT.md#35-mode-e--CELLSminingbondeddustdropped"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-enrollment-incident.json"
+          summary: "{{ $labels.instance }}: bonded stake dropped >50 CELL in 30m"
+          description: |
+            Total active bond fell by {{ humanize $value }} dust
+            (>50 CELL) in 30m. Decompose:
+              - Voluntary: rate(CELLS_unenrollment_applied_total[30m])
+              - Forced:    rate(CELLS_slash_drained_dust_total[30m])
+              - Sweep:     rate(CELLS_enrollment_unbond_swept_total[30m])
+            If neither driver explains the magnitude, suspect a
+            metric callback regression (the gauge is read live from
+            EnrollmentStateProvider — a stale provider will read
+            stale numbers).
+
+  # -----------------------------------------------------------------
+  # v2 mining — chain liveness sanity
+  # -----------------------------------------------------------------
+  # Belt-and-braces companion to the v2-mining groups above.
+  # CELLS_chain_height stuck while CELLS_mempool_size grows is the
+  # operator-observable shape of "validator wedged" — most v2
+  # mining alerts will silently come along for the ride if this
+  # one fires, so we keep it terse.
+  - name: CELLS-v2-mining-liveness
+    rules:
+      - alert: CELLSMiningChainStuck
+        # Height has not advanced in 5m AND uptime allows. Gauge
+        # is monotonic on a healthy node — delta == 0 over 5m on a
+        # production block-time of seconds is unambiguous.
+        expr: |
+          delta(CELLS_chain_height[5m]) == 0
+          and CELLS_process_uptime_seconds > 300
+        for: 3m
+        labels:
+          severity: critical
+          subsystem: v2-mining
+        annotations:
+          # Mode A is the only critical-severity v2-mining
+          # alert in this file. The runbook spends most of
+          # its triage on the "all transactions failed
+          # state application" silent-freeze path because
+          # that's the operationally most-frequent cause —
+          # admission stays open while the producer
+          # silently refuses to seal, and every downstream
+          # mining alert flatlines as collateral signal
+          # rather than firing.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/MINING_LIVENESS.md#31-mode-a--CELLSminingchainstuck"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-mining-liveness.json"
+          summary: "{{ $labels.instance }}: CELLS_chain_height has not advanced in 5m"
+          description: |
+            Block production has stalled. v2 mining alerts above
+            (slash, enrollment) will go quiet because the applier
+            is the consumer of these counters. Triage in this
+            order:
+              1. CELLS_mempool_size — growing? validator stuck on
+                 admission. Empty? validator never built a block.
+              2. CELLS_validators_active — quorum?
+              3. Process logs for "ProduceBlock" errors — the
+                 "all transactions failed" path silently freezes
+                 the producer when no tx applies.
+
+      - alert: CELLSMiningMempoolBacklog
+        # Mempool > 10k pending txs for 10m = admission gate is
+        # accepting faster than the producer can drain. On a
+        # stack-default config this means the slash/enroll
+        # AdmissionCheckers are letting payloads through that
+        # the consensus-time applier will reject — costing block
+        # space.
+        expr: CELLS_mempool_size > 10000
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-mining
+        annotations:
+          # Mode B has a strict promotion path to Mode A:
+          # if chain_height stops advancing while the
+          # backlog is firing, the runbook redirects the
+          # operator to abandon backlog triage and treat
+          # the incident as a freeze. The decision tree on
+          # the dominant reject-by-reason label
+          # (not_enrolled / wrong_contract / decode_failed
+          # vs. insufficient_balance / fee_invalid) lives in
+          # the runbook table.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/MINING_LIVENESS.md#32-mode-b--CELLSminingmempoolbacklog"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-mining-liveness.json"
+          summary: "{{ $labels.instance }}: mempool >10k pending for 10m"
+          description: |
+            CELLS_mempool_size is {{ $value }}. Either traffic spiked
+            past producer throughput, or the admission gate is
+            letting through txs that ApplySlashTx / ApplyEnrollTx
+            reject at apply time (admission stateless, applier
+            stateful — a known divergence vector).
+            Cross-check CELLS_slash_rejected_total and
+            CELLS_enrollment_rejected_total; high rejection rate
+            means admission is not catching what apply does.
+
+  # -----------------------------------------------------------------
+  # v2 attestation — arch-spoof rejection (§4.6.1 / §4.6.2 / §4.6.5)
+  # -----------------------------------------------------------------
+  # Consumes CELLS_attest_archspoof_rejected_total{reason} emitted
+  # by pkg/monitoring/archcheck_metrics.go (recorder pattern,
+  # recorded from pkg/mining/verifier.go and the per-type
+  # attestation verifiers). Pages on:
+  #
+  #   reason="unknown_arch":
+  #     Attestation.GPUArch outside the closed-enum allowlist.
+  #     Single increment is usually a typo'd client; sustained
+  #     rate is a probe / future-arch-sneak attempt.
+  #
+  #   reason="gpu_name_mismatch":
+  #     HMAC bundle's gpu_name does not match any pattern for the
+  #     claimed arch (the §3.3 step-8 lazy-spoof catch). The bundle
+  #     is HMAC-bound under the operator's enrollment key, so this
+  #     reason firing means an enrolled operator is spoofing arch
+  #     (consumer card claiming Hopper) — economically deterred by
+  #     stake bond + slashing, but operators want a heads-up.
+  #
+  #   reason="cc_subject_mismatch":
+  #     CC bundle's leaf cert Subject contains positive product
+  #     evidence that contradicts the claimed arch (§4.6.5). To
+  #     reach this reason the proof has ALREADY passed cert-chain
+  #     pin (§3.2 step 3) + AIK signature (§3.2 step 4), so a
+  #     non-zero increment is highly suspicious — fabricated AIK
+  #     or serious operator misconfiguration. Pages at higher
+  #     severity than the other two reasons.
+  - name: CELLS-v2-attest-archspoof
+    rules:
+      - alert: CELLSAttestArchSpoofUnknownArchBurst
+        # Sustained rate of unknown-arch rejections = probe / scan.
+        # Threshold 0.1/s = ≥30 rejections in 5m. A typo'd client
+        # gets one increment and stops; a probe drives the rate up.
+        expr: rate(CELLS_attest_archspoof_rejected_total{reason="unknown_arch"}[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-attest
+        annotations:
+          # Mode A is the typo / probe / release-skew
+          # signal — the gpu_arch field is outside the
+          # closed-enum allowlist. The runbook's §3.1
+          # source-distribution table maps {single
+          # NodeID, broad NodeIDs, release-correlated}
+          # to {operator-side fix, firewall block, alias
+          # PR}. Mode A almost never escalates to
+          # slashing because the offending field is
+          # simply not in the enum — there's no
+          # economic gain to harvest.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ARCH_SPOOF_INCIDENT.md#31-mode-a--CELLSattestarchspoofunknownarchburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-arch-spoof-incident.json"
+          summary: "{{ $labels.instance }}: sustained unknown-arch rejections"
+          description: |
+            CELLS_attest_archspoof_rejected_total{reason="unknown_arch"}
+            climbing at {{ $value }}/s over 5m. Either:
+              - A miner client running an unreleased GPU arch
+                (e.g. "rubin", a hypothetical post-Blackwell)
+                is auto-retrying. Tighten quickstart docs.
+              - External prober scanning the v2 attestation
+                surface. Confirm via source IP distribution in
+                ingress logs; consider rate-limiting upstream.
+              - Client/server skew on alias canonicalisation
+                (e.g. miner emits "ada" but server hasn't
+                landed alias yet). Cross-check release versions.
+
+      - alert: CELLSAttestArchSpoofGPUNameMismatch
+        # Any sustained gpu_name_mismatch is a real spoof attempt
+        # by an enrolled operator — page warning. Threshold lower
+        # than unknown_arch because the operator-side cost (stake
+        # bond at risk) means honest operators rarely trigger this
+        # by accident.
+        expr: rate(CELLS_attest_archspoof_rejected_total{reason="gpu_name_mismatch"}[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-attest
+        annotations:
+          # Mode B is the canonical economic-cheat
+          # signal — an enrolled operator's HMAC bundle
+          # has gpu_name contradicting the claimed
+          # gpu_arch (consumer Ada claiming Hopper, etc).
+          # The HMAC binds gpu_name to the bundle, so
+          # this isn't a client bug — it's a deliberate
+          # or config-drift attempt to claim a higher
+          # reward weight. Sustained Mode B from one
+          # NodeID IS the canonical forged-attestation
+          # slashing case; the runbook's §3.2 hands
+          # off to SLASHING_INCIDENT.md for evidence
+          # submission. Threshold 0.05/s lower than
+          # Mode A because the economic cost (stake
+          # bond at risk) means honest operators rarely
+          # trigger this by accident.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ARCH_SPOOF_INCIDENT.md#32-mode-b--CELLSattestarchspoofgpunamemismatch"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-arch-spoof-incident.json"
+          summary: "{{ $labels.instance }}: HMAC bundle gpu_name vs gpu_arch mismatch"
+          description: |
+            CELLS_attest_archspoof_rejected_total{reason="gpu_name_mismatch"}
+            climbing at {{ $value }}/s. An enrolled miner is
+            submitting proofs whose HMAC-bound gpu_name doesn't
+            match the patterns for the claimed gpu_arch. Most
+            common shapes:
+              - Consumer Ada card (RTX 4090) claiming gpu_arch=hopper
+                to chase higher reward weights.
+              - Hardware swap on an existing NodeID without
+                re-enrollment (bundle still HMAC-signed under
+                the old GPU's identity).
+            The §3.3 step-8 cross-check rejects these proofs
+            before block inclusion; the operator's stake bond
+            covers any cumulative damage. To identify the
+            offender, cross-reference CELLScli enrollment-status
+            against recent slash candidates. Sustained activity
+            from a single NodeID is a slashing case under §8.
+
+      - alert: CELLSAttestArchSpoofCCSubjectMismatch
+        # CC-path subject mismatch is critical: to even reach this
+        # check the proof has passed cert-chain pin AND AIK
+        # signature, so a non-zero increment is ALREADY a
+        # cryptographic anomaly. ANY single fire pages immediately.
+        expr: increase(CELLS_attest_archspoof_rejected_total{reason="cc_subject_mismatch"}[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          subsystem: v2-attest
+        annotations:
+          # Mode C is the only critical-severity alert
+          # in the arch-spoof group, and the only §4.6
+          # alert that pages on a SINGLE fire (no rate
+          # threshold). To reach this check the proof
+          # has already passed cert-chain pin (§3.2
+          # step 3) AND AIK signature (§3.2 step 4) —
+          # so a non-zero increment is, by construction,
+          # either a fabricated AIK leaf (cryptographic
+          # anomaly worth a security-team page) OR a
+          # real H100-class hardware operating with a
+          # stale gpu_arch config (operator
+          # misconfiguration, also serious). The
+          # runbook's §3.3 decision tree forks on
+          # whether the offending Subject CN is
+          # consistent with NVIDIA canonical naming —
+          # and explicitly tells the operator to NOT
+          # unilaterally slash on the cryptographic-
+          # anomaly branch (slashing destroys forensic
+          # state and the bundle may need to be
+          # preserved untouched as evidence).
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/ARCH_SPOOF_INCIDENT.md#33-mode-c--CELLSattestarchspoofccsubjectmismatch"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-arch-spoof-incident.json"
+          summary: "{{ $labels.instance }}: CC leaf cert subject contradicts gpu_arch"
+          description: |
+            CELLS_attest_archspoof_rejected_total{reason="cc_subject_mismatch"}
+            incremented in the last 15m. To reach this check the
+            CC bundle has ALREADY passed:
+              - Cert chain rooted in a genesis-pinned NVIDIA CA
+                (§3.2 step 3)
+              - AIK ECDSA signature over the canonical preimage
+                (§3.2 step 4)
+              - PCR firmware/driver floor (§3.2 step 8)
+            yet the leaf cert's Subject.CommonName contains
+            positive product evidence (e.g. "NVIDIA H100") that
+            contradicts the proof's claimed gpu_arch. Two
+            possibilities:
+              1. Fabricated AIK leaf — an operator with an
+                 NVIDIA-issued cert has crafted a leaf with a
+                 mismatched arch claim. This is a cryptographic
+                 anomaly worth a security-team page.
+              2. Operator misconfiguration — the miner binary is
+                 reading gpu_arch from a stale config file after
+                 a hardware swap. Less severe but still worth
+                 a direct contact with the operator.
+            Triage: identify the proof via the validator's reject
+            log (the rejection wraps archcheck.ErrArchCertSubjectMismatch
+            and embeds the offending Subject CN + claimed arch
+            in the error message), then check the operator's
+            recent enrollment / slash history.
+
+  # -----------------------------------------------------------------
+  # v2 attestation — hashrate-band plausibility (§4.6.3)
+  # -----------------------------------------------------------------
+  # Consumes CELLS_attest_hashrate_rejected_total{arch} emitted by
+  # pkg/monitoring/archcheck_metrics.go. Each per-arch series gets
+  # its own alert with arch-aware annotations so the on-call
+  # knows which product line is being targeted (T4 hashrate
+  # spoofs and B200 hashrate spoofs have different remediation:
+  # different MIN_FIRMWARE floors, different operator profiles).
+  #
+  # Threshold 0.05/s ≈ 15 rejections in 5m, lower than the
+  # archspoof unknown-arch rule because hashrate fabrication is
+  # economic-cheating-flavoured rather than typo-flavoured.
+  - name: CELLS-v2-attest-hashrate
+    rules:
+      - alert: CELLSAttestHashrateOutOfBand
+        # Catch-all rule that fires on ANY arch label. The
+        # description below uses {{ $labels.arch }} so a single
+        # rule covers all five canonical arches without manual
+        # duplication. arch="unknown" lands in the default switch
+        # branch in pkg/monitoring/archcheck_metrics.go and is
+        # rare enough that no separate rule is needed.
+        expr: rate(CELLS_attest_hashrate_rejected_total[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-attest
+        annotations:
+          # Mode C in OPERATOR_HYGIENE_INCIDENT.md —
+          # per-arch hashrate band rejection.
+          # Threshold 0.05/s ≈ 15 rejections in 5m,
+          # lower than archspoof unknown_arch because
+          # hashrate fabrication is economic-cheating-
+          # flavoured rather than typo-flavoured. The
+          # runbook §3.3 maps {value off by orders of
+          # magnitude, value just-above-Max,
+          # multi-miner one-arch-dominant,
+          # arch="unknown" dominant} to {units typo,
+          # leaderboard-stuffing, release regression
+          # / new SKU bump, ARCH_SPOOF Mode A}. The
+          # hashrate band check is upstream of the
+          # per-type verifier; if the hashrate fails,
+          # the per-type verifier never runs — so this
+          # alert often co-fires with rejection-flood
+          # signals and may flow into a slashing case
+          # for sustained single-NodeID activity.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/OPERATOR_HYGIENE_INCIDENT.md#33-mode-c--CELLSattesthashrateoutofband"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-operator-hygiene-incident.json"
+          summary: "{{ $labels.instance }}: claimed hashrate out of band for arch={{ $labels.arch }}"
+          description: |
+            CELLS_attest_hashrate_rejected_total{arch="{{ $labels.arch }}"}
+            climbing at {{ $value }}/s over 5m. Miners are
+            submitting Attestation.ClaimedHashrateHPS values
+            outside the per-arch [Min, Max] band (§4.6.3 in
+            MINING_PROTOCOL_V2.md). Bands are deliberately wide
+            (~100x range per arch); an out-of-band value is
+            either:
+              - A units-confusion typo (miner emitting H/min or
+                kH/s as raw H/s — quickstart docs may need
+                clarification).
+              - A leaderboard-stuffing attempt (miner inflating
+                claimed hashrate to top the leaderboard without
+                actually mining at that rate).
+              - A consensus-relevant signal: the rest of the
+                attestation is suspect, since the per-type
+                verifier ALSO rejected (this counter only fires
+                AFTER the hashrate gate trips).
+            Reference bands (see §4.6.3 table):
+              turing       [10K,    5M]   H/s
+              ampere       [50K,   50M]   H/s
+              ada-lovelace [100K,  50M]   H/s
+              hopper       [1M,   200M]   H/s
+              blackwell    [5M,   500M]   H/s
+
+  # -----------------------------------------------------------------
+  # v2 governance — authority rotation activity (§4.6 governance)
+  # -----------------------------------------------------------------
+  # Consumes CELLS_gov_authority_* counters + the
+  # CELLS_gov_authority_count gauge emitted by
+  # pkg/monitoring/gov_metrics.go. These pages are intentionally
+  # low-severity — multisig rotation is a deliberate, rare event
+  # that the authority members coordinate out-of-band; the alerts
+  # ensure the OTHER members know a vote happened in case the
+  # coordinator forgets to ping them.
+  - name: CELLS-v2-governance
+    rules:
+      - alert: CELLSGovAuthorityVoteRecorded
+        # Any vote in the last 24h is an "FYI" to the multisig
+        # set. Severity info — Alertmanager should route to a
+        # passive channel (chat ping) rather than PagerDuty.
+        expr: increase(CELLS_gov_authority_voted_total[24h]) > 0
+        for: 5m
+        labels:
+          severity: info
+          subsystem: v2-governance
+        annotations:
+          # Mode A in GOVERNANCE_AUTHORITY_INCIDENT.md —
+          # operator coordination glue. The alert exists
+          # so every multisig member sees that a vote
+          # happened in case the coordinator forgets the
+          # secure-channel ping. The runbook's §3.1
+          # observation table maps {expected coordinator
+          # schedule, unexpected vote, sustained
+          # duplicate-vote rejects, vote-validation
+          # rejects, mass-rotation event} to one of
+          # {acknowledge, secure-channel veto check,
+          # script-bug audit, voter-membership audit,
+          # planned mass rotation}. The alert is
+          # informational — if it pages someone out of
+          # bed, the Alertmanager routing config is
+          # wrong.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/GOVERNANCE_AUTHORITY_INCIDENT.md#31-mode-a--CELLSgovauthorityvoterecorded"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-governance-authority-incident.json"
+          summary: "{{ $labels.instance }}: authority rotation vote recorded ({{ $labels.op }})"
+          description: |
+            CELLS_gov_authority_voted_total{op="{{ $labels.op }}"}
+            incremented {{ $value }} time(s) in the last 24h.
+            A multisig member submitted a vote to {{ $labels.op }}
+            an authority. Pre-activation: the AuthorityVoteStore
+            is accumulating ballots toward the M-of-N threshold
+            (max(1, N/2 + 1)). Cross-reference CELLScli watch
+            params or the governance read API to see proposal
+            details and current vote tally.
+
+      - alert: CELLSGovAuthorityThresholdCrossed
+        # Threshold-cross is more interesting than a single vote:
+        # the proposal is now staged for activation at its
+        # effective_height. Bumps to warning severity so the
+        # multisig set gets a louder ping.
+        expr: increase(CELLS_gov_authority_crossed_total[24h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          subsystem: v2-governance
+        annotations:
+          # Mode B in GOVERNANCE_AUTHORITY_INCIDENT.md —
+          # the proposal has crossed M-of-N and is
+          # staged for activation at effective_height.
+          # The window between Crossed and
+          # effective_height is the LAST opportunity to
+          # coordinate out-of-band; no on-chain
+          # cancellation primitive exists. The runbook's
+          # §3.2 pre-activation checklist walks
+          # {confirm-intent, validate-address (canonical
+          # social-engineering attack on op=add),
+          # validate-effective-height, op=remove
+          # post-count-check}. The veto path is
+          # explicitly racing a counter-rotation —
+          # there is no "cancel proposal" tx.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/GOVERNANCE_AUTHORITY_INCIDENT.md#32-mode-b--CELLSgovauthoritythresholdcrossed"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-governance-authority-incident.json"
+          summary: "{{ $labels.instance }}: authority rotation crossed M-of-N threshold ({{ $labels.op }})"
+          description: |
+            CELLS_gov_authority_crossed_total{op="{{ $labels.op }}"}
+            crossed the M-of-N threshold and is now STAGED for
+            activation at its effective_height. Confirm:
+              - The other multisig members are aware (this alert
+                fires INSTEAD of the per-member ping if they
+                missed the vote).
+              - The effective_height is the agreed value (a
+                rotation that activates too soon could leave
+                the chain mid-flight on an unwanted authority
+                set).
+              - CELLS_gov_authority_count gauge will tick on
+                activation; cross-check against the genesis
+                authority set.
+
+      - alert: CELLSGovAuthorityCountTooLow
+        # Hard floor: an authority set of <2 means a single key
+        # compromise is a chain-rotation compromise. M-of-N with
+        # N=1 reduces to single-signer governance. Page critical.
+        # The gauge is seeded at boot from genesis (see
+        # SetAuthorityCountGauge in v2wiring), so a value of 0
+        # means either the genesis was misconfigured or the
+        # adapter wiring broke.
+        expr: CELLS_gov_authority_count < 2
+        for: 5m
+        labels:
+          severity: critical
+          subsystem: v2-governance
+        annotations:
+          # Mode C in GOVERNANCE_AUTHORITY_INCIDENT.md —
+          # the only critical-severity alert in the
+          # governance group, and the only governance
+          # alert that fires on a gauge-state rather
+          # than a counter-rate. The runbook's §3.3
+          # decision tree forks on whether the actual
+          # AuthorityList size matches the gauge
+          # (real count drop ⇒ Branch A, race a
+          # unilateral op=add if N=1; wiring bug ⇒
+          # Branch B, restart and audit
+          # gov_recorder). With N=0 governance is
+          # disabled entirely and only a hard fork can
+          # re-seed the AuthorityList — the runbook
+          # explicitly calls this out as the
+          # worst-case escape hatch. Cross-references
+          # SLASHING_INCIDENT.md (slashing of an
+          # authority key) and MINING_LIVENESS.md
+          # (gov recovery is gated on chain liveness
+          # if the authority drop has wedged
+          # consensus).
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/GOVERNANCE_AUTHORITY_INCIDENT.md#33-mode-c--CELLSgovauthoritycounttoolow"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-governance-authority-incident.json"
+          summary: "{{ $labels.instance }}: AuthorityList size = {{ $value }} (< 2)"
+          description: |
+            CELLS_gov_authority_count is {{ $value }}, below the
+            recommended minimum of 2. With <2 authorities the
+            M-of-N rule degenerates to single-signer governance
+            and any key compromise becomes chain-rotation
+            compromise. Either:
+              - The genesis was deliberately seeded with a
+                single bootstrap authority (testnet bring-up).
+                File this alert under "expected during bring-up"
+                and silence until rotation lands a second
+                member.
+              - The adapter wiring in pkg/monitoring/gov_recorder
+                broke and the gauge is stuck at 0. Verify with
+                the governance read API:
+                  GET /api/v1/governance/authority/list
+                If the list has >=2 members but the gauge says
+                0, file a metric-wiring bug.
+
+  # -----------------------------------------------------------------
+  # v2 attestation — recent-rejection ring truncation telemetry
+  # -----------------------------------------------------------------
+  # Consumes the CELLS_attest_rejection_field_* series emitted by
+  # pkg/monitoring/recentrejects_metrics.go (recorder pattern,
+  # recorded from pkg/mining/attest/recentrejects.Store.Record).
+  # The ring defensively truncates three operator-facing fields
+  # before storing them so a malicious miner stuffing the proof
+  # envelope cannot OOM the validator:
+  #
+  #   field="detail"        cap = 200 runes  (verifier RejectError detail)
+  #   field="gpu_name"      cap = 256 runes  (HMAC bundle gpu_name)
+  #   field="cert_subject"  cap = 256 runes  (CC leaf cert Subject CN)
+  #
+  # Sustained truncation is normally a sign of one of:
+  #   - a hostile miner blowing past the cap to drown signal
+  #     (worth a heads-up so operators can correlate with a
+  #     slashing-evidence-burst page from the v2-mining group);
+  #   - a verifier release that started emitting longer detail
+  #     strings and now needs the cap raised — bumping the
+  #     constants in pkg/mining/attest/recentrejects/recentrejects.go
+  #     (maxDetailRunes / maxGPUNameRunes / maxCertSubjectRunes)
+  #     is a 1-line change and a CHANGELOG entry;
+  #   - a unicode payload where rune count differs significantly
+  #     from byte count — the cap is rune-based by design but
+  #     operators sometimes assume bytes; the runes_max gauge is
+  #     the diagnostic for this.
+  #
+  # The truncation rate alert is rate(truncated)/rate(observed)
+  # so a low-traffic node firing one rejection at exactly the
+  # cap does not page; only a sustained truncation fraction
+  # crosses the threshold.
+  - name: CELLS-v2-attest-recent-rejections
+    rules:
+      - alert: CELLSAttestRejectionFieldTruncationSustained
+        # Truncation rate over 10m exceeds 25% of observations
+        # for a given field. The denominator guard
+        # (rate(observed) > 0) avoids 0/0 = NaN on quiet nodes.
+        # 25% is permissive — a healthy fleet typically sits at
+        # < 1% (mostly the off-by-one cases on multi-byte unicode
+        # cert subjects). Tune downwards once you have a week of
+        # baseline.
+        expr: |
+          (
+            rate(CELLS_attest_rejection_field_truncated_total[10m])
+            /
+            rate(CELLS_attest_rejection_field_runes_observed_total[10m])
+          ) > 0.25
+          and rate(CELLS_attest_rejection_field_runes_observed_total[10m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          subsystem: v2-attest
+        annotations:
+          # Mode D in REJECTION_FLOOD.md — payload-shape
+          # alert (NOT volume; Modes A/B/C cover that).
+          # The ring's per-field rune-caps are pinned
+          # in code (detail=200, gpu_name=256,
+          # cert_subject=256) and silently truncate
+          # overflows; sustained 25%+ truncation rate
+          # means something has changed about the
+          # rejection payload distribution. Runbook
+          # §7.4 maps the dominant `field` label to
+          # cause: detail ⇒ verifier release skew or
+          # adversarial stuffing; gpu_name ⇒
+          # cross-check ARCH_SPOOF_INCIDENT.md;
+          # cert_subject ⇒ benign multi-byte unicode
+          # in a real NVIDIA cert.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/REJECTION_FLOOD.md#74-mode-d--CELLSattestrejectionfieldtruncationsustained"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-rejection-flood.json"
+          summary: "{{ $labels.instance }}: recent-rejection ring is truncating {{ $labels.field }} >25% of the time"
+          description: |
+            CELLS_attest_rejection_field_truncated_total{field="{{ $labels.field }}"}
+            is firing on {{ $value | humanizePercentage }} of observed
+            rejections over the last 10 minutes. Possible causes:
+              - A miner is stuffing the proof envelope with an
+                oversized payload to drown debugging signal —
+                cross-check CELLS_attest_archspoof_rejected_total
+                and the v2-mining-slashing group; if the offender
+                is identifiable, slash via the §8 evidence path.
+              - A recent verifier release emits longer
+                RejectError.Detail strings than the cap allows —
+                check the latest CELLS release notes for any
+                §4.6 verifier change, then raise the cap in
+                pkg/mining/attest/recentrejects/recentrejects.go
+                (maxDetailRunes / maxGPUNameRunes /
+                maxCertSubjectRunes) and ship a CHANGELOG entry.
+              - A cert_subject containing significant non-ASCII
+                content (multi-byte unicode in CN/SAN) — verify
+                via CELLS_attest_rejection_field_runes_max and
+                the operator's NVIDIA cert chain.
+            Triage:
+              - Identify the worst offender field:
+                  topk(3, rate(CELLS_attest_rejection_field_truncated_total[10m]))
+              - Check headroom against the cap:
+                  CELLS_attest_rejection_field_runes_max{field="{{ $labels.field }}"}
+              - Inspect a recent rejection record for the offending
+                payload directly:
+                  GET /api/v1/attest/recent-rejections?limit=20
+                or:
+                  CELLScli watch archspoof --detailed
+
+      - alert: CELLSAttestRejectionFieldRunesMaxNearCap
+        # Process-lifetime max sitting within 10% of the cap
+        # for >30m means we are seeing real cap pressure even
+        # if the rate has not crossed the truncation-fraction
+        # alert above. Acts as a leading indicator before the
+        # truncation-rate alert paints. Caps are pinned in code:
+        #   detail        200
+        #   gpu_name      256
+        #   cert_subject  256
+        # Hard-coding the cap-1 values in the expression keeps
+        # the alert independent of the recordkeeping code.
+        expr: |
+          (
+            (CELLS_attest_rejection_field_runes_max{field="detail"} >= 180)
+            or
+            (CELLS_attest_rejection_field_runes_max{field="gpu_name"} >= 230)
+            or
+            (CELLS_attest_rejection_field_runes_max{field="cert_subject"} >= 230)
+          )
+        for: 30m
+        labels:
+          severity: info
+          subsystem: v2-attest
+        annotations:
+          # Mode E in REJECTION_FLOOD.md — leading
+          # indicator before the truncation-rate alert
+          # paints. Severity:info means the alert
+          # should NOT page; wire to a passive channel
+          # (chat ping, dashboard cell). The operator
+          # decision is whether to raise the per-field
+          # cap in pkg/mining/attest/recentrejects/
+          # before Mode D crosses 25%. Cross-references
+          # Mode D's cause table for the same `field`
+          # label.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/REJECTION_FLOOD.md#75-mode-e--CELLSattestrejectionfieldrunesmaxnearcap"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-rejection-flood.json"
+          summary: "{{ $labels.instance }}: recent-rejection ring {{ $labels.field }} runes_max within 10% of cap"
+          description: |
+            CELLS_attest_rejection_field_runes_max{field="{{ $labels.field }}"}
+            has reached {{ $value }} runes — within 10% of the
+            in-store cap (200 runes for detail, 256 for gpu_name
+            and cert_subject). The ring will continue to truncate
+            harmlessly, but if observed proofs are getting close
+            to the cap consider whether the cap should be raised
+            in pkg/mining/attest/recentrejects/recentrejects.go.
+            This alert is informational — it should not page;
+            wire it to a passive channel (chat ping) so operators
+            see the ramp before the truncation-rate alert above
+            crosses 25%.
+
+      # ---------------------------------------------------------------
+      # v2 attestation — recent-rejection ring on-disk persistence
+      # ---------------------------------------------------------------
+      # Independent signal from the truncation alerts above: the
+      # persistence layer (pkg/mining/attest/recentrejects/persistence.go)
+      # rewrites its JSONL log when the soft-cap is crossed. A
+      # sustained high compaction rate means a miner is filling
+      # the ring faster than the cap can absorb — useful for
+      # detecting rejection-flood patterns where the per-rejection
+      # rate stays under the slashing-evidence threshold but the
+      # cumulative volume over a long window is anomalous.
+      #
+      # Tuning:
+      #   - softCap defaults to DefaultMaxRejections (1024) so a
+      #     healthy validator should compact roughly every
+      #     1024 rejections. At 100 rejections/s steady-state
+      #     that's ~1 compaction every ~10 seconds — well under
+      #     the alert threshold below.
+      #   - The threshold is intentionally loose; tighten per-
+      #     deployment as you learn your validator's baseline.
+      - alert: CELLSAttestRejectionPersistCompactionsHigh
+        # >5 compactions/min sustained for 30m equals a soft-cap
+        # rewrite every ≤12s for half an hour — at the default
+        # softCap=1024 that's ~85 rejections/s sustained, i.e.
+        # roughly an order of magnitude above any healthy
+        # validator's normal §4.6 rejection rate.
+        expr: |
+          rate(CELLS_attest_rejection_persist_compactions_total[5m]) * 60 > 5
+        for: 30m
+        labels:
+          severity: warning
+          subsystem: v2-attest
+        annotations:
+          # Mode A in REJECTION_FLOOD.md — the soft-cap
+          # rewrite loop is keeping up but the rate is
+          # anomalously high. Validator is healthy; the
+          # VOLUME is the signal. Anchor §7.1 jumps
+          # directly to the mode-specific entry point;
+          # the runbook also walks the promotion path
+          # to Mode B (§7.2) if compactions stay high
+          # AND the persister starts dropping records.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/REJECTION_FLOOD.md#71-mode-a--CELLSattestrejectionpersistcompactionshigh"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-rejection-flood.json"
+          summary: "{{ $labels.instance }}: recent-rejection ring is compacting {{ $value | humanize }}× per minute"
+          description: |
+            CELLS_attest_rejection_persist_compactions_total has
+            been incrementing at >5/min sustained for 30m on
+            {{ $labels.instance }}. Each compaction means the
+            on-disk JSONL log crossed its soft-cap and was
+            rewritten — at the default softCap=1024 this implies
+            ~85 rejections/s sustained, ~10× a typical baseline.
+            Triage:
+              - Confirm the rejection volume is real, not a
+                metric leak: rate(CELLS_attestation_rejected_total[5m]).
+              - Identify the dominant rejection kind / miner:
+                topk(5, rate(CELLS_attestation_rejected_total{kind!=""}[5m]))
+              - Inspect recent records for a hostile pattern:
+                GET /api/v1/attest/recent-rejections?limit=50
+              - If a miner is spamming, consider tightening the
+                §4.6 cap (operator policy) or applying a P2P
+                rate-limit at the libp2p gate.
+            The CELLS_attest_rejection_persist_records_on_disk
+            gauge will hover near softCap during the spike;
+            after the spike subsides it should drift down on
+            the next compaction with no operator action.
+
+      # CELLS_attest_rejection_persist_hardcap_drops_total
+      # increments when the FilePersister refuses to admit a
+      # record because admitting it would breach the operator-
+      # configured hard byte ceiling (cfg.RecentRejectionsMaxBytes)
+      # AND a salvage in-band compaction failed to free enough
+      # headroom. ANY non-zero rate is anomalous: the soft-cap
+      # loop is sized to keep the file an order of magnitude
+      # under the hard cap on realistic traffic, so a hit means
+      # a flood is actively outrunning the rewrite cycle. The
+      # in-memory ring is unaffected (the dashboard tile and
+      # /api/v1/attest/recent-rejections still surface every
+      # record); only the durable on-disk forensic record was
+      # dropped.
+      #
+      # Independent signal from CELLSAttestRejectionPersistCompactionsHigh:
+      #   - Compactions-high fires on sustained rewrite rate.
+      #     The validator is keeping up but the volume is
+      #     elevated. Operator action: investigate, consider
+      #     tightening cap policy.
+      #   - HardCapDropping fires on ANY drops. The validator
+      #     is NOT keeping up; the cap is now actively shedding
+      #     records. Operator action: escalate immediately —
+      #     either tune softCap up, MaxBytes up, or apply a
+      #     rate-limit at the libp2p gate.
+      - alert: CELLSAttestRejectionPersistHardCapDropping
+        # rate > 0 for 10m: the drop counter advanced AT ALL
+        # over the last 5m, sustained across two scrape windows.
+        # No hysteresis — a single drop is operator-relevant.
+        expr: |
+          rate(CELLS_attest_rejection_persist_hardcap_drops_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-attest
+        annotations:
+          # Mode B in REJECTION_FLOOD.md — strictly
+          # worse than Mode A: the persister is now
+          # actively SHEDDING records. The in-memory
+          # ring is unaffected (dashboard tile and
+          # /api/v1/attest/recent-rejections continue
+          # to surface every record); ONLY the durable
+          # forensic-record persistence is being
+          # dropped. Anchor §7.2 walks the
+          # cap-tuning vs. mempool-rate-limit decision.
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/REJECTION_FLOOD.md#72-mode-b--CELLSattestrejectionpersisthardcapdropping"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-rejection-flood.json"
+          summary: "{{ $labels.instance }}: recent-rejection persister is shedding records at the hard byte cap"
+          description: |
+            CELLS_attest_rejection_persist_hardcap_drops_total has
+            been incrementing for ≥10m on {{ $labels.instance }}.
+            The on-disk JSONL log has hit its configured byte
+            ceiling AND the salvage compaction loop is not
+            freeing enough headroom for new records, so the
+            FilePersister is now dropping incoming records to
+            stay within budget.
+
+            The in-memory ring is unaffected — operators reading
+            the dashboard tile or /api/v1/attest/recent-rejections
+            continue to see every record. ONLY the durable
+            forensic-record persistence is being dropped.
+
+            Triage:
+              - Confirm a flood is in progress:
+                rate(CELLS_attestation_rejected_total[5m])
+              - Check the hard cap configuration vs current
+                file size:
+                CELLS_attest_rejection_persist_records_on_disk
+              - Identify the dominant offender:
+                topk(5, rate(CELLS_attestation_rejected_total{kind!=""}[5m]))
+              - Mitigations (operator policy):
+                * Raise cfg.RecentRejectionsMaxBytes if disk
+                  budget allows — gives the soft-cap loop more
+                  headroom but trades disk for durability.
+                * Raise softCap so each rewrite trims more —
+                  amortises the I/O cost of the compaction loop.
+                * Apply a libp2p / mempool rate-limit on the
+                  offending miner so the rejection volume drops
+                  to baseline and the soft-cap loop catches up.
+
+      # CELLS_attest_rejection_per_miner_rate_limited_total
+      # increments when the per-miner token-bucket limiter
+      # (recentrejects.SetRateLimit, wired via
+      # cfg.RecentRejectionsRateLimitPerSec) drops a record at
+      # Store.Record() entry. Distinct from the persist-hard-cap
+      # alert above:
+      #
+      #   - HardCapDropping fires when the on-disk persister
+      #     refuses an admitted record. The ring saw it; the
+      #     disk did not.
+      #   - PerMinerRateLimited fires when neither the ring
+      #     nor the persister see the record at all. A single
+      #     miner has saturated their per-miner rate budget,
+      #     full stop.
+      #
+      # Triage divergence:
+      #   - Rate-limit drops with a flat hard-cap rate ⇒ ONE
+      #     bad actor. Identify miner_addr from the dashboard
+      #     "top offenders" strip and apply policy at the
+      #     libp2p / mempool gate.
+      #   - Rate-limit drops AND hard-cap drops simultaneously
+      #     ⇒ ONE bad actor pushing hard enough that even
+      #     after rate-limiting their admitted records overflow
+      #     the persister. Tighten the per-miner rate limit
+      #     AND raise the disk cap, in that order.
+      #   - Rate-limit drops with NO obvious top offender
+      #     (broad attack across many miner_addrs) ⇒ either the
+      #     limiter rate is too tight (operators tighten under
+      #     load and forget to relax later) or a botnet is
+      #     active. Cross-check against
+      #     CELLS_p2p_peers_connected for unusual peer churn.
+      - alert: CELLSAttestRejectionPerMinerRateLimited
+        # rate > 0 for 10m: any sustained per-miner drops
+        # across two scrape windows. No hysteresis — non-zero
+        # is an investigation signal in itself.
+        expr: |
+          rate(CELLS_attest_rejection_per_miner_rate_limited_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-attest
+        annotations:
+          # Mode C in REJECTION_FLOOD.md — the EARLIEST
+          # defence in the stack. Records are dropped
+          # at Store.Record() entry; neither the ring
+          # nor the persister sees them. When Mode C
+          # fires alone (Modes A and B both flat) it
+          # is the cleanest single-bad-actor signal in
+          # the stack — the dashboard "top offenders"
+          # strip names the saturating miner_addr
+          # directly. Anchor §7.3 forks on whether the
+          # limiter is doing its job (apply policy
+          # upstream) vs. the limiter rate is too tight
+          # (relax cfg.RecentRejectionsRateLimitPerSec).
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/REJECTION_FLOOD.md#73-mode-c--CELLSattestrejectionperminerratelimited"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-rejection-flood.json"
+          summary: "{{ $labels.instance }}: per-miner rate-limit is dropping records at recent-rejection ring entry"
+          description: |
+            CELLS_attest_rejection_per_miner_rate_limited_total has
+            been incrementing for ≥10m on {{ $labels.instance }}.
+            One or more miners have exhausted their per-miner
+            token bucket and Store.Record is dropping their
+            records at entry — neither the in-memory ring nor
+            the persister see them.
+
+            This is the EARLIEST defence in the rejection-ring
+            stack: it fires before hard-cap drops, before
+            soft-cap compactions, and before per-field rune
+            truncation. A non-zero rate means the operator
+            policy (cfg.RecentRejectionsRateLimitPerSec) is
+            actively shedding what would otherwise be a flood.
+
+            Triage:
+              - Identify the offending miner_addr from the
+                dashboard "top offenders" strip:
+                /dashboard → Recent Attestation Rejections.
+              - Cross-check against the verifier's per-arch
+                rejection counters:
+                topk(5, rate(CELLS_attestation_rejected_total{kind!=""}[5m])
+                  by (miner_addr))
+              - If exactly one miner_addr dominates: apply a
+                libp2p / mempool ban or rate-limit at the
+                gate so the rejection volume drops to baseline.
+              - If many miner_addrs share the load: the
+                limiter rate may be too tight. Loosen
+                cfg.RecentRejectionsRateLimitPerSec or
+                widen the burst.
+
+  # =====================================================================
+  # CELLS-stub-active — surfaces deployments running with a stub-shipped
+  # implementation in place of the production verifier / signer / etc.
+  #
+  # This alert closes the silent-stub-deployment footgun: CELLS
+  # intentionally ships several stubs that are runtime-selectable or
+  # build-tag-selectable (non-CGO PoE / Dilithium / wallet, the CC
+  # nvidia-cc-v1 stub verifier, slashing StubVerifier for evidence kinds
+  # whose real implementation hasn't shipped, etc.). Some of these stubs
+  # are operationally dangerous in production:
+  #
+  #   - kind="poe" (non-CGO consensus) ACCEPTS transactions WITHOUT
+  #     signature verification — see pkg/consensus/poe_stub.go:38-46.
+  #     Any production deploy with this gauge set to 1 is a hard-fail
+  #     security event.
+  #
+  #   - kind="dilithium" / kind="wallet" (non-CGO) downgrade quantum-
+  #     safe ML-DSA-87 to SHA-256-keyed HMAC. Functionally correct
+  #     for testing, but a downgrade from the v2 mining protocol's
+  #     quantum-safe promise.
+  #
+  #   - kind="cc" (nvidia-cc-v1 stub verifier) rejects every CC
+  #     attestation. Validators wired to the stub effectively
+  #     refuse to admit any v2 mining proof of Type=nvidia-cc-v1
+  #     until Phase 2c-iv lands.
+  #
+  #   - kind="slashing" (StubVerifier) silently disables slashing
+  #     for evidence kinds wired to the stub. Slash txs of those
+  #     kinds are rejected with "not yet implemented" — the
+  #     subnet's slashing surface is partially offline without
+  #     the operator necessarily noticing.
+  #
+  #   - kind="mesh3d_cuda" / kind="wasm_sdk" are softer: CPU
+  #     fallback / WASM unavailable. Operationally fine but a
+  #     signal that the operator's deploy doesn't match what they
+  #     probably expected.
+  #
+  # The metric `CELLS_stub_active{kind="..."}` is emitted by
+  # pkg/monitoring/stub_active_metrics.go on every scrape, with one
+  # row per canonical kind in pkg/monitoring/stubactive/AllKinds()
+  # (always populated, value 0 or 1). The for:5m window swallows the
+  # ~30s of startup transients before all init() functions have run.
+  # =====================================================================
+  - name: CELLS-stub-active
+    rules:
+      - alert: CELLSStubActive
+        # `== 1` matches every kind label whose gauge is currently 1.
+        # Prometheus produces one alert instance per matching kind label,
+        # so operators get a separate page per stub-active kind (with
+        # the specific kind in $labels.kind for routing / dashboard
+        # panels).
+        expr: |
+          CELLS_stub_active == 1
+        for: 5m
+        labels:
+          severity: critical
+          subsystem: v2-deployment
+        annotations:
+          # Anchor lands on the kind-specific section of the runbook so
+          # an on-call clicking the page jumps straight to the right
+          # remediation (rebuild with CGO, swap the CC verifier,
+          # register a real slashing evidence verifier, etc.) rather
+          # than the runbook header.
+          runbook_url: 'https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/STUB_DEPLOYMENT_INCIDENT.md#kind-{{ reReplaceAll "_" "-" $labels.kind }}'
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-stub-deployment-incident.json"
+          summary: "{{ $labels.instance }}: stub implementation active for kind={{ $labels.kind }}"
+          description: |
+            CELLS_stub_active{kind="{{ $labels.kind }}"} == 1 on
+            {{ $labels.instance }} for ≥5m.
+
+            A stub-shipped code path is active in this binary. Some
+            stubs are operationally dangerous in production:
+
+              - kind="poe": non-CGO consensus ACCEPTS transactions
+                WITHOUT signature verification. Hard-fail security
+                event in production. Rebuild with CGO_ENABLED=1 and
+                liboqs available.
+
+              - kind="dilithium" / "wallet": quantum-safe ML-DSA-87
+                not available; SHA-256 fallback in use. Downgrade
+                from the v2 mining protocol's quantum-safe promise.
+                Rebuild with CGO + liboqs.
+
+              - kind="cc": nvidia-cc-v1 stub verifier rejects every
+                proof. Validators using this stub admit zero v2
+                mining proofs of Type=nvidia-cc-v1 (Phase 2c-iv work
+                pending). Replace cc.NewStubVerifier() with the real
+                AIK verifier in the validator wiring.
+
+              - kind="slashing": at least one EvidenceKind is wired
+                to the StubVerifier (always rejects). Slash txs of
+                that kind silently fail. Replace the StubVerifier
+                registration in slashing.NewProductionDispatcher
+                with the real per-kind verifier.
+
+              - kind="mesh3d_cuda": CUDA acceleration unavailable;
+                CPU fallback in use. Functionally correct but
+                throughput will be far below CUDA-enabled capacity.
+
+              - kind="wasm_sdk": WASM module execution unavailable
+                (non-CGO). Modules configured under [wasm.*] will
+                all fail to load.
+
+            Triage:
+              - See CELLS/docs/docs/runbooks/STUB_DEPLOYMENT_INCIDENT.md
+                for the kind-specific remediation (the runbook_url
+                above anchors directly into the right section).
+              - This alert is for:5m which means a brand-new node
+                boot will not page; the gauge has to remain 1 for
+                two scrape windows.
+              - To see all currently-active kinds:
+                  CELLS_stub_active == 1
+                and group by `kind` for an at-a-glance summary.
+              - This alert NEVER auto-resolves until the binary is
+                redeployed with the stub replaced. There is no
+                "transient" stub-active condition.
+
+  # =====================================================================
+  # CELLS-wallet — wallet HTTP API health
+  #
+  # Three alerts cover the four state-changing endpoints under
+  # /api/v1/wallet/*:
+  #
+  #   - CELLSWalletSendErrorRate: send-side terminal-failure rate
+  #     (excluding submesh-policy and dedupe rejects, which are
+  #     gate-side and counted separately).
+  #   - CELLSWalletStorageErrorBurst: storage backend errors on
+  #     either /balance or /send/StoreTransaction. Strong storage-
+  #     wedge signal that complements MINING_LIVENESS / OPERATOR_HYGIENE.
+  #   - CELLSWalletMintBurst: sustained admin mint volume — supply-
+  #     inflation tripwire. Mint is admin-only; sustained success
+  #     volume is suspicious in itself, regardless of policy.
+  #
+  # Per-result counters are emitted by pkg/monitoring/wallet_metrics.go
+  # with rows pre-populated for every result tag, so alerting
+  # expressions don't have a missing-data bootstrap problem.
+  # =====================================================================
+  - name: CELLS-wallet
+    rules:
+      - alert: CELLSWalletSendErrorRate
+        # Sum of all *handler-side* failure tags (excludes
+        # submesh-policy and dedupe — those are gate-side, separate
+        # counters) divided by the total send rate. Fires when more
+        # than 10% of /api/v1/wallet/send requests terminate in a
+        # handler-side error for ≥10m.
+        #
+        # Why >0.1 instead of >0? A small burst of `invalid_request`
+        # is normal user error and shouldn't page the on-call.
+        # 0.1 is the inflection point where the user-error
+        # explanation runs out — at that ratio either the validator
+        # is misconfigured (storage wedge, NVIDIA-lock perpetually
+        # blocking) or a client is hammering with bad requests.
+        expr: |
+          (
+            sum by (instance) (
+              rate(CELLS_wallet_send_total{result=~"tx_create_failed|store_failed|no_wallet_service|nvidia_lock_blocked"}[5m])
+            )
+          )
+          /
+          (
+            sum by (instance) (
+              rate(CELLS_wallet_send_total[5m])
+            ) > 0
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-wallet
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/WALLET_INCIDENT.md#31-mode-a--CELLSwalletsenderrorrate"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-wallet-incident.json"
+          summary: "{{ $labels.instance }}: /api/v1/wallet/send error rate above 10% for ≥10m"
+          description: |
+            CELLS_wallet_send_total handler-side failure ratio
+            (tx_create_failed + store_failed + no_wallet_service +
+            nvidia_lock_blocked) / total > 10% on
+            {{ $labels.instance }} for ≥10m.
+
+            Submesh-policy and dedupe rejects are NOT counted in
+            this ratio — they live in
+            CELLS_submesh_api_wallet_reject_*_total and
+            CELLS_p2p_wallet_ingress_dedupe_skip_total respectively
+            (covered by CELLSSubmeshAPISustained422 and the
+            quarantine pipeline).
+
+            Triage:
+              - Drill into the failure tag breakdown:
+                  topk(3,
+                    sum by (result) (rate(CELLS_wallet_send_total{result!="success"}[5m])))
+                The dominant tag tells you the failure mode.
+              - tx_create_failed → wallet service init issue
+                (CGO/liboqs); cross-check CELLS_stub_active{kind="wallet"}.
+              - store_failed → storage wedge; cross-check
+                CELLSNoTransactionsStored and the storage-backend
+                runbook (OPERATOR_HYGIENE_INCIDENT.md §3.4).
+              - no_wallet_service → wallet didn't initialize at
+                node boot; check startup logs for liboqs/OpenSSL
+                errors.
+              - nvidia_lock_blocked → NVIDIA-lock proof ring is
+                empty or the gate is misconfigured; cross-check
+                NGC_SUBMISSION_INCIDENT.md and OPERATOR_HYGIENE
+                §3.1 / §3.2.
+
+      - alert: CELLSWalletStorageErrorBurst
+        # Storage errors on the wallet read path (/balance) or
+        # write path (/send → StoreTransaction). Either path
+        # erroring sustained means the storage backend is wedged
+        # — strong companion signal to CELLSNoTransactionsStored
+        # and CELLSMiningChainStuck.
+        expr: |
+          (
+            sum by (instance) (rate(CELLS_wallet_balance_query_total{result="storage_error"}[5m]))
+            +
+            sum by (instance) (rate(CELLS_wallet_send_total{result="store_failed"}[5m]))
+          ) * 60 > 1
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: v2-wallet
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/WALLET_INCIDENT.md#32-mode-b--CELLSwalletstorageerrorburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-wallet-incident.json"
+          summary: "{{ $labels.instance }}: wallet API storage errors > 1/min for ≥5m"
+          description: |
+            Combined rate of CELLS_wallet_balance_query_total{result="storage_error"}
+            + CELLS_wallet_send_total{result="store_failed"} on
+            {{ $labels.instance }} exceeds 1/min for ≥5m.
+
+            This indicates the storage backend (BoltDB/Badger) is
+            failing reads OR writes from the wallet API surface.
+            Triage:
+              - Cross-check CELLSNoTransactionsStored
+                (OPERATOR_HYGIENE_INCIDENT.md §3.4) — if firing
+                concurrently, the storage wedge is system-wide
+                and not wallet-specific.
+              - Cross-check CELLSMiningChainStuck
+                (MINING_LIVENESS.md §3.1) — block production
+                will follow if storage stays wedged.
+              - Inspect node logs for "Failed to get balance" /
+                "Failed to store transaction" and the underlying
+                storage error.
+
+      - alert: CELLSWalletMintBurst
+        # Sustained admin mint volume — supply-inflation tripwire.
+        # Mint is admin-only and gated by NVIDIA-lock; sustained
+        # success volume regardless of policy is suspicious because
+        # an admin who mints continuously is either (a) running a
+        # legitimate test campaign without notifying ops or (b) a
+        # compromised admin credential.
+        #
+        # Threshold: rate*60 > 5 means more than 5 successful mints
+        # per minute sustained for 30m → ≥150 mints in the window.
+        # Tunable per-deployment; tighten for mainnet, loosen for
+        # testnet smoke tests.
+        expr: |
+          rate(CELLS_wallet_mint_total{result="success"}[5m]) * 60 > 5
+        for: 30m
+        labels:
+          severity: warning
+          subsystem: v2-wallet
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/WALLET_INCIDENT.md#33-mode-c--CELLSwalletmintburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-wallet-incident.json"
+          summary: "{{ $labels.instance }}: $CELL mint rate > 5/min for ≥30m"
+          description: |
+            CELLS_wallet_mint_total{result="success"} on
+            {{ $labels.instance }} has been incrementing at
+            >5/min sustained for ≥30m (≥150 mints in the window).
+
+            $CELL mint is admin-only and gated by NVIDIA-lock.
+            Sustained successful mint volume regardless of policy
+            is a supply-inflation signal:
+              - Legitimate cause: an admin running a test campaign
+                without notifying ops. Confirm out-of-band with
+                the operator who owns the API credentials.
+              - Adversarial cause: compromised admin credentials.
+                Rotate the credential and audit the recipient
+                addresses against the legitimate-recipient list.
+
+            Triage:
+              - List the mint amounts and recipients from logs:
+                grep '"coin":"CELL"' on the validator's stdout.
+              - Cross-check CELLSGovAuthorityVoteRecorded — if a
+                governance vote authorized the campaign, the vote
+                will be in the chain.
+              - If recipient is not on the legitimate list, treat
+                as a credential compromise: rotate, restrict, and
+                file an incident report.
+
+  # =====================================================================
+  # CELLS-storage — storage backend health
+  #
+  # Two alerts cover the SQLite/file/Scylla backends' per-op
+  # outcomes. Both fire on the same metric
+  # (CELLS_storage_op_total{op,result="error"}) but at different
+  # thresholds — the write-path burst is the higher-confidence
+  # signal because it implies the chain can't accept new state;
+  # the read-path burst is more permissive because read errors
+  # (e.g. transient lock contention) are noisier.
+  #
+  # The metric is emitted by pkg/monitoring/storage_op_metrics.go
+  # with all 10 (op, result) pairs always populated, so cold-start
+  # nodes don't have a missing-data bootstrap problem.
+  # =====================================================================
+  - name: CELLS-storage
+    rules:
+      - alert: CELLSStorageWriteErrorBurst
+        # store_transaction error rate above 1/min sustained for
+        # 5m. Strong signal that the storage backend is rejecting
+        # writes — either a disk/space issue, a lock-contention
+        # storm, or a Scylla cluster degradation. Companion to
+        # CELLSNoTransactionsStored (which fires when zero writes
+        # complete) and CELLSWalletStorageErrorBurst (which fires
+        # when the wallet API surface sees the failures); this
+        # one fires when the storage layer itself is the
+        # source of truth for the failure.
+        expr: |
+          rate(CELLS_storage_op_total{op="store_transaction",result="error"}[5m]) * 60 > 1
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: v2-storage
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/STORAGE_INCIDENT.md#31-mode-a--CELLSstoragewriteerrorburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-storage-incident.json"
+          summary: "{{ $labels.instance }}: storage StoreTransaction errors > 1/min for ≥5m"
+          description: |
+            CELLS_storage_op_total{op="store_transaction",result="error"}
+            rate on {{ $labels.instance }} has been > 1/min sustained
+            for ≥5m. The storage backend (SQLite / FileStorage / Scylla)
+            is rejecting transaction writes.
+
+            Triage:
+              - Drill into the success-vs-error ratio to confirm the
+                magnitude:
+                  rate(CELLS_storage_op_total{op="store_transaction",result="error"}[5m])
+                  /
+                  rate(CELLS_storage_op_total{op="store_transaction"}[5m])
+              - Cross-check CELLSNoTransactionsStored: if firing
+                concurrently, ZERO transactions are completing
+                (full storage wedge); if NOT firing, some writes
+                are getting through but a fraction are failing
+                (lock contention, partial disk failure, transient
+                Scylla quorum loss).
+              - Cross-check CELLSWalletStorageErrorBurst: if firing
+                concurrently, the wallet API surface is seeing the
+                failures end-to-end (this is expected). If NOT
+                firing but CELLSStorageWriteErrorBurst is, the
+                error volume is from p2p ingress (libp2p
+                accepting txs that storage then rejects) rather
+                than the wallet API.
+              - Inspect node logs for storage error messages
+                (SQLite "database is locked", Scylla "quorum",
+                FileStorage "no space left").
+
+      - alert: CELLSStorageReadyFailing
+        # Storage Ready() probe failing > 0 for 2m. This is the
+        # lowest-level health signal — Ready() is called by the
+        # /healthz endpoint, the wallet handler, and the metrics
+        # check. A Ready() failure means the backend is fully
+        # offline (file directory missing, SQLite DB closed,
+        # Scylla session dead). Critical because the validator
+        # cannot meaningfully participate in consensus without
+        # a working storage backend.
+        expr: |
+          rate(CELLS_storage_op_total{op="ready",result="error"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          subsystem: v2-storage
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/STORAGE_INCIDENT.md#32-mode-b--CELLSstoragereadyfailing"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-storage-incident.json"
+          summary: "{{ $labels.instance }}: storage Ready() probe failing"
+          description: |
+            CELLS_storage_op_total{op="ready",result="error"} is
+            non-zero on {{ $labels.instance }} for ≥2m. The
+            storage backend is reporting itself unhealthy on the
+            health-probe path — either fully offline or
+            unreachable.
+
+            Likely causes:
+              - SQLite: db file deleted, FS unmounted, fsync
+                failure on the journal.
+              - FileStorage: storage directory removed or
+                permissions broken.
+              - Scylla: session lost (auth expiry, TLS cert
+                rotation, network partition to the cluster).
+
+            Immediate consequences:
+              - /api/v1/health returns 503 — load balancers
+                will (correctly) take this node out of rotation.
+              - CELLSNoTransactionsStored will follow within
+                30m if this stays unresolved.
+              - CELLSMiningChainStuck will follow if a majority
+                of validators hit this concurrently.
+
+            Triage:
+              - Confirm the underlying backend is reachable:
+                  - SQLite: `ls -la <db-path>` from the node.
+                  - FileStorage: `ls -la <storage-dir>`.
+                  - Scylla: `cqlsh <host>` from the node.
+              - If the backend is alive but the validator can't
+                reach it, the issue is between the node and the
+                backend (DNS, TLS, auth, firewall). Restart
+                with the correct config.
+
+  # =====================================================================
+  # CELLS-p2p — libp2p peer-graph health
+  #
+  # Two alerts cover the most common shapes of a "validator is
+  # alive but isolated from the network" failure: zero
+  # peers (full islanding) and peers-but-no-inbound-gossip
+  # (one-way partition or subscription drift). Both fire
+  # against time series that are guaranteed to be populated
+  # because CELLS_p2p_peers_connected always emits with either
+  # provider="live" or provider="none" (the alert filters to
+  # "live" so test/dev nodes don't false-fire).
+  # =====================================================================
+  - name: CELLS-p2p
+    rules:
+      - alert: CELLSP2PNoPeers
+        # Validator has zero connected libp2p peers for ≥5m on
+        # a host where networking has actually been wired
+        # (provider="live"). The provider label filters out
+        # unit-test / pre-init scrapes which legitimately have
+        # no peers and would otherwise false-fire this alert.
+        expr: |
+          CELLS_p2p_peers_connected{provider="live"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: v2-networking
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/NETWORKING_INCIDENT.md#31-mode-a--CELLSp2pnopeers"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-networking-incident.json"
+          summary: "{{ $labels.instance }}: libp2p peer count == 0 for ≥5m"
+          description: |
+            CELLS_p2p_peers_connected{instance="{{ $labels.instance }}",provider="live"}
+            has been 0 for ≥5m. The validator is islanded from
+            the rest of the network — no inbound gossip, no
+            outbound publish reachability. Mining / consensus
+            participation is effectively dead while in this
+            state.
+
+            Common causes:
+              - libp2p TCP port not reachable (firewall change,
+                k8s service config drift, wrong host port).
+              - mDNS-only test deploy on a host with no peer
+                neighbours.
+              - Bootstrap peer list is wrong / unreachable.
+              - libp2p host shutdown but process not crashed
+                (Network.Close() was called and never replaced).
+
+            Triage:
+              - On the node: `ss -tnp | grep <libp2p-port>` to
+                confirm the listener is bound and accepting.
+              - From a known-good peer: try to dial this host
+                directly and confirm whether it accepts the
+                connection.
+              - Check `CELLS_p2p_messages_total{direction="in"}`
+                rate — if 0 across the whole fleet, the
+                ingress side of gossip is dead at every node
+                (likely a deploy-wide config issue, not a
+                single-host problem).
+
+      - alert: CELLSP2PGossipIngressStalled
+        # Connected peers > 0 but received-message rate is
+        # exactly 0 for ≥10m. Peers are visible but not
+        # gossiping — strong signal of a pubsub-topic
+        # subscription failure or a one-way network partition
+        # (we can dial out but inbound gossip never lands).
+        expr: |
+          CELLS_p2p_peers_connected{provider="live"} > 0
+            and on(instance)
+          rate(CELLS_p2p_messages_total{direction="in"}[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-networking
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/NETWORKING_INCIDENT.md#32-mode-b--CELLSp2pgossipingressstalled"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-networking-incident.json"
+          summary: "{{ $labels.instance }}: peers > 0 but no inbound gossip for ≥10m"
+          description: |
+            On {{ $labels.instance }}, CELLS_p2p_peers_connected
+            > 0 but the inbound message rate is exactly zero
+            for ≥10m. The validator's libp2p host has live
+            connections that aren't producing pubsub
+            traffic.
+
+            Likely:
+              - Subscription on the CELLS-transactions topic
+                was dropped (e.g. context cancellation but
+                handleMessages goroutine still nominally
+                "running").
+              - One-way network partition: outbound dials work,
+                inbound payload delivery is silently dropped
+                (NAT misconfiguration, asymmetric firewall).
+              - All connected peers have been quarantined or
+                are themselves muted from the topic.
+
+            Triage:
+              - Cross-check CELLSQuarantineAnySubmesh — if
+                co-firing, our peer set is silenced by quarantine
+                policy rather than broken at the network layer.
+              - Restart the validator. handleMessages re-binds
+                the subscription cleanly on startup, so a
+                bounce is the cheapest recovery for transient
+                cases. If the alert re-fires immediately
+                after restart, it's a network-layer issue,
+                not a goroutine drift.
+
+      - alert: CELLSP2PWalletIngressDedupeBurst
+        # Wallet-tx dedupe is a healthy mechanism — same
+        # tx_id arriving via mesh3d wire and JSON gossip
+        # both hit the same idempotent ingest. But a SUDDEN
+        # high-rate burst (>1/sec sustained for 15m)
+        # indicates a gossip-replay storm: peers re-sending
+        # the same tx repeatedly. Either a recent rejoin
+        # (validators replaying the mempool), an honest
+        # mistake by a peer's relayer, or active spam.
+        expr: |
+          rate(CELLS_p2p_wallet_ingress_dedupe_skip_total[5m]) > 1
+        for: 15m
+        labels:
+          severity: info
+          subsystem: v2-networking
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/NETWORKING_INCIDENT.md#33-mode-c--CELLSp2pwalletingressdedupeburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-networking-incident.json"
+          summary: "{{ $labels.instance }}: wallet-tx dedupe skip rate > 1/sec for ≥15m"
+          description: |
+            CELLS_p2p_wallet_ingress_dedupe_skip_total on
+            {{ $labels.instance }} has been incrementing at
+            > 1/sec sustained for ≥15m. Inbound wallet
+            transactions are being deduplicated at high
+            volume — a peer (or many peers) is re-sending
+            the same tx_ids repeatedly via mesh wire +
+            JSON gossip.
+
+            Common causes:
+              - A peer that rejoined recently and is
+                replaying its mempool aggressively.
+              - A buggy relayer with too-tight retry
+                cadence.
+              - Adversarial re-broadcast spam aimed at
+                amplifying gossip volume.
+
+            This is INFO severity because dedupe is
+            actively protecting the chain — duplicates
+            are not getting double-applied. The signal
+            is useful for capacity planning and for
+            spotting the buggy/adversarial source
+            before they scale up.
+
+  # =====================================================================
+  # CELLS-contracts-bridge — smart-contract execution + atomic-swap bridge
+  #
+  # Two alerts cover the two new metric surfaces. Both are
+  # threshold-on-error-rate, intentionally tuned to be
+  # conservative — these subsystems can carry user-driven
+  # error volume (gas exhaustion, invalid secret submission)
+  # that's not necessarily a system fault. The thresholds
+  # match sustained dominant-error patterns rather than
+  # absolute error counts.
+  # =====================================================================
+  - name: CELLS-contracts-bridge
+    rules:
+      - alert: CELLSContractExecuteErrorRate
+        # Contract executions failing at >50% of total volume
+        # for ≥15m AND with at least 1 attempt/min sustained.
+        # Filters out the "rarely-used contract that errored
+        # once" case while still catching a sustained
+        # systematic failure (gas envelope misconfiguration,
+        # ABI drift, runtime regression).
+        expr: |
+          (
+            rate(CELLS_contract_executions_total{result="error"}[15m])
+            /
+            (rate(CELLS_contract_executions_total[15m]) > 0)
+          ) > 0.5
+          and
+          rate(CELLS_contract_executions_total[15m]) * 60 >= 1
+        for: 15m
+        labels:
+          severity: warning
+          subsystem: v2-contracts
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/CONTRACTS_BRIDGE_INCIDENT.md#31-mode-a--CELLScontractexecuteerrorrate"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-contracts-bridge-incident.json"
+          summary: "{{ $labels.instance }}: contract execution error rate > 50% for ≥15m"
+          description: |
+            ContractEngine.ExecuteContract on
+            {{ $labels.instance }} has been failing at >50%
+            of total volume (with ≥1 call/min) sustained for
+            ≥15m. Likely:
+              - WASM runtime regression (per-contract wazero
+                or shared wazero failing systematically).
+              - Gas envelope misconfiguration causing the
+                majority of calls to exhaust their limit.
+              - ABI/codec drift after a deploy: callers are
+                passing args the contracts no longer accept.
+              - simulation-fallback path producing an error
+                where the real WASM runtime would have
+                succeeded.
+
+            Triage:
+              - Inspect node logs for "function not found",
+                "gas exhausted", or runtime panic stacks.
+              - Cross-check CELLS_stub_active{kind="wasm_sdk"} —
+                if 1, the WASM SDK stub is active, which can
+                produce systematic errors. See
+                STUB_DEPLOYMENT_INCIDENT.md.
+              - If failure is concentrated to a single
+                contract, that contract has likely shipped a
+                broken update; consider rolling it back.
+
+      - alert: CELLSBridgeOpErrorBurst
+        # Bridge op error rate > 0.2/min sustained for 10m.
+        # Lower threshold than the contract alert because
+        # each bridge op represents a real cross-chain
+        # action and a sustained error rate has direct
+        # economic impact (locked funds that won't redeem).
+        expr: |
+          rate(CELLS_bridge_op_total{result="error"}[10m]) * 60 > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-bridge
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/CONTRACTS_BRIDGE_INCIDENT.md#32-mode-b--CELLSbridgeoperrorburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-contracts-bridge-incident.json"
+          summary: "{{ $labels.instance }}: bridge op error rate > 0.2/min for ≥10m"
+          description: |
+            BridgeProtocol on {{ $labels.instance }} has had
+            errors at >0.2/min sustained for ≥10m. Drill by
+            op tag to identify the failing stage:
+
+              topk(3, sum by (op) (rate(CELLS_bridge_op_total{result="error"}[10m])))
+
+            Per-op interpretation:
+              - op="lock": secret-generation failed, or the
+                source-chain lock state is stuck. Inspect
+                generateSecret / generateLockID call paths.
+              - op="redeem": invalid-secret spam (adversarial
+                or buggy redeemer client) OR cross-chain
+                proof failures. Cross-reference with
+                CELLS_p2p_messages_total — a redeem-error
+                burst with no other p2p activity hints at
+                spam.
+              - op="refund": post-expiry recovery is failing
+                — locks aren't transitioning to LockStatusRefunded.
+                This is the highest-stakes case: funds are
+                stuck. Investigate immediately.
+
+  # =====================================================================
+  # CELLS-reputation — peer-reputation tracker health
+  #
+  # The reputation tracker is the primary defence against
+  # misbehaving peers (invalid blocks, invalid txs, protocol
+  # violations) — it scores them down and bans them when
+  # they cross the BanThreshold (-200 default). A high
+  # banned-ratio is either a real attack OR a sign the
+  # penalty config is too aggressive; either way it
+  # warrants operator attention.
+  #
+  # Metrics scoped by tracker= label:
+  #   tracker="tx"        — DefaultReputationConfig (lenient)
+  #   tracker="evidence"  — ReputationConfigForEvidence (strict)
+  # =====================================================================
+  - name: CELLS-reputation
+    rules:
+      - alert: CELLSReputationBanRatioHigh
+        # banned/total > 50% sustained for 10m on a tracker
+        # that has at least 4 peers (filters out the
+        # "1-of-2-peers banned" noise on tiny dev clusters).
+        # Either a real attack from a majority of peers
+        # (very rare; quarantine should kick in first), or
+        # a penalty-config regression that's mass-banning
+        # honest peers.
+        expr: |
+          (CELLS_reputation_peers_banned / CELLS_reputation_peers_total) > 0.5
+          and CELLS_reputation_peers_total >= 4
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-reputation
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/REPUTATION_INCIDENT.md#31-mode-a--CELLSreputationbanratiohigh"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-reputation-incident.json"
+          summary: "{{ $labels.instance }}: {{ $labels.tracker }} ban ratio > 50% for ≥10m"
+          description: |
+            CELLS_reputation_peers_banned /
+            CELLS_reputation_peers_total on
+            {{ $labels.instance }} (tracker={{ $labels.tracker }})
+            has been > 0.5 for ≥10m with ≥4 tracked peers.
+            Either a coordinated attack against this node OR
+            a penalty-config regression mass-banning honest
+            peers.
+
+            Triage:
+              - Inspect AllPeers() via the admin API
+                (or equivalent endpoint exposing the
+                tracker's BannedPeers list). If the banned
+                set is dominated by repeated misbehaviour
+                from peers that pre-date the alert, this is
+                an attack. If the banned set is recent and
+                the misbehaviour counts are low, the
+                penalty config has shifted (e.g. someone
+                tightened InvalidTxWeight without thinking
+                through the cascade).
+              - Cross-check tracker="evidence" vs.
+                tracker="tx": if both show high ban ratios
+                concurrently, the cause is likely systemic;
+                if only one, the cause is per-tracker
+                config or per-tracker traffic shape.
+              - Cross-check CELLS_quarantine_* — if a
+                majority of peers are also quarantined by
+                submesh policy, the failure is upstream of
+                reputation.
+
+      - alert: CELLSReputationScoreCollapse
+        # min-score sliding toward the BanThreshold across
+        # the whole peer set. Drift signal — if min-score
+        # has been below -100 (halfway to ban) for ≥30m on
+        # a non-trivial peer set, peers are accumulating
+        # penalties faster than the decay can pull them
+        # back. Often a precursor to CELLSReputationBanRatioHigh.
+        expr: |
+          CELLS_reputation_score_min < -100
+          and CELLS_reputation_peers_total >= 4
+        for: 30m
+        labels:
+          severity: info
+          subsystem: v2-reputation
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/REPUTATION_INCIDENT.md#32-mode-b--CELLSreputationscorecollapse"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-reputation-incident.json"
+          summary: "{{ $labels.instance }}: {{ $labels.tracker }} min-score < -100 for ≥30m"
+          description: |
+            CELLS_reputation_score_min on
+            {{ $labels.instance }} (tracker={{ $labels.tracker }})
+            has been below -100 (halfway to ban) for ≥30m
+            with ≥4 tracked peers. Penalties are
+            accumulating faster than the configured
+            DecayInterval/DecayFactor can pull them back.
+            Often a precursor to CELLSReputationBanRatioHigh
+            (Mode A) — read the next 30m of trend before
+            paging up.
+
+  # =====================================================================
+  # CELLS-hot-reload — runtime config hot-reload health
+  #
+  # The hot-reload subsystem applies config changes without
+  # a validator restart. Two failure shapes matter:
+  #   1. apply_failure_total climbing — applies (real
+  #      config swaps) are being rejected by the in-process
+  #      reload path. Validator is running on stale config.
+  #   2. last_dry_run_load_ok == 0 sustained — the on-disk
+  #      config can't even parse cleanly. The next planned
+  #      apply will fail.
+  # =====================================================================
+  - name: CELLS-hot-reload
+    rules:
+      - alert: CELLSHotReloadApplyFailures
+        # Any sustained rate of failed applies. Threshold is
+        # >0/5m sustained for 10m — a single transient
+        # failure shouldn't page, but consistent failures
+        # mean live config swaps are jammed.
+        expr: |
+          rate(CELLS_hot_reload_apply_failure_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: v2-hotreload
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/HOT_RELOAD_INCIDENT.md#31-mode-a--CELLShotreloadapplyfailures"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-hot-reload-incident.json"
+          summary: "{{ $labels.instance }}: hot-reload apply failures sustained for ≥10m"
+          description: |
+            CELLS_hot_reload_apply_failure_total on
+            {{ $labels.instance }} has been incrementing for
+            ≥10m. Live config-swap attempts are being
+            rejected by the in-process reload path; the
+            validator is running on the previous config
+            until the swap path is fixed.
+
+            Likely:
+              - On-disk config has a syntactic / semantic
+                regression (the dry-run guard would catch
+                this — see CELLSHotReloadDryRunDegraded).
+              - A reloader hook (subsystem-specific
+                Apply()) is failing — read the validator
+                logs for the specific subsystem error.
+              - Lock contention on a config-mutex if a
+                deploy script is hammering the apply
+                endpoint.
+
+      - alert: CELLSHotReloadDryRunDegraded
+        # Last dry-run failed to load OR failed policy, AND
+        # a dry-run has actually been attempted (timestamp
+        # != 0). Filters out cold-start nodes that haven't
+        # yet attempted a dry-run.
+        expr: |
+          (CELLS_hot_reload_last_dry_run_load_ok == 0
+           or CELLS_hot_reload_last_dry_run_policy_ok == 0)
+          and CELLS_hot_reload_last_dry_run_timestamp > 0
+        for: 30m
+        labels:
+          severity: info
+          subsystem: v2-hotreload
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/HOT_RELOAD_INCIDENT.md#32-mode-b--CELLShotreloaddryrundegraded"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-hot-reload-incident.json"
+          summary: "{{ $labels.instance }}: last hot-reload dry-run failed load or policy for ≥30m"
+          description: |
+            On {{ $labels.instance }} the most-recent
+            hot-reload dry-run reports
+            CELLS_hot_reload_last_dry_run_load_ok == 0 or
+            CELLS_hot_reload_last_dry_run_policy_ok == 0
+            sustained for ≥30m. The on-disk config either
+            doesn't parse cleanly or fails the policy
+            guard. The next planned apply WILL fail —
+            this is the precursor signal to
+            CELLSHotReloadApplyFailures.
+
+  # -----------------------------------------------------------------
+  # CELLS-security — MED-8 security event counters
+  # -----------------------------------------------------------------
+  # Surfaces the 11 atomic counters published by
+  # pkg/monitoring/security_metrics.go under the
+  # CELLS_security_* prefix. These counters are
+  # recorded from every middleware in the chain
+  # documented in pkg/api/server.go::setupMiddleware
+  # (SecurityHeaders → CORS → Audit → Deprecation →
+  # RequestTimeout → RateLimit → CSRF →
+  # RequestSigning → Auth → AdminAccess → mux), so
+  # an alert firing here pins the failure to a
+  # specific layer of the request-processing stack.
+  # The compatible runbook is SECURITY_INCIDENT.md;
+  # per-alert anchors are linked in each rule below.
+  # Thresholds chosen so a healthy operator-only
+  # node (admin login from a tooling jumpbox a few
+  # times a day, occasional SDK refresh) does NOT
+  # alarm — every threshold is calibrated against
+  # the SECURITY_AUDIT.md baseline traffic profile.
+  - name: CELLS-security
+    rules:
+      - alert: CELLSSecurityFailedLoginBurst
+        # >1 failed-login/sec sustained for 10m is well
+        # above the legitimate fat-fingered-password
+        # baseline and below the rate-limit threshold —
+        # the gap is exactly the credential-stuffing /
+        # password-spray window.
+        expr: rate(CELLS_security_failed_logins_total[5m]) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#31-CELLSsecurityfailedloginburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: failed-login rate >1/s for 10m"
+          description: |
+            CELLS_security_failed_logins_total is climbing
+            at >1/s sustained for 10m. The AccountLockout
+            middleware has not yet tripped (otherwise
+            CELLSSecurityAccountLockoutBurst would also be
+            firing), which means the attacker is either
+            spraying many usernames OR the lockout
+            threshold is set too high for the observed
+            attack rate. SECURITY_INCIDENT.md §3.1 lists
+            the standard triage: tail audit log for the
+            distinct username count and source-IP /16
+            distribution, then decide between
+            CELLS_LOCKOUT_THRESHOLD tightening (single
+            target) or an upstream WAF block list
+            (many targets / few IPs).
+
+      - alert: CELLSSecurityAccountLockoutBurst
+        # AccountLockoutManager only fires after N
+        # consecutive failures. >5 distinct lockouts
+        # in 15m means a coordinated, multi-user
+        # attack landed past the password layer —
+        # promote to HIGH severity.
+        expr: increase(CELLS_security_account_lockouts_total[15m]) > 5
+        for: 5m
+        labels:
+          severity: critical
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#32-CELLSsecurityaccountlockoutburst"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: >5 account lockouts in 15m"
+          description: |
+            CELLS_security_account_lockouts_total
+            incremented by >5 in 15m. The lockout
+            manager only fires after the configured
+            consecutive-failure threshold, so this
+            represents at least 5 distinct accounts
+            that absorbed enough wrong-password
+            attempts to trigger lockout — a strong
+            signal of a coordinated credential-spray
+            or stolen-password-dump replay. Cross-
+            reference CELLSSecurityFailedLoginBurst
+            (should be co-firing) and capture the
+            full audit log slice for forensics
+            before the rate decays.
+
+      - alert: CELLSSecurityRateLimitViolationSpike
+        # >5 rate-limit-rejections/sec sustained for 10m
+        # = scraper / scripted client / DoS. Below this
+        # threshold a single misbehaving SDK can show
+        # transient rate-limit hits without it being an
+        # attack — so we want a conservative trigger.
+        expr: rate(CELLS_security_rate_limit_violations_total[5m]) > 5.0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#33-CELLSsecurityratelimitviolationspike"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: rate-limit rejections >5/s for 10m"
+          description: |
+            CELLS_security_rate_limit_violations_total
+            is incrementing at >5/s sustained for 10m.
+            Per-IP and per-role limits are tripping
+            faster than legitimate traffic ever would.
+            Triage by aggregating the audit log on
+            client_ip — if the offender is a single
+            /32 it is almost certainly a script and
+            can be hard-blocked at the LB; if the
+            offender is a wide /16 the rate-limit
+            tier should hold the line on its own
+            (legitimate burst, no action needed).
+
+      - alert: CELLSSecurityCSRFFailureSpike
+        # CSRF failures from a healthy browser SDK
+        # should be ZERO once a client picks up its
+        # token. Sustained >0.1/s for 5m → either an
+        # active CSRF probe OR a deployed client that
+        # forgot to wire X-CSRF-Token, both worth
+        # immediate paging.
+        expr: rate(CELLS_security_csrf_failures_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#34-CELLSsecuritycsrffailurespike"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: CSRF failures >0.1/s for 5m"
+          description: |
+            CELLS_security_csrf_failures_total is
+            incrementing at >0.1/s sustained for 5m.
+            CSRFMiddleware rejected a state-changing
+            request because either the X-CSRF-Token
+            header was missing/mismatched against the
+            CELLS_csrf cookie, OR the synchronizer-
+            token store rejected it (expired / not
+            issued / user-bind mismatch). A healthy
+            browser SDK that fetched the token from
+            GET /api/v1/csrf-token should never
+            trigger this — so the alert means either
+            an active attack probe OR a freshly-
+            deployed client that skipped the
+            handshake. The audit log entry names
+            which of the two conditions tripped.
+
+      - alert: CELLSSecurityInvalidTokenSpike
+        # Stale JWTs from an old client deploy will
+        # produce a one-shot burst that decays in
+        # minutes. Sustained >1/s for 10m is a brute-
+        # force JWT forgery attempt OR a wholly-broken
+        # signing key on a peer / SDK.
+        expr: rate(CELLS_security_auth_invalid_token_total[5m]) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#35-CELLSsecurityinvalidtokenspike"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: invalid-JWT rate >1/s for 10m"
+          description: |
+            CELLS_security_auth_invalid_token_total is
+            climbing at >1/s sustained for 10m.
+            AuthMiddleware rejected presented JWTs as
+            signature-invalid, expired, or unparseable.
+            One-shot bursts are expected immediately
+            after a server-side ML-DSA key rotation —
+            the alert's 10m for: filters that. A
+            sustained signal means a probe is trying
+            forged JWTs OR an SDK was deployed with
+            the wrong issuer / audience / signing key.
+
+      - alert: CELLSSecurityTokenRevokedHit
+        # ANY hit on a revoked-token nonce is by
+        # definition post-logout replay. We do not
+        # want to ride out a 10-minute window
+        # waiting for "enough" hits — one is enough.
+        expr: increase(CELLS_security_token_revoked_hits_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#36-CELLSsecuritytokenrevokedhit"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: revoked-JWT replay attempt"
+          description: |
+            CELLS_security_token_revoked_hits_total
+            incremented in the last 15m. The
+            TokenRevocationStore caught a JWT that
+            its rightful owner had explicitly logged
+            out (POST /api/v1/auth/logout). Because
+            the token's signature was still valid
+            (otherwise AuthMiddleware would have
+            failed earlier), the replayer holds a
+            copy of the raw JWT — i.e. the token
+            leaked. Treat as a credential-compromise
+            event. SECURITY_INCIDENT.md §3.6 walks
+            through the forensic capture, the
+            mandatory rotation of the user's
+            keystore, and the audit-log evidence
+            preservation steps.
+
+      - alert: CELLSSecurityRequestSignatureFailureSpike
+        # The request-signing middleware verifies a
+        # client-attached HMAC over (method, path,
+        # body, ts). Failures are typically
+        # operator-error during SDK rollout, but
+        # sustained >0.1/s for 5m is a tamper signal
+        # worth investigating.
+        expr: rate(CELLS_security_request_signature_failed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#37-CELLSsecurityrequestsignaturefailurespike"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: request signature failures >0.1/s for 5m"
+          description: |
+            CELLS_security_request_signature_failed_total
+            is climbing at >0.1/s sustained for 5m.
+            RequestSigningMiddleware rejected the
+            HMAC over (method, path, body, ts) on
+            inbound requests. Likely causes, in
+            descending order of probability:
+              1. SDK upgrade without the matching
+                 secret update.
+              2. Clock skew between client and
+                 server > MaxClockSkew (30s).
+              3. Active man-in-the-middle tampering
+                 with bodies of in-flight requests.
+
+      - alert: CELLSSecurityRequestTimeoutSpike
+        # Per-request context timeout (MED-5) hits
+        # are a slow-handler signal in normal
+        # operation, but sustained >0.5/s for 10m
+        # while overall request rate is steady is
+        # the classic Slowloris fingerprint.
+        expr: rate(CELLS_security_request_timeout_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#38-CELLSsecurityrequesttimeoutspike"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: per-request timeouts >0.5/s for 10m"
+          description: |
+            CELLS_security_request_timeout_total is
+            incrementing at >0.5/s sustained for 10m.
+            RequestTimeoutMiddleware cancelled the
+            handler context after the 30s deadline.
+            Triage by correlating with handler-
+            latency histograms — if a single route
+            dominates, it is a code-path bug; if
+            the distribution is flat across routes,
+            it is a connection-holding attacker
+            (Slowloris / hold-and-stall) and the
+            mitigation is an upstream Read/Write
+            timeout reduction at the LB / proxy.
+
+      - alert: CELLSSecurityCORSRejectionSpike
+        # CORS rejections from a properly-configured
+        # SDK are normally zero. >1/s sustained for
+        # 10m is a deployed client that lost its
+        # origin entry OR an unauthorised cross-
+        # origin probe.
+        expr: rate(CELLS_security_cors_rejections_total[5m]) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          subsystem: security
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/SECURITY_INCIDENT.md#39-CELLSsecuritycorsrejectionspike"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: "{{ $labels.instance }}: CORS rejections >1/s for 10m"
+          description: |
+            CELLS_security_cors_rejections_total is
+            climbing at >1/s sustained for 10m.
+            CORSMiddleware rejected a browser
+            preflight or actual request because its
+            Origin header did not appear in the
+            CELLS_CORS_ALLOWED_ORIGINS allowlist.
+            Triage by aggregating on the rejected
+            Origin: a single repeated value means
+            a missing entry on the allowlist; a wide
+            distribution is a scanner that should be
+            ignored.
+
+  # -----------------------------------------------------------------
+  # v2 peer-attester (Public Challenge Issuer) tunnel liveness
+  # -----------------------------------------------------------------
+  # Each [[peer]] in /opt/CELLS/peer_signers.toml that is also
+  # reachable over the reverse tunnel (CELLS-attester home-side +
+  # CELLS-relay BLR1-side + Caddy /attest/* route) gets a Prometheus
+  # scrape job named CELLS-peer-attester-<slot>. up=0 sustained
+  # 5m means the validator's Tier-2 telemetry oracle has lost its
+  # 5-minute reference-profile feed: NOT a fatal consensus event,
+  # but the validator silently falls back on its own attester for
+  # the GPU SKU catalog, weakening the anti-spoof posture. The
+  # alert is warning (not page) because spec-check tolerates the
+  # fallback for hours; the operator should fix it within shift.
+  - name: CELLS-v2-peer-attester
+    rules:
+      - alert: CELLSPeerAttesterAbsent
+        # up=0 sustained 5m. Five-minute window is one
+        # full CELLS_PEER_ATTESTER_REFRESH interval; we
+        # want to alert AFTER the validator's next
+        # scheduled fetch would also fail, not before.
+        expr: |
+          up{job=~"CELLS-peer-attester-.+"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: v2-peer-attester
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/DEPLOYMENT_TOPOLOGY.md#mode-a--CELLSpeerattesterabsent"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-deployment-topology.json"
+          summary: "{{ $labels.peer_slot }}: peer attester unreachable via tunnel for >=5m"
+          description: |
+            Prometheus has been unable to scrape
+            {{ $labels.peer_slot }} (signer_id={{
+            $labels.peer_signer_id }}) for >=5m. The
+            Tier-2 telemetry oracle on this validator
+            depends on a successful 5-minute fetch
+            from
+            https://api.CELLS.tech/attest/{{ $labels.peer_slot }}/api/v1/telemetry/reference;
+            when that fetch fails the validator
+            silently falls back on its own attester
+            for the GPU SKU catalog, weakening the
+            anti-spoof posture.
+
+            Triage map (DEPLOYMENT_TOPOLOGY.md §6
+            failure modes):
+              - 502 on the public path -> home
+                attester process down; restart the
+                launcher on the home box (runbook §5).
+              - 401 on the public path -> Caddy is
+                mis-routing /attest/* to the main
+                API; re-apply the handle_path directive
+                (§2) and `systemctl restart caddy`.
+              - timeout -> Caddy or the relay itself
+                is down; check
+                `systemctl status caddy CELLS-relay`.
+
+  # -----------------------------------------------------------------
+  # rotation-05: secret / cert rotation monitoring
+  # -----------------------------------------------------------------
+  # The CELLS_security_secret_days_until_expiry gauge is emitted by
+  # pkg/monitoring/expiry_gauge.go. Two semantics live in one
+  # series — distinguished by the `kind` label:
+  #
+  #   * kind="tls_cert" / "mtls_client_ca": value = (NotAfter - now)
+  #     in days. POSITIVE while the cert is still valid, NEGATIVE
+  #     once it expires. Alert on `< 30` to fire 30 days before
+  #     expiry, `< 7` for the urgent rotation window.
+  #
+  #   * kind="jwt_primary" / "request_sig_primary" /
+  #     "jwt_secondary" / "request_sig_secondary": value =
+  #     -(age-since-set in days). The trick is intentional — the
+  #     gauge is uniformly "negative means worse, positive means
+  #     better" so a single dashboard panel reads naturally. Alert
+  #     on `<= -90` for the primary keys to fire when an HMAC
+  #     secret has been in place longer than the rotation policy.
+  #     Secondary kinds: alert on `<= -7` to fire when a rotation
+  #     window has been left open for more than a week (the JWT
+  #     rotation runbook prescribes 24h-7d depending on token TTL).
+  - name: CELLS-secret-rotation
+    rules:
+      - alert: CELLSTLSCertNearExpiry
+        expr: |
+          CELLS_security_secret_days_until_expiry{kind=~"tls_cert|mtls_client_ca"} < 30
+        for: 1h
+        labels:
+          severity: warning
+          audit_row: rotation-05
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/MTLS_CERT_ROTATION.md#31-CELLStlscertnearexpiry"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: |
+            TLS / mTLS cert near expiry (<30 days)
+          description: |
+            CELLS_security_secret_days_until_expiry for
+            kind={{ $labels.kind }} subject={{ $labels.subject }}
+            has dropped below 30 days. Rotate the cert
+            (autocert renews automatically; manual deploys
+            follow the mTLS rotation runbook). Once the new
+            cert is loaded the gauge will jump back to
+            (new NotAfter - now), so this alert auto-resolves
+            on successful rotation.
+
+      - alert: CELLSTLSCertCriticalExpiry
+        expr: |
+          CELLS_security_secret_days_until_expiry{kind=~"tls_cert|mtls_client_ca"} < 7
+        for: 15m
+        labels:
+          severity: critical
+          audit_row: rotation-05
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/MTLS_CERT_ROTATION.md#32-CELLStlscertcriticalexpiry"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: |
+            TLS / mTLS cert CRITICALLY near expiry (<7 days)
+          description: |
+            kind={{ $labels.kind }} subject={{ $labels.subject }}
+            cert is within 7 days of expiry — rotate NOW.
+            A negative value means the cert has already
+            expired; any incoming TLS handshake will fail.
+
+      - alert: CELLSJWTPrimaryKeyAgedOut
+        expr: |
+          CELLS_security_secret_days_until_expiry{kind=~"jwt_primary|request_sig_primary"} <= -90
+        for: 6h
+        labels:
+          severity: warning
+          audit_row: rotation-05
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/JWT_KEY_ROTATION.md#31-CELLSjwtprimarykeyagedout"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: |
+            JWT / request-sig primary HMAC older than 90d — rotate
+          description: |
+            The primary HMAC key for kind={{ $labels.kind }}
+            subject={{ $labels.subject }} was set more than 90
+            days ago (gauge value <= -90). CELLS's rotation
+            policy is 90 days; install a new primary and use
+            the dual-accept secondary path documented in the
+            JWT_KEY_ROTATION runbook. Setting a new primary
+            resets the gauge so this alert auto-resolves on
+            cutover.
+
+      - alert: CELLSJWTSecondaryKeyWindowLeftOpen
+        expr: |
+          CELLS_security_secret_days_until_expiry{kind=~"jwt_secondary|request_sig_secondary"} <= -7
+        for: 1h
+        labels:
+          severity: warning
+          audit_row: rotation-05
+        annotations:
+          runbook_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/runbooks/JWT_KEY_ROTATION.md#32-CELLSjwtsecondarykeywindowleftopen"
+          dashboard_url: "https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/grafana/dashboards/CELLS-runbook-security-incident.json"
+          summary: |
+            JWT secondary HMAC rotation window left open >7d
+          description: |
+            The rotation runbook gates "cutover complete" on
+            CELLS_security_jwt_secondary_key_hits_total going
+            flat. If it's been flat AND the window has been
+            open for more than 7 days, the operator has likely
+            forgotten to clear the secondary. Clear with
+            CELLS_JWT_HMAC_SECRET_SECONDARY="" + systemctl
+            restart CELLS (calls
+            SetJWTHMACFallbackSecondarySecret("") +
+            ClearSecretExpiry, so this alert auto-resolves).

@@ -1,0 +1,78 @@
+/* humanstxt.org — the humans responsible & technology colophon */
+
+/* TEAM */
+
+  Project lead, sole founder: Joedel Lopez Dalioan (Blackbeard)
+  GitHub:                     https://github.com/blackbeardONE
+  Project:                    https://github.com/blackbeardONE/CELLS
+  Location:                   Manila, Philippines
+
+  AI pair-programming partner: Cursor / Claude (sessions 60+ — every
+  source file with a "session N" comment was co-edited in a Cursor
+  session, with all decisions, deploys, and signatures owned by the
+  human above).
+
+
+/* THANKS */
+
+  The CELLS public network stands on the shoulders of these open-source
+  projects (full list in CELLS/source/go.mod):
+
+  - libp2p           — peer-to-peer networking
+  - cloudflare/circl — post-quantum signatures (ML-DSA-87 / FIPS 204)
+  - wazero          — pure-Go WebAssembly runtime for smart contracts
+  - Caddy           — TLS termination + reverse proxy at the edge
+  - Prometheus      — operational metrics scrape target
+  - Grafana         — dashboard rendering
+
+  And to every operator running a validator, miner, Hive, or Relay against
+  the public network — your bug reports, log paste-ins, and "this
+  doesn't work" pings are why the public audit score is where it
+  is. Thank you.
+
+
+/* SITE */
+
+  Last update:  2026-08-04
+  Language:     English
+  Doctype:      HTML5
+  Standards:    HTML5, CSS3, JSON-LD (schema.org/SoftwareApplication), RFC 9116
+  Components:   Vanilla HTML + CSS + JavaScript — no build step,
+                no React, no bundler. Marketing pages are hand-edited.
+                The docs SPA at /docs/ fetches Markdown from GitHub main.
+                The browser wallet at /wallet.html embeds /wallet.wasm
+                (cloudflare/circl ML-DSA-87 compiled to WebAssembly).
+  Software:     Backend in Go, frontend in vanilla JS, edge in
+                Caddy, observability in Prometheus + Grafana, source
+                control in git/GitHub. Desktop client: CELLS Hive.
+
+  Product surfaces:
+    /                             — protocol-first landing (Network + Hive/CELL)
+    /network.html                 — live public CELL network and custody boundary
+    /download.html                — Hive 1.4.15 + Wallet Extension 0.5.1 + Edge Control 1.3.7
+    /account/                     — optional identity + linked public wallet dashboard
+    /docs/                        — knowledge-base SPA
+    /wallet.html                  — browser web wallet (ML-DSA-87)
+    /explorer.html                — blocks, txs, accounts + live tip status
+    /validators.html              — bootstrap peers
+    /chain.html                   — redirect alias → /explorer.html#status
+    /api.html                     — HTTP v1 vs mining v2 explainer
+    https://CELLS.online/          — CELLS VPN product and Android release
+
+  Primary nav (canonical):
+    Network ▾ · Hive ▾ · Docs · Trust ▾
+    CTA: Account · Download
+    Network → Overview, Explorer, API, Validators
+    Hive → Download Hive, CELLS Account, Web wallet, CELLS VPN
+    Trust → Public audit, Attestations
+
+  Transparency surfaces:
+    /audit.html                   — public audit checklist
+    /api/v1/audit/summary         — machine-readable score + counts
+    /api/v1/audit/items           — machine-readable per-row list
+    /api/v1/audit/badge.svg       — embeddable SVG badge
+    /trust.html                   — recent attestations + scope notes
+    /api/v1/trust/attestations/*  — machine-readable attestation feed
+    /.well-known/security.txt     — RFC 9116 security disclosure
+    /sitemap.xml                  — site index
+    /humans.txt                   — this file

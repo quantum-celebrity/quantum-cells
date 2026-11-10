@@ -1,0 +1,64 @@
+# Quick start
+
+Five minutes from nothing to a CELL wallet on the CELLS pilot network
+(pre-mainnet). Pick the path that fits you.
+
+## 1. Look at the network (no install)
+
+- Open the [explorer](https://CELLS.tech/explorer.html) to see blocks as they
+  arrive (about one every 10 seconds).
+- Or ask the API directly:
+
+  ```bash
+  curl -s https://api.CELLS.tech/api/v1/status
+  ```
+
+  [Network status](NETWORK_STATUS.md) explains every field.
+
+## 2. Get a wallet
+
+**In the browser:** open the [web wallet](https://CELLS.tech/wallet.html), create
+a wallet and choose a strong passphrase. Your ML-DSA-87 key is generated and
+encrypted on your device. Download the encrypted backup and keep it safe.
+More: [Web wallet](WEB_WALLET.md).
+
+**On the desktop:** install CELLS Hive 1.4.22 for Windows or Linux from the
+[download page](https://CELLS.tech/download.html), check the file hash
+([how](DOWNLOADS_AND_VERIFICATION.md)), then open **Settings → Wallet → Create
+New Wallet** and write down the 24 recovery words.
+
+Your address is 64 hexadecimal characters. Share it to receive CELL.
+
+## 3. Check a balance
+
+```bash
+curl -s "https://api.CELLS.tech/api/v1/wallet/balance?address=<your address>"
+```
+
+## 4. Send CELL
+
+Use **Send** in the web wallet or in Hive. The wallet fetches your next nonce,
+picks committed parent transactions
+([Proof-of-Entanglement](PROOF_OF_ENTANGLEMENT.md), required since block
+816,600), signs the transfer with ML-DSA-87 and submits it; it is included in
+the next block. Use Hive 1.4.22 or newer, or the web wallet. Developers can do the same through `POST /api/v1/wallet/submit-signed`
+([API reference](API_REFERENCE.md#post-walletsubmit-signed)).
+
+## 5. Mine (NVIDIA GPU)
+
+Mining runs in CELLS Hive on NVIDIA GPUs (Turing or newer). It is open to every
+enrolled miner, in 7-day windows that renew automatically; Hive enrolls your
+GPU for you. See [Mining today](MINING_TODAY.md) for the current state and the
+full walkthrough.
+
+## Before you store value
+
+CELLS is a pilot network whose blocks come from one producer run by the project, and it
+has not had an independent external audit. Read the
+[Security model](SECURITY_MODEL.md).
+
+## Building the node from source
+
+Developers who want to build and run the Go node locally should start with the
+repository [README](https://github.com/blackbeardONE/CELLS/blob/main/CELLS/README.md)
+and the [Operator guide](OPERATOR_GUIDE.md).

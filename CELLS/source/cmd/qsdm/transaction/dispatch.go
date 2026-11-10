@@ -1,0 +1,87 @@
+package transaction
+
+import (
+	"bytes"
+	"encoding/json"
+
+	"github.com/blackbeardONE/CELLS/internal/logging"
+	"github.com/blackbeardONE/CELLS/pkg/consensus"
+	"github.com/blackbeardONE/CELLS/pkg/mesh3d"
+	"github.com/blackbeardONE/CELLS/pkg/monitoring"
+	"github.com/blackbeardONE/CELLS/pkg/quarantine"
+	"github.com/blackbeardONE/CELLS/pkg/submesh"
+	"github.com/blackbeardONE/CELLS/pkg/wasm"
+)
+
+type storageAdapter struct {
+	store func([]byte) error
+	close func() error
+}
+
+func (a storageAdapter) StoreTransaction(tx []byte) error { return a.store(tx) }
+func (a storageAdapter) Close() error                       { return a.close() }
+
+// AdaptStorage wraps main's (or any) storage value that exposes StoreTransaction and Close.
+func AdaptStorage(s interface {
+	StoreTransaction(tx []byte) error
+	Close() error
+}) Storage {
+	if s == nil {
+		return nil
+	}
+	return storageAdapter{
+		store: s.StoreTransaction,
+		close: s.Close,
+	}
+}
+
+// DispatchDeps carries dependencies for inbound pubsub transaction dispatch.
+type DispatchDeps struct {
+	Logger            *logging.Logger
+	Msg               []byte
+	DynamicManager    *submesh.DynamicSubmeshManager
+	WasmSdk           *wasm.WASMSDK
+	Consensus         *consensus.ProofOfEntanglement
+	Storage           Storage
+	NvidiaGate        *monitoring.NvidiaLockP2PGate
+	Mesh3dValidator   *mesh3d.Mesh3DValidator
+	QuarantineManager *quarantine.QuarantineManager
+	ReputationManager *quarantine.ReputationManager
+	// ParentCheck applies this node's Proof-of-Entanglement history rules
+	// (parents must be committed transactions) after the signature and
+	// structure checks. Nil skips it.
+	ParentCheck ParentCheck
+}
+
+// DispatchInboundP2P routes a single pubsub payload to the correct handler:
+//   - Envelope kind "CELLS_mesh3d_v1" → mesh3d / phase-3 path
+//   - Otherwise JSON matching ParseTransaction → wallet / JSON transaction path
+//
+// When the same logical wallet transaction is published twice (raw JSON plus mesh companion wrapping
+// the same JSON), the second ingress is dropped by shared tx-id dedupe (see wallet_ingress_dedupe.go).
+//
+// Unrecognized payloads are ignored (debug log only) so the topic can carry other JSON in future.
+func DispatchInboundP2P(d DispatchDeps) {
+	msg := bytes.TrimSpace(d.Msg)
+	if len(msg) == 0 || d.Logger == nil {
+		return
+	}
+
+	if tx, sub, err := ParsePhase3Wire(msg); err == nil {
+		if d.Mesh3dValidator == nil {
+			d.Logger.Warn("mesh3d wire message dropped: validator not initialized")
+			return
+		}
+		handlePhase3MeshTx(d.Logger, tx, sub, d.Mesh3dValidator, d.QuarantineManager, d.ReputationManager, d.Consensus, d.Storage, d.NvidiaGate, d.ParentCheck)
+		return
+	}
+
+	if json.Valid(msg) && msg[0] == '{' {
+		if _, err := ParseTransaction(msg); err == nil {
+			handleTransaction(d.Logger, msg, d.DynamicManager, d.WasmSdk, d.Consensus, d.Storage, d.NvidiaGate, d.ParentCheck)
+			return
+		}
+	}
+
+	d.Logger.Debug("ignored pubsub payload (not wallet tx or mesh3d wire)", "len", len(msg))
+}

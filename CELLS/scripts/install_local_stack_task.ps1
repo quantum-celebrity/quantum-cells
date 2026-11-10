@@ -1,0 +1,140 @@
+param(
+    [string]$CELLSRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+    [string]$Relay = "",
+    [string]$Slot = "",
+    [string]$TaskName = "CELLS-Local-Stack",
+    [int]$IntervalSeconds = 30,
+    [int]$RestartAfterFailures = 10,
+    [int]$GatewayRestartAfterFailures = 3,
+    [switch]$NoPublicGatewayCheck,
+    [switch]$Highest,
+    [switch]$AtStartup,
+    [switch]$AsSystem,
+    [switch]$RemoveStartupFallback,
+    [switch]$NoStartupFallback,
+    [switch]$NoRunNow
+)
+
+$ErrorActionPreference = "Stop"
+
+if ($AsSystem) {
+    $AtStartup = $true
+    $Highest = $true
+}
+
+$CELLSRoot = (Resolve-Path $CELLSRoot).Path
+. (Join-Path $CELLSRoot "scripts\lib\CELLS-endpoints.ps1")
+$Relay = Resolve-CELLSEndpointValue -Value $Relay -Name "home_gateway_relay" -EnvVar "CELLS_HOME_GATEWAY_RELAY"
+$Slot = Resolve-CELLSEndpointValue -Value $Slot -Name "home_gateway_slot" -EnvVar "CELLS_HOME_GATEWAY_SLOT"
+$WatchdogScript = Join-Path $CELLSRoot "scripts\watch_local_stack.ps1"
+$LocalRoot = Join-Path $CELLSRoot "source\.cache\local-validator"
+$LogPath = Join-Path $LocalRoot "local-stack-task-install.log"
+New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
+
+function Write-InstallLog {
+    param([string]$Message)
+    $stamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssK"
+    Add-Content -LiteralPath $LogPath -Value "$stamp $Message"
+}
+
+if (-not (Test-Path -LiteralPath $WatchdogScript)) {
+    throw "Missing watchdog script: $WatchdogScript"
+}
+
+$watchdogArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WatchdogScript`" -CELLSRoot `"$CELLSRoot`" -Relay `"$Relay`" -Slot `"$Slot`" -IntervalSeconds $IntervalSeconds -RestartAfterFailures $RestartAfterFailures -GatewayRestartAfterFailures $GatewayRestartAfterFailures"
+if (-not $NoPublicGatewayCheck) {
+    $watchdogArgs += " -CheckPublicGateway"
+} else {
+    $watchdogArgs += " -NoPublicGatewayCheck"
+}
+$taskRun = "powershell.exe $watchdogArgs"
+
+Write-InstallLog "install requested task=$TaskName highest=$Highest at_startup=$AtStartup as_system=$AsSystem root=$CELLSRoot check_public_gateway=$(-not $NoPublicGatewayCheck.IsPresent)"
+
+try {
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $watchdogArgs -WorkingDirectory $CELLSRoot
+    $triggers = @()
+    if ($AtStartup) {
+        $triggers += New-ScheduledTaskTrigger -AtStartup
+    }
+    if (-not $AsSystem) {
+        $triggers += New-ScheduledTaskTrigger -AtLogOn
+    }
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -MultipleInstances IgnoreNew
+    if ($AsSystem) {
+        $runLevel = "Highest"
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId "SYSTEM" `
+            -LogonType ServiceAccount `
+            -RunLevel Highest
+    } else {
+        $runLevel = if ($Highest) { "Highest" } else { "Limited" }
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+            -LogonType Interactive `
+            -RunLevel $runLevel
+    }
+
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger $triggers `
+        -Settings $settings `
+        -Principal $principal `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop)) {
+        throw "Scheduled task registration returned without creating $TaskName"
+    }
+
+    Write-InstallLog "registered scheduled task run_level=$runLevel principal=$($principal.UserId) trigger_count=$($triggers.Count)"
+} catch {
+    Write-InstallLog "scheduled task registration failed: $($_.Exception.Message)"
+    if ($NoStartupFallback) {
+        throw "Failed to create scheduled task $TaskName`: $($_.Exception.Message)"
+    }
+    $startup = [Environment]::GetFolderPath("Startup")
+    if ([string]::IsNullOrWhiteSpace($startup)) {
+        throw "Failed to create scheduled task $TaskName and could not locate the Startup folder"
+    }
+    New-Item -ItemType Directory -Force -Path $startup | Out-Null
+    $launcher = Join-Path $startup "$TaskName.vbs"
+    $vbsCommand = $taskRun.Replace('"', '""')
+    Set-Content -LiteralPath $launcher -Encoding ASCII -Value @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run "$vbsCommand", 0, False
+"@
+    Write-Host "Scheduled task creation was denied; installed Startup launcher instead: $launcher"
+    if (-not $NoRunNow) {
+        Start-Process -FilePath "wscript.exe" -ArgumentList "`"$launcher`"" -WindowStyle Hidden
+    }
+    exit 0
+}
+
+if ($RemoveStartupFallback) {
+    $startup = [Environment]::GetFolderPath("Startup")
+    if (-not [string]::IsNullOrWhiteSpace($startup)) {
+        $launcher = Join-Path $startup "$TaskName.vbs"
+        Remove-Item -LiteralPath $launcher -Force -ErrorAction SilentlyContinue
+        Write-InstallLog "removed startup fallback launcher=$launcher"
+    }
+}
+
+if (-not $NoRunNow) {
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        Write-InstallLog "started scheduled task"
+    } catch {
+        Write-InstallLog "scheduled task start failed: $($_.Exception.Message)"
+        throw "Scheduled task $TaskName was created but could not be started"
+    }
+}
+
+Write-Host "Installed scheduled task $TaskName"
+Write-Host "Action: $taskRun"
+Write-Host "Log: $LogPath"

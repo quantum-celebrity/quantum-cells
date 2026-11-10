@@ -1,0 +1,626 @@
+package networking
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/blackbeardONE/CELLS/internal/logging"
+	"github.com/blackbeardONE/CELLS/pkg/monitoring/netmetrics"
+	libp2p "github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+)
+
+// DefaultPubsubSignaturePolicy is the message-signature policy applied
+// to every libp2p pubsub instance the production wiring creates. We
+// pin StrictSign (= signed-and-verified) explicitly rather than rely
+// on the go-libp2p-pubsub library default so the property is
+// locally-declared and won't silently regress on dependency upgrade.
+//
+// Under StrictSign, the pubsub layer:
+//
+//   - Wraps every outbound payload from topic.Publish in a
+//     pubsub_pb.Message envelope and signs the envelope with the
+//     host's libp2p identity private key (libp2p.Identity option in
+//     SetupLibP2PWithPortAndKey + loadOrCreateHostKey).
+//   - Verifies every inbound envelope's signature against the sender's
+//     claimed peer.ID; messages that fail verification are dropped
+//     BEFORE reaching topic.Subscribe consumers (see pubsub
+//     ValidationError handling in upstream pubsub.go::pushMsg).
+//   - Rejects messages with absent or malformed signatures the same
+//     way as bad-sig messages — so an attacker can't bypass the gate
+//     by stripping the signature field.
+//
+// Audit row net-01 ("P2P message authentication") evidence path:
+//
+//	pkg/networking/libp2p.go::SetupLibP2PWithPortAndKey   (this file)
+//	pkg/networking/pubsub_signpolicy_test.go              (round-trip + presence-of-option test)
+//	pkg/networking/pubsub_two_hosts_test.go               (broader round-trip smoke)
+var DefaultPubsubSignaturePolicy = pubsub.StrictSign
+
+type DiscoveryNotifee struct {
+	h      host.Host
+	logger *logging.Logger
+}
+
+func (n *DiscoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	n.logger.Info("Discovered new peer", "peerID", pi.ID.String())
+	if err := n.h.Connect(context.Background(), pi); err != nil {
+		n.logger.Error("Failed to connect to peer", "peerID", pi.ID.String(), "error", err)
+	}
+}
+
+type Network struct {
+	Host       host.Host
+	PubSub     *pubsub.PubSub
+	Topic      *pubsub.Topic
+	Sub        *pubsub.Subscription
+	ctx        context.Context
+	cancel     context.CancelFunc
+	msgHandler func(msg []byte)
+	txGossip   *TxGossipIngress
+	mu         sync.Mutex
+	logger     *logging.Logger
+	banGater   *banGater
+	limits     P2PLimits
+	guard      *gossipGuard
+
+	peerStatusMu sync.Mutex
+	peerStatus   map[peer.ID]time.Time
+	peerMsgCount map[peer.ID]int64 // pubsub messages received per peer (CELLS-transactions)
+}
+
+// SetupLibP2P creates a libp2p host that listens on an ephemeral port (useful for tests).
+// Production callers should use SetupLibP2PWithPort to bind a stable TCP port so
+// firewall rules and peer dial strings are deterministic.
+func SetupLibP2P(ctx context.Context, logger *logging.Logger) (*Network, error) {
+	return SetupLibP2PWithPortAndKey(ctx, logger, 0, "")
+}
+
+// SetupLibP2PWithPort creates a libp2p host listening on the given TCP port on all
+// IPv4/IPv6 interfaces. Pass 0 to bind an ephemeral port. The host identity is
+// ephemeral (generated fresh on every call) — production deploys should use
+// SetupLibP2PWithPortAndKey so the libp2p peer.ID is stable across CELLS.service
+// restarts (see hostkey.go for the on-disk format).
+func SetupLibP2PWithPort(ctx context.Context, logger *logging.Logger, port int) (*Network, error) {
+	return SetupLibP2PWithPortAndKey(ctx, logger, port, "")
+}
+
+// SetupLibP2PWithPortAndKey creates a libp2p host listening on the given TCP
+// port and identified by the libp2p PrivateKey loaded from (or, on first run,
+// generated and persisted to) hostKeyPath. An empty hostKeyPath preserves the
+// legacy ephemeral-identity behaviour. See pkg/networking/hostkey.go for the
+// on-disk file format.
+//
+// Persisting the host key keeps `peer.ID` stable across CELLS.service restarts
+// so:
+//   - Pre-restart `trust/attestations/*` rows submitted under the old node_id
+//     remain valid across the next 15-minute freshness window.
+//   - Bootstrap allowlists and operator metrics don't see the same node as
+//     a different peer after each restart.
+//   - The /api/v1/status `node_id` field is stable for dashboards and
+//     external probes.
+func SetupLibP2PWithPortAndKey(ctx context.Context, logger *logging.Logger, port int, hostKeyPath string) (*Network, error) {
+	return SetupLibP2PWithPortBindAndKey(ctx, logger, port, "", hostKeyPath)
+}
+
+// SetupLibP2PWithPortBindAndKey is like SetupLibP2PWithPortAndKey but can
+// restrict the listen socket to a single interface address. Empty bindAddress
+// preserves the historical all-interfaces IPv4+IPv6 listener.
+// SetupLibP2PWithPortBindAndKey creates the historical host without changing
+// router state. Public production callers should use
+// SetupLibP2PWithPortBindAndKeyAndNAT.
+func SetupLibP2PWithPortBindAndKey(ctx context.Context, logger *logging.Logger, port int, bindAddress string, hostKeyPath string) (*Network, error) {
+	return SetupLibP2PWithPortBindAndKeyAndNAT(ctx, logger, port, bindAddress, hostKeyPath, false)
+}
+
+// SetupLibP2PWithPortBindAndKeyAndNAT creates a libp2p host and, when
+// enableNAT is true, asks the local gateway to map the configured peer port
+// using libp2p native NAT support. Hole punching is enabled alongside the
+// mapping so a node behind a restrictive NAT can use a compatible relay path
+// when a direct mapping is unavailable.
+//
+// NAT mapping is deliberately opt-in. The public-P2P validator launcher is
+// the only production caller that enables it; tests and loopback-only nodes
+// keep the historical no-router-mutation behavior.
+func SetupLibP2PWithPortBindAndKeyAndNAT(ctx context.Context, logger *logging.Logger, port int, bindAddress string, hostKeyPath string, enableNAT bool) (*Network, error) {
+	return SetupLibP2PWithOptions(ctx, logger, SetupOptions{
+		Port:        port,
+		BindAddress: bindAddress,
+		HostKeyPath: hostKeyPath,
+		EnableNAT:   enableNAT,
+	})
+}
+
+// SetupOptions configures SetupLibP2PWithOptions.
+type SetupOptions struct {
+	Port        int
+	BindAddress string
+	HostKeyPath string
+	EnableNAT   bool
+	// Limits bounds connections, streams and gossip. The zero value
+	// means DefaultP2PLimits(); set Limits.Disabled to fall back to the libp2p
+	// library defaults.
+	Limits P2PLimits
+	// AllowedPeers turns on private P2P mode (private_p2p.go): only these
+	// libp2p peer IDs may connect or be dialled, only over private addresses,
+	// BindAddress must be a literal private IP, EnableNAT must be false and
+	// mDNS is not started. Empty (the default) changes nothing.
+	AllowedPeers []string
+}
+
+// SetupLibP2PWithOptions creates the libp2p host, the GossipSub router and the
+// CELLS-transactions subscription with explicit connection / resource / gossip
+// limits (see p2p_limits.go and CELLS/docs/docs/P2P_LIMITS.md).
+func SetupLibP2PWithOptions(ctx context.Context, logger *logging.Logger, so SetupOptions) (*Network, error) {
+	port, bindAddress, hostKeyPath, enableNAT := so.Port, so.BindAddress, so.HostKeyPath, so.EnableNAT
+	limits := so.Limits
+	if !limits.Disabled {
+		limits = limits.WithDefaults()
+		if err := limits.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	var opts []libp2p.Option
+	if port < 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid libp2p port: %d", port)
+	}
+	allow, aerr := parseAllowedPeers(so.AllowedPeers)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if allow != nil {
+		if enableNAT {
+			return nil, fmt.Errorf("private p2p: NAT port mapping and hole punching cannot be enabled")
+		}
+		if err := validatePrivateListen(bindAddress); err != nil {
+			return nil, err
+		}
+	}
+	listenAddrs, lerr := libp2pListenAddrs(port, bindAddress)
+	if lerr != nil {
+		return nil, lerr
+	}
+	opts = append(opts, libp2p.ListenAddrStrings(listenAddrs...))
+	if enableNAT {
+		opts = append(opts, libp2p.NATPortMap(), libp2p.EnableHolePunching())
+	}
+	if hostKeyPath != "" {
+		priv, kerr := loadOrCreateHostKey(hostKeyPath)
+		if kerr != nil {
+			return nil, fmt.Errorf("libp2p host key: %w", kerr)
+		}
+		if priv != nil {
+			opts = append(opts, libp2p.Identity(priv))
+		}
+	}
+	// Transport-level ban gate. Constructed inert (nil tracker) because the
+	// reputation tracker does not exist yet at host-build time; SetReputationGate
+	// attaches it later. Passing the gater here rather than wiring it afterwards
+	// is required -- libp2p takes the ConnectionGater as a construction option
+	// and there is no setter on a live host.
+	gater := &banGater{allow: allow}
+	opts = append(opts, libp2p.ConnectionGater(gater))
+	limitOpts, err := limits.hostOptions()
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, limitOpts...)
+
+	h, err := libp2p.New(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Setup mDNS discovery to find local peers. Private mode skips it: the
+	// peer set is fixed and mDNS would announce the node on every attached LAN.
+	if allow == nil {
+		notifee := &DiscoveryNotifee{h: h, logger: logger}
+		mdnsService := mdns.NewMdnsService(h, "CELLS-mdns", notifee)
+		if mdnsService == nil {
+			return nil, fmt.Errorf("failed to start mDNS service")
+		}
+	}
+
+	// pubsub.StrictSign is the secure baseline: every published message
+	// is wrapped in an envelope signed by the sender's libp2p identity
+	// key, every received message is rejected unless the envelope
+	// signature verifies against the sender's claimed peer.ID. This is
+	// also the go-libp2p-pubsub default, but we pin it EXPLICITLY here
+	// so the property does not silently regress if a future upstream
+	// version flips the default — relying on a dependency's defaults
+	// is weaker evidence than a locally-declared invariant. Audit row
+	// net-01 ("P2P message authentication") is satisfied by this line
+	// plus DefaultPubsubSignaturePolicy below + the round-trip test
+	// in pubsub_signpolicy_test.go.
+	//
+	// The P2P limits add: a global max message size, a larger validation
+	// queue, peer scoring, and an inline default validator (gossipGuard)
+	// enforcing per-topic payload ceilings and a per-peer rate on every
+	// topic. Locally published messages always pass the guard.
+	var guard *gossipGuard
+	psOpts := []pubsub.Option{pubsub.WithMessageSignaturePolicy(DefaultPubsubSignaturePolicy)}
+	if !limits.Disabled {
+		guard = newGossipGuard(h.ID(), limits)
+		psOpts = append(psOpts, limits.pubsubOptions(guard)...)
+	}
+	ps, err := pubsub.NewGossipSub(ctx, h, psOpts...)
+	if err != nil {
+		_ = h.Close()
+		return nil, fmt.Errorf("failed to create pubsub: %w", err)
+	}
+
+	topic, err := ps.Join(TxTopicName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to join pubsub topic: %w", err)
+	}
+
+	sub, err := topic.Subscribe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to subscribe to pubsub topic: %w", err)
+	}
+
+	networkCtx, cancel := context.WithCancel(ctx)
+
+	net := &Network{
+		Host:         h,
+		PubSub:       ps,
+		Topic:        topic,
+		Sub:          sub,
+		ctx:          networkCtx,
+		cancel:       cancel,
+		logger:       logger,
+		banGater:     gater,
+		limits:       limits,
+		guard:        guard,
+		peerStatus:   make(map[peer.ID]time.Time),
+		peerMsgCount: make(map[peer.ID]int64),
+	}
+
+	// Wire the live network into the monitoring layer so
+	// CELLS_p2p_peers_connected{provider="live"} reflects
+	// this host's peer count at scrape time. Goes through
+	// the netmetrics leaf to avoid an import cycle with
+	// pkg/monitoring (which itself imports pkg/networking
+	// for TopologyMonitor).
+	netmetrics.RegisterNetworkProvider(net)
+
+	go net.handleMessages()
+	go net.monitorPeers()
+
+	logger.Info("LibP2P host created", "hostID", h.ID().String(), "p2p_limits", limits.String(),
+		"private_p2p", allow != nil, "allowed_peers", len(allow))
+	return net, nil
+}
+
+func libp2pListenAddrs(port int, bindAddress string) ([]string, error) {
+	bindAddress = strings.TrimSpace(bindAddress)
+	if bindAddress == "" || bindAddress == "0.0.0.0" || bindAddress == "::" || bindAddress == "[::]" {
+		return []string{
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port),
+			fmt.Sprintf("/ip6/::/tcp/%d", port),
+		}, nil
+	}
+	if strings.EqualFold(bindAddress, "localhost") {
+		bindAddress = "127.0.0.1"
+	}
+	ip := net.ParseIP(bindAddress)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid libp2p bind address: %q", bindAddress)
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return []string{fmt.Sprintf("/ip4/%s/tcp/%d", ip4.String(), port)}, nil
+	}
+	return []string{fmt.Sprintf("/ip6/%s/tcp/%d", ip.String(), port)}, nil
+}
+
+// Limits returns the effective P2P limits this host was built with.
+func (n *Network) Limits() P2PLimits {
+	if n == nil {
+		return P2PLimits{}
+	}
+	return n.limits
+}
+
+// GossipGuardStats returns the gossip guard counters (zero when limits are
+// disabled).
+func (n *Network) GossipGuardStats() GossipGuardStats {
+	if n == nil {
+		return GossipGuardStats{}
+	}
+	return n.guard.Stats()
+}
+
+// PeerCount implements netmetrics.NetworkProvider for this
+// host. Counts only fully-connected libp2p peers (matches the
+// semantic the alerts in CELLS-p2p assume).
+func (n *Network) PeerCount() int {
+	if n == nil || n.Host == nil {
+		return 0
+	}
+	return len(n.Host.Network().Peers())
+}
+
+func (n *Network) handleMessages() {
+	for {
+		msg, err := n.Sub.Next(n.ctx)
+		if err != nil {
+			if n.ctx.Err() != nil {
+				return
+			}
+			n.logger.Error("Error reading pubsub message", "error", err)
+			continue
+		}
+		if msg.ReceivedFrom == n.Host.ID() {
+			continue // Ignore messages from self
+		}
+		// Increment CELLS_p2p_messages_total{direction="in"}
+		// for every non-self pubsub message — gives the
+		// scrape a publish-rate signal for gossip-stall
+		// alerts.
+		netmetrics.RecordGossipMessage(netmetrics.DirectionIn)
+		n.peerStatusMu.Lock()
+		n.peerStatus[msg.ReceivedFrom] = time.Now()
+		n.peerMsgCount[msg.ReceivedFrom]++
+		n.peerStatusMu.Unlock()
+
+		n.mu.Lock()
+		txIng := n.txGossip
+		handler := n.msgHandler
+		n.mu.Unlock()
+		if txIng != nil && txIng.TryConsumeGossip(msg.ReceivedFrom.String(), msg.Data) {
+			continue
+		}
+		n.mu.Lock()
+		if handler != nil {
+			handler(msg.Data)
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *Network) SetMessageHandler(handler func(msg []byte)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.msgHandler = handler
+}
+
+// SetTxGossipIngress optionally routes CELLS-transactions pubsub payloads through signed-tx
+// gossip validation first; accepted or quarantined payloads skip the legacy message handler.
+func (n *Network) SetTxGossipIngress(ing *TxGossipIngress) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.txGossip = ing
+}
+
+func (n *Network) Broadcast(msg []byte) error {
+	if err := n.Topic.Publish(n.ctx, msg); err != nil {
+		return err
+	}
+	// Only count successful publishes — the counter then
+	// reflects payloads the gossip layer actually accepted,
+	// not those that errored out at the libp2p boundary.
+	netmetrics.RecordGossipMessage(netmetrics.DirectionOut)
+	return nil
+}
+
+func (n *Network) Close() error {
+	n.cancel()
+	return n.Host.Close()
+}
+
+// JoinTopic joins a new pubsub topic and returns the topic handle and subscription.
+// Callers are responsible for reading from the subscription in a goroutine.
+func (n *Network) JoinTopic(name string) (*pubsub.Topic, *pubsub.Subscription, error) {
+	t, err := n.PubSub.Join(name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to join topic %s: %w", name, err)
+	}
+	s, err := t.Subscribe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to subscribe to topic %s: %w", name, err)
+	}
+	return t, s, nil
+}
+
+// monitorPeers periodically checks peer connectivity and attempts reconnection.
+func (n *Network) monitorPeers() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			n.peerStatusMu.Lock()
+			for pid, lastSeen := range n.peerStatus {
+				if time.Since(lastSeen) > 1*time.Minute {
+					n.logger.Warn("Peer inactive, attempting reconnect", "peerID", pid.String())
+					pi := peer.AddrInfo{ID: pid}
+					err := n.Host.Connect(n.ctx, pi)
+					if err != nil {
+						n.logger.Error("Failed to reconnect to peer", "peerID", pid.String(), "error", err)
+					} else {
+						n.logger.Info("Reconnected to peer", "peerID", pid.String())
+						n.peerStatus[pid] = time.Now()
+					}
+				}
+			}
+			n.peerStatusMu.Unlock()
+		case <-n.ctx.Done():
+			return
+		}
+	}
+}
+
+// UpdatePeerStatus updates the last seen time for a peer.
+func (n *Network) UpdatePeerStatus(pid peer.ID) {
+	n.peerStatusMu.Lock()
+	defer n.peerStatusMu.Unlock()
+	n.peerStatus[pid] = time.Now()
+}
+
+// PeerInfo contains information about a peer
+type PeerInfo struct {
+	ID        string        `json:"id"`
+	Addresses []string      `json:"addresses"`
+	LastSeen  time.Time     `json:"last_seen"`
+	Connected bool          `json:"connected"`
+	Latency   time.Duration `json:"latency,omitempty"`
+}
+
+// ConnectionQuality represents the quality of a peer connection
+type ConnectionQuality struct {
+	PeerID       string        `json:"peer_id"`
+	Latency      time.Duration `json:"latency"`
+	LastSeen     time.Time     `json:"last_seen"`
+	Status       string        `json:"status"` // "connected", "disconnected", "reconnecting"
+	MessageCount int64         `json:"message_count"`
+}
+
+// GetPeerInfo returns information about all connected peers
+func (n *Network) GetPeerInfo() []PeerInfo {
+	n.peerStatusMu.Lock()
+	defer n.peerStatusMu.Unlock()
+
+	var peers []PeerInfo
+	connectedPeers := n.Host.Network().Peers()
+
+	for _, pid := range connectedPeers {
+		info := PeerInfo{
+			ID:        pid.String(),
+			Addresses: []string{},
+			Connected: true,
+		}
+
+		// Get addresses
+		addrs := n.Host.Network().Peerstore().Addrs(pid)
+		for _, addr := range addrs {
+			info.Addresses = append(info.Addresses, addr.String())
+		}
+
+		// Get last seen time
+		if lastSeen, ok := n.peerStatus[pid]; ok {
+			info.LastSeen = lastSeen
+		}
+
+		peers = append(peers, info)
+	}
+
+	// Also include peers we've seen but aren't currently connected
+	for pid, lastSeen := range n.peerStatus {
+		found := false
+		for _, p := range peers {
+			if p.ID == pid.String() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			peers = append(peers, PeerInfo{
+				ID:        pid.String(),
+				Addresses: []string{},
+				LastSeen:  lastSeen,
+				Connected: false,
+			})
+		}
+	}
+
+	return peers
+}
+
+// GetConnectionQuality returns connection quality metrics for all peers
+func (n *Network) GetConnectionQuality() []ConnectionQuality {
+	n.peerStatusMu.Lock()
+	defer n.peerStatusMu.Unlock()
+
+	var qualities []ConnectionQuality
+	connectedPeers := n.Host.Network().Peers()
+
+	for _, pid := range connectedPeers {
+		lastSeen, ok := n.peerStatus[pid]
+		if !ok {
+			lastSeen = time.Now()
+		}
+
+		status := "connected"
+		if time.Since(lastSeen) > 1*time.Minute {
+			status = "disconnected"
+		} else if time.Since(lastSeen) > 30*time.Second {
+			status = "reconnecting"
+		}
+
+		qualities = append(qualities, ConnectionQuality{
+			PeerID:       pid.String(),
+			LastSeen:     lastSeen,
+			Status:       status,
+			MessageCount: n.peerMsgCount[pid],
+		})
+	}
+
+	return qualities
+}
+
+// GetNetworkTopology returns the network topology for visualization
+func (n *Network) GetNetworkTopology() map[string]interface{} {
+	peers := n.GetPeerInfo()
+	qualities := n.GetConnectionQuality()
+
+	// Build topology graph
+	nodes := []map[string]interface{}{}
+	edges := []map[string]interface{}{}
+
+	// Add self as central node
+	nodes = append(nodes, map[string]interface{}{
+		"id":    n.Host.ID().String(),
+		"label": "Self",
+		"type":  "self",
+	})
+
+	// Add peer nodes
+	for _, peer := range peers {
+		nodeType := "peer"
+		if !peer.Connected {
+			nodeType = "disconnected"
+		}
+
+		nodes = append(nodes, map[string]interface{}{
+			"id":    peer.ID,
+			"label": peer.ID[:12] + "...", // Shortened ID
+			"type":  nodeType,
+		})
+
+		// Add edge from self to peer
+		edgeStatus := "connected"
+		if !peer.Connected {
+			edgeStatus = "disconnected"
+		}
+
+		edges = append(edges, map[string]interface{}{
+			"from":   n.Host.ID().String(),
+			"to":     peer.ID,
+			"status": edgeStatus,
+		})
+	}
+
+	return map[string]interface{}{
+		"nodes":     nodes,
+		"edges":     edges,
+		"peerCount": len(peers),
+		"connectedCount": func() int {
+			count := 0
+			for _, p := range peers {
+				if p.Connected {
+					count++
+				}
+			}
+			return count
+		}(),
+		"qualities": qualities,
+	}
+}

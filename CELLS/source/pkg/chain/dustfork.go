@@ -1,0 +1,216 @@
+package chain
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"sync/atomic"
+)
+
+// Integer-dust accounting fork.
+//
+// The ledger's account layer stores balances as float64 CELL while the
+// emission layer computes in uint64 dust (1 CELL = 1e8 dust). That mismatch
+// is not cosmetic — it destroys money:
+//
+//	funder balance          ~1.0e15 CELL
+//	float64 ULP there        0.125 CELL
+//	epoch-0 reward/block     3.564909879 CELL
+//	debit actually applied   3.625 CELL      (quantised up to the ULP grid)
+//	credit actually applied  3.564909879 CELL (exact, small balance)
+//	net destroyed per block   0.0601 CELL  ->  ~190,000 CELL/year
+//
+// AccountStore.StateRoot compounds it by formatting balances with %f — six
+// decimal places — so anything below 1e-6 CELL is invisible to the state
+// root even though the protocol's unit is 1e-8.
+//
+// Fixing this changes every state root, so it is gated on an activation
+// height exactly like the Tensor-Core fork in pkg/mining/fork.go: nodes
+// agree on the legacy encoding below the fork and the integer encoding at or
+// above it, letting a live network roll forward without splitting.
+//
+// Default is math.MaxUint64 — never active — so a node that has not been
+// explicitly configured behaves exactly as before.
+
+// DustPerCellInt is the protocol's smallest unit, mirroring
+// emission.DustPerCell as an integer constant for account arithmetic.
+const DustPerCellInt uint64 = 100_000_000
+
+// forkDustHeight is the first height governed by integer-dust accounting.
+var forkDustHeight atomic.Uint64
+
+func init() { forkDustHeight.Store(math.MaxUint64) }
+
+// ForkDustHeight returns the activation height for integer-dust accounting.
+func ForkDustHeight() uint64 { return forkDustHeight.Load() }
+
+// SetForkDustHeight pins the activation height. Setting it to
+// math.MaxUint64 disables the fork.
+func SetForkDustHeight(h uint64) { forkDustHeight.Store(h) }
+
+// IsDustAccounting reports whether a block at the given height is governed
+// by integer-dust accounting. Boundary-inclusive, matching mining.IsV2TC.
+func IsDustAccounting(height uint64) bool { return height >= forkDustHeight.Load() }
+
+// ErrSupplyCapExceeded is returned when an operation would push total
+// supply past the protocol maximum.
+var ErrSupplyCapExceeded = errors.New("chain: operation would exceed the CELL supply cap")
+
+// ErrDustConversionRange is returned when a CELL amount cannot be
+// represented exactly in dust.
+var ErrDustConversionRange = errors.New("chain: CELL amount is not exactly representable in dust")
+
+// CellToDust converts whole-CELL float to integer dust, refusing any value
+// that cannot be represented exactly.
+//
+// Refusing rather than rounding is deliberate: silent rounding at the
+// conversion boundary is how the float64 layer lost money in the first
+// place. A caller that genuinely wants truncation must ask for it.
+//
+// NOT to be confused with balanceToDust in enrollment_apply.go, which floors
+// and clamps to MaxUint64 on overflow. That leniency is fine for enrollment
+// stakes (bounded near 10 CELL, far inside float64's exact range) but is
+// exactly the wrong behaviour on the general money path, where a silently
+// floored conversion is a silently destroyed balance. Use CellToDust for
+// ledger balances; balanceToDust remains for the enrollment helper's
+// existing, bounded use.
+func CellToDust(cell float64) (uint64, error) {
+	if math.IsNaN(cell) || math.IsInf(cell, 0) {
+		return 0, fmt.Errorf("%w: %v is not a finite amount", ErrDustConversionRange, cell)
+	}
+	if cell < 0 {
+		return 0, fmt.Errorf("%w: %v is negative", ErrDustConversionRange, cell)
+	}
+	scaled := cell * float64(DustPerCellInt)
+	// float64(math.MaxUint64) rounds up to 2^64, which does not fit in a
+	// uint64 either: converting it would wrap instead of failing.
+	if scaled >= float64(math.MaxUint64) {
+		return 0, fmt.Errorf("%w: %v overflows uint64 dust", ErrDustConversionRange, cell)
+	}
+	rounded := math.Round(scaled)
+	// Accept only values that land on an exact dust boundary up to float
+	// noise from the scaling multiply (a few ULPs of scaled, at least 1e-6
+	// dust). The previous test, |scaled-rounded| > 0.5, could never fire
+	// because math.Round is always within 0.5, so every in-range value was
+	// silently rounded to the nearest dust. Beyond 2^53 dust (~90.07 M CELL)
+	// float64's ULP exceeds one dust and exactness is no longer decidable
+	// from the float alone; those values are accepted as rounded. The CELL
+	// value itself is coarser than one dust from 2^26 CELL (67,108,864
+	// CELL): there, neighbouring dust amounts can share one float64 (see
+	// DustToCell).
+	ulp := math.Nextafter(scaled, math.Inf(1)) - scaled
+	if math.Abs(scaled-rounded) > math.Max(1e-6, 4*ulp) {
+		return 0, fmt.Errorf("%w: %v is not a whole number of dust", ErrDustConversionRange, cell)
+	}
+	return uint64(rounded), nil
+}
+
+// DustToCell converts integer dust to whole-CELL float for legacy surfaces:
+// the float Balance mirror, JSON and APIs. float64(dust) is exact below 2^53
+// dust, which covers the entire 90 M supply (CellSupplyCapDust = 9e15 dust),
+// but the division by 1e8 rounds: the result is the float64 nearest to the
+// amount, not always the amount itself.
+//
+//   - CellToDust gives the same dust back for every amount below 2^25 CELL
+//     (33,554,432 CELL), and again from 2^52 dust (about 45.0 M CELL) up to
+//     2^26 CELL (67,108,864 CELL). Between 33.5 M and 45.0 M CELL some
+//     amounts come back one dust too many; from 67.1 M CELL some come back
+//     one dust off either way.
+//   - From 2^26 CELL two neighbouring dust amounts can give the same float64.
+//   - Flooring the result instead, as balanceToDust does, comes back one dust
+//     short for some amounts of any size: 3 dust gives 2.
+//
+// Code that needs the exact amount must read BalanceDust, not this float.
+func DustToCell(dust uint64) float64 {
+	return float64(dust) / float64(DustPerCellInt)
+}
+
+// CellSupplyCapDust is the protocol maximum total supply in dust:
+// 90,000,000 CELL, all of it issued by mining (equal to CellMiningCapDust).
+// There is no genesis treasury allocation: decision D1-a (2026-10-16) of the
+// CELLS Genesis Policy withdrew the earlier 10 M treasury proposal (v1.0,
+// unchanged in v1.1, clause 1; CELLS/docs/docs/GENESIS_POLICY_v1.1.md).
+//
+// Lowering this from 100 M to 90 M does not change block production or
+// mining rewards. Only two places read it: SupplyLedger, which has no
+// production caller (see account_supply.go), and the offline
+// cmd/CELLS-ledger-fork-plan analyzer. Rewards are bounded by
+// EmissionSchedule.MiningCapDust, which was already 90 M and is unchanged.
+const CellSupplyCapDust uint64 = 90_000_000 * 100_000_000
+
+// SupplyLedger tracks total issued dust so no path — mining reward, faucet,
+// genesis seeding or a future contract — can mint past the cap.
+//
+// The emission schedule already caps what MINING can pay out
+// (emission.go), but that is a property of one code path. Nothing enforced a
+// ledger-wide invariant, so any other minting path was unbounded.
+type SupplyLedger struct {
+	issued atomic.Uint64
+	cap    atomic.Uint64
+}
+
+// NewSupplyLedger returns a ledger enforcing the protocol cap.
+func NewSupplyLedger() *SupplyLedger {
+	s := &SupplyLedger{}
+	s.cap.Store(CellSupplyCapDust)
+	return s
+}
+
+// NewSupplyLedgerWithCap returns a ledger with a custom cap (tests,
+// devnets). A zero cap is rejected as a configuration error.
+func NewSupplyLedgerWithCap(capDust uint64) (*SupplyLedger, error) {
+	if capDust == 0 {
+		return nil, errors.New("chain: supply cap must be greater than zero")
+	}
+	s := &SupplyLedger{}
+	s.cap.Store(capDust)
+	return s, nil
+}
+
+// Cap returns the configured maximum supply in dust.
+func (s *SupplyLedger) Cap() uint64 { return s.cap.Load() }
+
+// Issued returns total dust issued so far.
+func (s *SupplyLedger) Issued() uint64 { return s.issued.Load() }
+
+// Remaining returns how much dust may still be minted.
+func (s *SupplyLedger) Remaining() uint64 {
+	issued, capDust := s.issued.Load(), s.cap.Load()
+	if issued >= capDust {
+		return 0
+	}
+	return capDust - issued
+}
+
+// Mint records newly issued dust, refusing anything that would exceed the
+// cap. The check and the increment are one atomic compare-and-swap loop, so
+// concurrent minters cannot race past the cap between check and commit.
+func (s *SupplyLedger) Mint(dust uint64) error {
+	if dust == 0 {
+		return nil
+	}
+	capDust := s.cap.Load()
+	for {
+		cur := s.issued.Load()
+		if dust > capDust-cur {
+			return fmt.Errorf("%w: issued %d + %d > cap %d", ErrSupplyCapExceeded, cur, dust, capDust)
+		}
+		if s.issued.CompareAndSwap(cur, cur+dust) {
+			return nil
+		}
+	}
+}
+
+// Burn reduces issued supply (e.g. burned fees), never below zero.
+func (s *SupplyLedger) Burn(dust uint64) {
+	for {
+		cur := s.issued.Load()
+		next := uint64(0)
+		if cur > dust {
+			next = cur - dust
+		}
+		if s.issued.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}

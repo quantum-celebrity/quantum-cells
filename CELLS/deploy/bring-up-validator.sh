@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+# bring-up-validator.sh — Stand up an additional CELLS validator on a Linux host.
+#
+# This script is the companion of install-ubuntu-vps.sh (which stands up the
+# *first* validator). It assumes your first validator is already running and
+# that you have its libp2p bootstrap multiaddr handy.
+#
+# What it does (idempotent; safe to re-run):
+#   1. Pre-flight: OS + user + disk + RAM checks.
+#   2. Install build deps (apt, no-op if already present).
+#   3. Build liboqs once under $CELLS_HOME/liboqs_install, or reuse the cache.
+#   4. Build the CELLS-validator binary (CGO_ENABLED=1).
+#   5. Materialize a per-validator install dir under
+#      /opt/CELLS-validator-<INDEX> with its own TOML config, systemd user,
+#      data dir, and port offsets derived from --index.
+#   6. Render + enable a systemd unit named CELLS-validator-<INDEX>.service
+#      that points at the per-validator config.
+#   7. Open the firewall for the libp2p port only (NOT the API/dashboard --
+#      those should stay behind Caddy / the VPN).
+#   8. Wait up to $HEALTH_TIMEOUT_SEC seconds for /api/v1/health/ready and
+#      for the new node to list at least one peer.
+#
+# Usage:
+#   sudo bash bring-up-validator.sh \
+#       --index 2 \
+#       --bootstrap /ip4/203.0.113.10/tcp/4001/p2p/12D3KooW...
+#
+# Flags:
+#   --index N             Second/third/... validator on this host. N>=2.
+#                         Derives port offsets: libp2p=4000+N, api=8080+(N-1)*10,
+#                         dashboard=8081+(N-1)*10. Default: 2.
+#   --bootstrap ADDR      libp2p multiaddr of the primary (or any existing)
+#                         validator to bootstrap from. REQUIRED.
+#                         Example: /ip4/1.2.3.4/tcp/4001/p2p/12D3KooWabc...
+#   --install-dir DIR     Where to place the binary + config + db.
+#                         Default: /opt/CELLS-validator-<INDEX>
+#   --service-name NAME   systemd unit name (without .service).
+#                         Default: CELLS-validator-<INDEX>
+#   --CELLS-home DIR       Source checkout to build from.
+#                         Default: $HOME/CELLS (git-cloned if missing)
+#   --skip-liboqs         Re-use an existing $CELLS_HOME/liboqs_install.
+#   --skip-build          Re-use an existing $CELLS_HOME/CELLS binary.
+#   --skip-firewall       Do not touch ufw.
+#   --health-timeout SEC  How long to wait for ready + peer-count>=1.
+#                         Default: 180
+#   --require-signed-votes
+#                         Write require_signed_votes=true. Must be paired with
+#                         --signed-message-activation-height set to the same
+#                         future height on every validator.
+#   --signed-message-activation-height HEIGHT
+#                         Shared future height for signed consensus enforcement.
+#                         Default: $CELLS_SIGNED_MESSAGE_ACTIVATION_HEIGHT or 0.
+#   --task-action-signature-activation-height HEIGHT
+#                         Shared height where CELLS/tasks/v1 actions must be signed.
+#                         Default: $CELLS_TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT or 625000.
+#   --tx-content-root-activation-height HEIGHT
+#                         Shared height where block tx roots commit transaction contents.
+#                         Default: $CELLS_TX_CONTENT_ROOT_ACTIVATION_HEIGHT or 625000.
+#   --enrollment-state-root-activation-height HEIGHT
+#                         Shared height where enrollment/slashing state is committed.
+#                         Default: $CELLS_ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT or 625000.
+#   --strict-secrets      Enable strict production validation for this validator.
+#                         Requires at least one pinned producer ID.
+#   --authorized-block-producer ID
+#                         Add one permitted external block producer ID. Repeat for
+#                         every known producer. Defaults to comma-separated
+#                         CELLS_AUTHORIZED_BLOCK_PRODUCERS when omitted.
+#   --dry-run             Print what would happen; do not mutate the system.
+#   -h, --help            Show this help and exit.
+#
+# Safety:
+#   * This script never touches your *first* validator's config/data dir.
+#   * /var/lib/CELLS-validator-<N> and /opt/CELLS-validator-<N> are scoped per
+#     index -- wiping one validator does not affect any other.
+#   * DO NOT copy a validator's data dir from another host. Two validators
+#     with the same ML-DSA-87 identity will both be slashed once slashing is
+#     enabled. Each run generates a fresh key on first boot.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/authorized-block-producers.sh
+source "${SCRIPT_DIR}/scripts/authorized-block-producers.sh"
+
+# --- colors / log helpers ---------------------------------------------------
+if [[ -t 1 ]]; then
+    C_RED=$'\033[0;31m'; C_YEL=$'\033[1;33m'; C_GRN=$'\033[0;32m'; C_NC=$'\033[0m'
+else
+    C_RED=""; C_YEL=""; C_GRN=""; C_NC=""
+fi
+log()  { printf "%s==>%s %s\n"  "$C_GRN" "$C_NC" "$*"; }
+warn() { printf "%s!! %s%s\n"   "$C_YEL" "$*" "$C_NC" >&2; }
+die()  { printf "%sxx %s%s\n"   "$C_RED" "$*" "$C_NC" >&2; exit 1; }
+
+run() {
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        printf "  [dry-run] %s\n" "$*"
+    else
+        "$@"
+    fi
+}
+
+# --- defaults ---------------------------------------------------------------
+INDEX=2
+BOOTSTRAP=""
+INSTALL_DIR=""
+SERVICE_NAME=""
+CELLS_HOME="${CELLS_HOME:-${HOME:-/root}/CELLS}"
+CELLS_GIT="${CELLS_GIT:-https://github.com/blackbeardONE/CELLS.git}"
+SKIP_LIBOQS=0
+SKIP_BUILD=0
+SKIP_FIREWALL=0
+HEALTH_TIMEOUT_SEC=180
+DRY_RUN=0
+REQUIRE_SIGNED_VOTES="${CELLS_REQUIRE_SIGNED_VOTES:-false}"
+SIGNED_MESSAGE_ACTIVATION_HEIGHT="${CELLS_SIGNED_MESSAGE_ACTIVATION_HEIGHT:-0}"
+TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT="${CELLS_TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT:-625000}"
+TX_CONTENT_ROOT_ACTIVATION_HEIGHT="${CELLS_TX_CONTENT_ROOT_ACTIVATION_HEIGHT:-625000}"
+ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT="${CELLS_ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT:-625000}"
+STRICT_SECRETS="${CELLS_STRICT_SECRETS:-false}"
+AUTHORIZED_BLOCK_PRODUCERS="${CELLS_AUTHORIZED_BLOCK_PRODUCERS:-}"
+
+# --- arg parsing ------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --index)            INDEX="$2"; shift 2 ;;
+        --bootstrap)        BOOTSTRAP="$2"; shift 2 ;;
+        --install-dir)      INSTALL_DIR="$2"; shift 2 ;;
+        --service-name)     SERVICE_NAME="$2"; shift 2 ;;
+        --CELLS-home)        CELLS_HOME="$2"; shift 2 ;;
+        --skip-liboqs)      SKIP_LIBOQS=1; shift ;;
+        --skip-build)       SKIP_BUILD=1; shift ;;
+        --skip-firewall)    SKIP_FIREWALL=1; shift ;;
+        --health-timeout)   HEALTH_TIMEOUT_SEC="$2"; shift 2 ;;
+        --require-signed-votes) REQUIRE_SIGNED_VOTES=true; shift ;;
+        --signed-message-activation-height) SIGNED_MESSAGE_ACTIVATION_HEIGHT="$2"; shift 2 ;;
+        --task-action-signature-activation-height) TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT="$2"; shift 2 ;;
+        --tx-content-root-activation-height) TX_CONTENT_ROOT_ACTIVATION_HEIGHT="$2"; shift 2 ;;
+        --enrollment-state-root-activation-height) ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT="$2"; shift 2 ;;
+        --strict-secrets)   STRICT_SECRETS=true; shift ;;
+        --authorized-block-producer)
+            [[ $# -ge 2 ]] || die "--authorized-block-producer requires an ID"
+            if [[ -n "$AUTHORIZED_BLOCK_PRODUCERS" ]]; then
+                AUTHORIZED_BLOCK_PRODUCERS+=",$2"
+            else
+                AUTHORIZED_BLOCK_PRODUCERS="$2"
+            fi
+            shift 2
+            ;;
+        --dry-run)          DRY_RUN=1; shift ;;
+        -h|--help)
+            # Print everything between the shebang and the first blank line
+            # after "Safety:" -- i.e. the leading help block above.
+            sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/d;s/^# \{0,1\}//;p}' "$0"
+            exit 0
+            ;;
+        *) die "Unknown flag: $1 (try --help)" ;;
+    esac
+done
+
+case "$(printf '%s' "$REQUIRE_SIGNED_VOTES" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) REQUIRE_SIGNED_VOTES=true ;;
+    0|false|no|off|"") REQUIRE_SIGNED_VOTES=false ;;
+    *) die "Invalid require-signed-votes value: $REQUIRE_SIGNED_VOTES" ;;
+esac
+if ! [[ "$SIGNED_MESSAGE_ACTIVATION_HEIGHT" =~ ^[0-9]+$ ]]; then
+    die "Invalid signed-message activation height: $SIGNED_MESSAGE_ACTIVATION_HEIGHT"
+fi
+if ! [[ "$TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT" =~ ^[0-9]+$ ]]; then
+    die "Invalid task-action signature activation height: $TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT"
+fi
+if ! [[ "$TX_CONTENT_ROOT_ACTIVATION_HEIGHT" =~ ^[0-9]+$ ]]; then
+    die "Invalid tx-content-root activation height: $TX_CONTENT_ROOT_ACTIVATION_HEIGHT"
+fi
+if ! [[ "$ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT" =~ ^[0-9]+$ ]]; then
+    die "Invalid enrollment-state-root activation height: $ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT"
+fi
+if [[ "$REQUIRE_SIGNED_VOTES" == "true" && "$SIGNED_MESSAGE_ACTIVATION_HEIGHT" == "0" ]]; then
+    die "--require-signed-votes requires --signed-message-activation-height set to a shared future height"
+fi
+if [[ "$REQUIRE_SIGNED_VOTES" == "false" && "$SIGNED_MESSAGE_ACTIVATION_HEIGHT" != "0" ]]; then
+    die "--signed-message-activation-height must be 0 unless --require-signed-votes is set"
+fi
+STRICT_SECRETS="$(CELLS_normalize_bool "CELLS_STRICT_SECRETS" "$STRICT_SECRETS")"
+AUTHORIZED_BLOCK_PRODUCERS_TOML="$(CELLS_render_authorized_block_producers_toml "$AUTHORIZED_BLOCK_PRODUCERS")"
+AUTHORIZED_BLOCK_PRODUCER_COUNT="$(CELLS_authorized_block_producer_count "$AUTHORIZED_BLOCK_PRODUCERS")"
+if [[ "$STRICT_SECRETS" == "true" && "$AUTHORIZED_BLOCK_PRODUCER_COUNT" == "0" ]]; then
+    die "--strict-secrets requires at least one --authorized-block-producer (or CELLS_AUTHORIZED_BLOCK_PRODUCERS)"
+fi
+
+# --- pre-flight -------------------------------------------------------------
+if [[ "$(id -u)" -ne 0 ]]; then
+    if [[ "$DRY_RUN" == "1" ]]; then
+        warn "Not running as root, but --dry-run was requested -- continuing without actually writing anything."
+    else
+        die "Run as root (e.g. sudo bash $0 ...)"
+    fi
+fi
+[[ "$INDEX" =~ ^[0-9]+$ ]] || die "--index must be a positive integer"
+[[ "$INDEX" -ge 2 ]] || die "--index must be >= 2 (index 1 is install-ubuntu-vps.sh)"
+[[ -n "$BOOTSTRAP" ]] || die "--bootstrap is required (see --help for format)"
+case "$BOOTSTRAP" in
+    /ip4/*|/ip6/*|/dns*/*) ;;
+    *) die "--bootstrap does not look like a libp2p multiaddr (got: $BOOTSTRAP)" ;;
+esac
+
+INSTALL_DIR="${INSTALL_DIR:-/opt/CELLS-validator-${INDEX}}"
+SERVICE_NAME="${SERVICE_NAME:-CELLS-validator-${INDEX}}"
+SERVICE_USER="CELLS-validator-${INDEX}"
+DATA_DIR="/var/lib/CELLS-validator-${INDEX}"
+P2P_PORT=$((4000 + INDEX))
+API_PORT=$((8080 + (INDEX - 1) * 10))
+DASHBOARD_PORT=$((8081 + (INDEX - 1) * 10))
+
+log "Config plan:"
+printf "    index            = %s\n"  "$INDEX"
+printf "    install_dir      = %s\n"  "$INSTALL_DIR"
+printf "    data_dir         = %s\n"  "$DATA_DIR"
+printf "    service          = %s.service (user: %s)\n" "$SERVICE_NAME" "$SERVICE_USER"
+printf "    libp2p port      = %s/tcp\n" "$P2P_PORT"
+printf "    api port         = %s/tcp (loopback only)\n" "$API_PORT"
+printf "    dashboard port   = %s/tcp (loopback only)\n" "$DASHBOARD_PORT"
+printf "    bootstrap        = %s\n" "$BOOTSTRAP"
+printf "    CELLS_home        = %s\n" "$CELLS_HOME"
+printf "    strict_secrets   = %s\n" "$STRICT_SECRETS"
+printf "    producer pins    = %s\n" "$AUTHORIZED_BLOCK_PRODUCER_COUNT"
+printf "    dry_run          = %s\n" "$DRY_RUN"
+
+# Guard against running against the index-1 primary by mistake.
+if [[ "$INSTALL_DIR" == "/opt/CELLS" ]]; then
+    die "Refusing to overwrite the primary validator at /opt/CELLS"
+fi
+if systemctl is-active --quiet CELLS 2>/dev/null; then
+    log "Primary validator (CELLS.service) is active -- proceeding as a second node."
+fi
+
+# Check the requested ports are not in use by another process.
+for p in "$P2P_PORT" "$API_PORT" "$DASHBOARD_PORT"; do
+    if ss -ltn "sport = :$p" 2>/dev/null | grep -q LISTEN; then
+        die "Port $p is already in LISTEN state -- either another validator index is using it, or --index $INDEX collides with something else."
+    fi
+done
+
+# --- 1. build deps ----------------------------------------------------------
+log "Installing build dependencies (apt)..."
+export DEBIAN_FRONTEND=noninteractive
+run apt-get update -y
+run apt-get install -y --no-install-recommends \
+    build-essential cmake git curl wget ufw jq ca-certificates pkg-config \
+    libssl-dev libsqlite3-dev
+
+# --- 2. Go toolchain --------------------------------------------------------
+GO_TGZ="${GO_TGZ:-https://go.dev/dl/go1.23.4.linux-amd64.tar.gz}"
+if [[ ! -x /usr/local/go/bin/go ]]; then
+    log "Installing Go from $GO_TGZ"
+    TMP_TGZ="$(mktemp)"
+    run wget -qO "$TMP_TGZ" "$GO_TGZ"
+    run rm -rf /usr/local/go
+    run tar -C /usr/local -xzf "$TMP_TGZ"
+    run rm -f "$TMP_TGZ"
+fi
+export PATH="/usr/local/go/bin:${PATH:-}"
+log "Go: $(go version 2>/dev/null || echo '(dry-run)')"
+
+# --- 3. clone / pull source -------------------------------------------------
+if [[ -f "$CELLS_HOME/scripts/rebuild_liboqs.sh" && -d "$CELLS_HOME/source" ]]; then
+    log "Using existing CELLS tree at $CELLS_HOME"
+elif [[ ! -d "$CELLS_HOME/.git" ]]; then
+    log "Cloning CELLS from $CELLS_GIT into $CELLS_HOME"
+    run git clone --depth 1 "$CELLS_GIT" "$CELLS_HOME"
+else
+    log "Updating existing clone at $CELLS_HOME"
+    run git -C "$CELLS_HOME" pull --ff-only || warn "git pull --ff-only failed; continuing with current HEAD"
+fi
+if [[ -d "$CELLS_HOME" ]]; then
+    cd "$CELLS_HOME"
+    run chmod +x scripts/rebuild_liboqs.sh scripts/build.sh 2>/dev/null || true
+elif [[ "$DRY_RUN" == "1" ]]; then
+    warn "[dry-run] would cd to $CELLS_HOME (does not exist yet -- skipping subsequent fs-relative steps)"
+    log "Dry-run complete (stopped before liboqs / build because source tree is absent)."
+    exit 0
+else
+    die "$CELLS_HOME does not exist after clone/pull -- this should not happen"
+fi
+
+# --- 4. liboqs --------------------------------------------------------------
+if [[ "$SKIP_LIBOQS" == "1" && -d "$CELLS_HOME/liboqs_install" ]]; then
+    log "Skipping liboqs build (cached at $CELLS_HOME/liboqs_install)"
+elif [[ -d "$CELLS_HOME/liboqs_install" ]]; then
+    log "Reusing existing liboqs_install ($CELLS_HOME/liboqs_install)"
+else
+    log "Building liboqs (this can take 10-30 minutes on a small VPS)..."
+    run ./scripts/rebuild_liboqs.sh
+fi
+
+# --- 5. binary --------------------------------------------------------------
+if [[ "$SKIP_BUILD" == "1" && -x "$CELLS_HOME/CELLS" ]]; then
+    log "Skipping Go build (reusing $CELLS_HOME/CELLS)"
+else
+    log "Building CELLS-validator binary..."
+    run ./scripts/build.sh
+    [[ "$DRY_RUN" == "1" ]] || test -x "./CELLS" || die "Build produced no binary at $CELLS_HOME/CELLS"
+fi
+
+# --- 6. install dir + user --------------------------------------------------
+log "Provisioning service user + dirs..."
+if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+    run useradd -r -s /usr/sbin/nologin -d "$INSTALL_DIR" "$SERVICE_USER"
+fi
+run mkdir -p "$INSTALL_DIR" "$DATA_DIR"
+run chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$DATA_DIR"
+
+run install -m 0755 "$CELLS_HOME/CELLS" "$INSTALL_DIR/CELLS-validator"
+if [[ -d "$CELLS_HOME/liboqs_install" ]]; then
+    run cp -a "$CELLS_HOME/liboqs_install" "$INSTALL_DIR/"
+    run chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/liboqs_install"
+fi
+
+# --- 7. config --------------------------------------------------------------
+CONFIG_FILE="$INSTALL_DIR/config.toml"
+log "Writing $CONFIG_FILE"
+if [[ "$DRY_RUN" != "1" ]]; then
+    cat > "$CONFIG_FILE" <<EOF
+# CELLS validator config -- generated by bring-up-validator.sh (index=${INDEX}).
+# Do not hand-edit without also updating the bring-up script -- re-running
+# the script will REWRITE this file.
+
+[node]
+role            = "validator"
+mining_enabled  = false
+
+[network]
+port            = ${P2P_PORT}
+bootstrap_peers = [
+    "${BOOTSTRAP}",
+]
+
+[storage]
+type        = "sqlite"
+sqlite_path = "${DATA_DIR}/CELLS.db"
+
+[monitoring]
+dashboard_port = ${DASHBOARD_PORT}
+log_viewer_port = 0
+log_file       = "${DATA_DIR}/CELLS.log"
+log_level      = "INFO"
+
+[api]
+port        = ${API_PORT}
+enable_tls  = false
+tls_cert_file = ""
+tls_key_file  = ""
+strict_secrets = ${STRICT_SECRETS}
+
+[consensus]
+# Consensus messages are signed by every modern validator. Enforce rejection of
+# unsigned messages only at one operator-approved future height shared by the
+# entire validator set; see SIGNED_CONSENSUS_ROLLOUT.md.
+require_signed_votes = ${REQUIRE_SIGNED_VOTES}
+signed_message_activation_height = ${SIGNED_MESSAGE_ACTIVATION_HEIGHT}
+task_action_signature_activation_height = ${TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT}
+tx_content_root_activation_height = ${TX_CONTENT_ROOT_ACTIVATION_HEIGHT}
+enrollment_state_root_activation_height = ${ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT}
+signer_key_path = "CELLS_consensus_signer.json"
+${AUTHORIZED_BLOCK_PRODUCERS_TOML}
+
+[performance]
+transaction_interval = "1h"
+health_check_interval = "30s"
+EOF
+    chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_FILE"
+    chmod 0640 "$CONFIG_FILE"
+fi
+
+# --- 8. systemd unit --------------------------------------------------------
+UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+log "Writing $UNIT_PATH"
+if [[ "$DRY_RUN" != "1" ]]; then
+    cat > "$UNIT_PATH" <<EOF
+[Unit]
+Description=CELLS validator (index ${INDEX})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/CELLS-validator
+Restart=always
+RestartSec=10
+
+Environment="CGO_ENABLED=1"
+Environment="LD_LIBRARY_PATH=${INSTALL_DIR}/liboqs_install/lib:${INSTALL_DIR}/liboqs_install/lib64:/usr/local/lib64:/usr/local/lib"
+Environment="CONFIG_FILE=${CONFIG_FILE}"
+Environment="CELLS_LOG_STDOUT=false"
+# Restrict WebSocket origins. initialiseWSAllowedOriginsFromEnv
+# (internal/dashboard/websocket.go) returns early when neither this nor
+# CELLS_CORS_ALLOWED_ORIGINS is set, leaving CheckOrigin permissive -- that
+# file's own comment says production wiring MUST call it. The dashboard
+# binds loopback by default and /ws now requires authentication, so this is
+# defence in depth rather than the only control; set it to the operator's
+# real dashboard origin when fronting the node with a reverse proxy.
+Environment="CELLS_WS_ALLOWED_ORIGINS=http://127.0.0.1:${DASHBOARD_PORT},http://localhost:${DASHBOARD_PORT}"
+# CELLS_CONFIG_FILE is set ahead of a future Go-side migration that
+# would teach pkg/config/config.go to read it before falling back to
+# the bare CONFIG_FILE name. As of today the binary ONLY reads
+# CONFIG_FILE (see config.go:179), so this line is a no-op the binary
+# ignores; it exists so a deploy unit that later flips on CELLS_CONFIG_FILE
+# reads doesn't need a unit-file edit. Do NOT remove the CONFIG_FILE
+# line above — that is the single source the binary actually consults.
+Environment="CELLS_CONFIG_FILE=${CONFIG_FILE}"
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${INSTALL_DIR} ${DATA_DIR}
+
+LimitNOFILE=65536
+LimitNPROC=4096
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SERVICE_NAME}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
+run systemctl daemon-reload
+run systemctl enable "${SERVICE_NAME}"
+run systemctl restart "${SERVICE_NAME}"
+
+# --- 9. firewall ------------------------------------------------------------
+if [[ "$SKIP_FIREWALL" == "1" ]]; then
+    log "Skipping ufw (per --skip-firewall)"
+elif command -v ufw >/dev/null 2>&1; then
+    log "Opening libp2p port ${P2P_PORT}/tcp in ufw (API/dashboard stay on loopback)"
+    run ufw allow "${P2P_PORT}/tcp" || warn "ufw allow failed; continuing"
+fi
+
+# --- 10. health wait --------------------------------------------------------
+if [[ "$DRY_RUN" == "1" ]]; then
+    log "Dry-run complete."
+    exit 0
+fi
+
+log "Waiting up to ${HEALTH_TIMEOUT_SEC}s for the validator to reach READY + peer-count>=1..."
+deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SEC ))
+ready=0
+peered=0
+while [[ "$(date +%s)" -lt "$deadline" ]]; do
+    if [[ "$ready" -eq 0 ]]; then
+        code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${API_PORT}/api/v1/health/ready" || true)"
+        if [[ "$code" == "200" ]]; then
+            log "READY (/api/v1/health/ready -> 200)"
+            ready=1
+        fi
+    fi
+    if [[ "$ready" -eq 1 && "$peered" -eq 0 ]]; then
+        # The status endpoint exposes peer counts; fall back to 'status' if
+        # the specific peer field is not present.
+        peers="$(curl -sS "http://127.0.0.1:${API_PORT}/api/v1/status" 2>/dev/null \
+                 | jq -r '.network.peer_count // .peer_count // 0' 2>/dev/null || echo 0)"
+        if [[ "$peers" =~ ^[0-9]+$ && "$peers" -ge 1 ]]; then
+            log "Connected to ${peers} peer(s) via ${BOOTSTRAP}"
+            peered=1
+            break
+        fi
+    fi
+    sleep 3
+done
+
+if [[ "$ready" -ne 1 ]]; then
+    warn "Validator did not report READY within ${HEALTH_TIMEOUT_SEC}s -- check 'journalctl -u ${SERVICE_NAME} -n 100'"
+    systemctl --no-pager -l status "${SERVICE_NAME}" || true
+    exit 2
+fi
+if [[ "$peered" -ne 1 ]]; then
+    warn "Validator is READY but has 0 peers. Common causes:"
+    warn "  * Firewall on the bootstrap host is blocking ${BOOTSTRAP} (check its ufw/sec-group)."
+    warn "  * Bootstrap multiaddr is stale (peer-id changes on key rotation)."
+    warn "  * Primary validator is not actually listening on the tcp port in the multiaddr."
+    exit 3
+fi
+
+# --- 11. done ---------------------------------------------------------------
+log "Validator ${INDEX} is up and peered."
+cat <<EOF
+
+${C_GRN}Summary${C_NC}
+  service:        systemctl status ${SERVICE_NAME}
+  journal:        journalctl -u ${SERVICE_NAME} -f
+  config:         ${CONFIG_FILE}
+  data dir:       ${DATA_DIR}
+  libp2p:         tcp ${P2P_PORT} (open on firewall)
+  API:            http://127.0.0.1:${API_PORT}          (loopback; front with Caddy for TLS)
+  Dashboard:      http://127.0.0.1:${DASHBOARD_PORT}    (loopback; keep private)
+  bootstrap:      ${BOOTSTRAP}
+
+Next steps:
+  * Front the API with Caddy / nginx (see docs/docs/VALIDATOR_QUICKSTART.md §6).
+  * Back up ${DATA_DIR} *before* exposing this node to the public network.
+    The ML-DSA-87 signing key lives there and is unique to this validator.
+  * (Optional) Enable NGC attestation -- see apps/CELLS-nvidia-ngc/QUICKSTART.md.
+
+EOF

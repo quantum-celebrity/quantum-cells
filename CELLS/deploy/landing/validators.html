@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Validators &amp; bootstrap peers — CELLS · Cell (CELL)</title>
+<meta name="description" content="Official bootstrap address and public endpoints for the CELLS network. Use these values in your validator's bootstrap_peers configuration." />
+<meta name="theme-color" content="#061116" />
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/assets/brand/favicon-16.png" />
+<link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+<link rel="manifest" href="/site.webmanifest" />
+<meta property="og:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="CELLS logo: Quantum-Secure Dynamic Mesh ledger and the CELL coin" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<link rel="stylesheet" href="/assets/site.css" />
+<link rel="stylesheet" href="/assets/site-shell.css" />
+
+<style>
+  :root {
+    --bg: #061116;
+    --bg-2: #0a1f26;
+    --panel: #0c242c;
+    --panel-2: #12323c;
+    --border: rgba(142, 220, 224, 0.16);
+    --text: #f4fbfd;
+    --text-2: rgba(244, 251, 253, 0.62);
+    --muted: rgba(173, 198, 204, 0.72);
+    --gold: #d6b75f;
+    --teal: #8edce0;
+    --accent: #d6b75f;
+    --accent-2: #8edce0;
+    --accent-3: #8edce0;
+    --ink: #061116;
+    --danger: #ff6b6b;
+    --warn: #ffb454;
+    --success: #3ddc97;
+    --warning: #e8c547;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.5; }
+  a { color: var(--accent-3); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); background: rgba(255,255,255,.06); padding: 1px 6px; border-radius: 4px; font-size: .92em; }
+  pre {
+    font-family: var(--mono); background: rgba(0,0,0,.35); padding: 14px 16px;
+    border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; font-size: 13px;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .container { max-width: 960px; margin: 0 auto; padding: 36px 20px; }
+  header { border-bottom: 1px solid var(--border); background: rgba(6,17,22,.82); backdrop-filter: saturate(140%) blur(10px); position: sticky; top: 0; z-index: 10; }
+  header .container { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 700; }
+  .brand svg { width: 26px; height: 26px; }
+  .brand .plus { color: var(--accent); }
+  h1 { font-size: 34px; line-height: 1.1; margin: 0 0 10px; letter-spacing: 0; }
+  h2 { font-size: 20px; margin: 30px 0 8px; }
+  h3 { font-size: 16px; margin: 20px 0 6px; color: var(--text-2); font-weight: 700; letter-spacing: .3px; text-transform: uppercase; }
+  .lede { color: var(--text-2); font-size: 17px; max-width: 720px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 22px 24px;
+    box-shadow: 0 10px 30px -12px rgba(0,0,0,.55); margin-top: 18px;
+  }
+  .panel.hl { border-color: rgba(214,183,95,.35); background: var(--panel-2); }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 8px 18px; margin: 10px 0 0; }
+  @media (max-width: 640px) { .kv { grid-template-columns: 1fr; } }
+  .kv .k { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .6px; }
+  .kv .v { color: var(--text); font-family: var(--mono); font-size: 13.5px; word-break: break-all; }
+  .kv .v .note { color: var(--muted); font-family: var(--sans); font-size: 12.5px; }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+    background: rgba(142,220,224,.08); color: var(--accent-2); border: 1px solid rgba(142,220,224,.25);
+    font-weight: 700; letter-spacing: .4px; text-transform: uppercase;
+  }
+  .tag.warn { background: rgba(255,180,84,.08); color: var(--warn); border-color: rgba(255,180,84,.35); }
+  .tag.ok { background: rgba(61,220,151,.08); color: var(--success); border-color: rgba(61,220,151,.35); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 10px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--text); font-weight: 700; font-size: 13px; background: rgba(255,255,255,.03); }
+  footer { border-top: 1px solid var(--border); color: var(--muted); padding: 36px 0; margin-top: 40px; }
+  footer .container { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; font-size: 13px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 16px; border-radius: 8px; font-weight: 600; font-size: 14px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  }
+  .btn:hover { background: var(--panel-2); text-decoration: none; }
+  .btn.primary { background: var(--gold, var(--accent)); color: var(--ink, #061116); border-color: rgba(214, 183, 95, .55); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  /* "Verified by public audit" cross-reference callout — same
+   * vocabulary as trust.html so the visual treatment is consistent
+   * across every page that cross-references the audit checklist.
+   * Accent-blue border to distinguish from the green ".panel.hl"
+   * callouts (which mark the official live value) —
+   * this one reads as "this surface is itself audited". */
+  .audit-callout {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    padding: 14px 18px; margin: 20px 0;
+    border: 1px solid var(--border); border-left: 3px solid var(--accent-3);
+    background: rgba(142,220,224,0.05);
+    border-radius: 8px;
+  }
+  .audit-callout .audit-callout-badge {
+    flex: 0 0 auto;
+    padding: 10px 12px;
+    background: rgba(0,0,0,.30);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex; align-items: center;
+  }
+  .audit-callout .audit-callout-badge img { display: block; height: 20px; }
+  .audit-callout .audit-callout-text { flex: 1 1 280px; color: var(--text-2); font-size: 13.5px; line-height: 1.55; }
+  .audit-callout .audit-callout-text strong { color: var(--text); }
+  .audit-callout .audit-callout-text a { color: var(--accent-3); font-weight: 600; }
+  .audit-callout .audit-callout-text code { font-family: var(--mono); background: rgba(255,255,255,.06); padding: 1px 6px; border-radius: 4px; font-size: 12px; color: var(--text); }
+</style>
+</head>
+<body data-page="validators">
+
+<header id="site-header"></header>
+<script src="/assets/site-shell.js"></script>
+
+<main id="main" class="container">
+
+<h1>Validators &amp; bootstrap peers</h1>
+<p class="lede">
+  This page publishes the official bootstrap address for the <strong>CELLS public pilot network</strong>
+  (pre-mainnet). A new validator uses this value once, at startup, to discover the libp2p mesh. After the
+  handshake your node gossips directly with the other peers — <code>api.CELLS.tech</code> is a bootstrap, not a hub.
+  Today the chain is produced by a single block producer during recovery, so the peer count below may read 0;
+  independent validators are on the roadmap.
+</p>
+
+<!-- Cross-reference to the public audit checklist. The network
+     category pins the rules under which the validator mesh
+     operates (DHT Sybil resistance, libp2p P2P stack, peer
+     discovery, bootstrap protocol). 5 rows in that category, all
+     passing as of the latest deploy. -->
+<div class="audit-callout">
+  <a class="audit-callout-badge" href="/audit.html?category=network"
+     title="Open the 5 network audit rows on audit.html">
+    <img src="/api/v1/audit/badge.svg" alt="CELLS audit score (live)" />
+  </a>
+  <div class="audit-callout-text">
+    <strong>Network stack is on the internal audit checklist.</strong>
+    Five <code>network</code> checklist rows pin DHT, libp2p, discovery,
+    and bootstrap peers used below. This is a self-maintained checklist, not an independent audit.
+    See <a href="/audit.html?category=network">audit.html?category=network</a>.
+  </div>
+</div>
+
+<div class="panel hl">
+  <span class="tag ok">Official · Public · Live</span>
+  <h2 style="margin-top:8px">Project bootstrap validator — <code>api.CELLS.tech</code></h2>
+  <p style="color:var(--text-2); margin:6px 0 4px;">
+    The official bootstrap validator for the public CELLS network. It is operated by the CELLS project.
+  </p>
+
+  <h3>libp2p bootstrap multiaddr</h3>
+  <pre id="multiaddr-live">/ip4/206.189.132.232/tcp/4001/p2p/<span id="peer-id">12D3KooWRH4MGiaRYMZEr9LvdxYrpePT5LPbNqLTMGukD32yhkZ8</span></pre>
+  <p style="color:var(--muted); font-size:12.5px; margin-top:6px;">
+    This is the value you paste into <code>bootstrap_peers</code> in your
+    <code>CELLS.toml</code> / <code>CELLS.yaml</code>, or into the
+    <code>BOOTSTRAP_PEERS</code> environment variable for Docker deployments. The peer-id rotates
+    when the node's libp2p private key rotates. The values on this page refresh live from
+    <code>/api/v1/status</code> every 30&nbsp;s in a browser; the static HTML is also re-synced on
+    every redeploy so <code>curl</code> / non-JS crawlers see the current value too.
+  </p>
+
+  <!-- Live operator-facing status row, populated from /api/v1/status
+       on page load and refreshed every 30 s by the IIFE at the bottom
+       of this file. Until the fetch completes (or if it fails — offline,
+       CORS, validator down), every value reads "—". Per-field "—"
+       persists when the API omits or returns a non-matching type for
+       the field, so the row is robust against API-shape drift. -->
+  <div id="status-live" aria-label="Live validator status from /api/v1/status" style="display:flex;gap:18px;flex-wrap:wrap;align-items:baseline;margin-top:10px;padding:10px 14px;background:rgba(0,0,0,0.20);border:1px solid var(--border);border-radius:8px;font-size:12.5px;color:var(--text-2);">
+    <span><span style="color:var(--muted)">Peers:</span> <strong id="st-peers" style="color:var(--text);font-family:var(--mono);">—</strong></span>
+    <span><span style="color:var(--muted)">Chain tip:</span> <strong id="st-tip" style="color:var(--text);font-family:var(--mono);">—</strong></span>
+    <span><span style="color:var(--muted)">Uptime:</span> <strong id="st-uptime" style="color:var(--text);font-family:var(--mono);">—</strong></span>
+    <span><span style="color:var(--muted)">Version:</span> <strong id="st-version" style="color:var(--text);font-family:var(--mono);">—</strong></span>
+    <span style="margin-left:auto;color:var(--muted);font-size:11px;">refreshed <span id="st-refreshed">—</span></span>
+  </div>
+
+  <h3>Public endpoints</h3>
+  <div class="kv">
+    <div class="k">REST / JSON-RPC</div>
+    <div class="v"><a href="https://api.CELLS.tech/api/v1/health">https://api.CELLS.tech/api/v1/*</a></div>
+    <div class="k">Trust summary</div>
+    <div class="v"><a href="https://api.CELLS.tech/api/v1/trust/attestations/summary">.../trust/attestations/summary</a></div>
+    <div class="k">Trust recent</div>
+    <div class="v"><a href="https://api.CELLS.tech/api/v1/trust/attestations/recent">.../trust/attestations/recent</a></div>
+    <div class="k">Mining work</div>
+    <div class="v"><a href="https://api.CELLS.tech/api/v1/mining/work">.../mining/work</a> <span class="note">— point your miner here with <code>--validator=https://api.CELLS.tech</code></span></div>
+    <div class="k">Live status</div>
+    <div class="v"><a href="https://api.CELLS.tech/api/v1/status">.../status</a> <span class="note">— returns current node-id, chain tip, peer count</span></div>
+    <div class="k">Prometheus</div>
+    <div class="v"><a href="https://api.CELLS.tech/api/metrics/prometheus">.../api/metrics/prometheus</a></div>
+    <div class="k">Dashboard</div>
+    <div class="v"><a href="https://dashboard.CELLS.tech/">https://dashboard.CELLS.tech/</a></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Using this value</h2>
+  <p style="color:var(--text-2); margin-bottom:10px;">
+    Drop the multiaddr above into the <code>[network] bootstrap_peers</code> block of your
+    validator config, then start the service. You do <strong>not</strong> need to list every peer —
+    libp2p discovers the rest via PEX after the initial handshake.
+  </p>
+
+  <h3>TOML</h3>
+  <pre>[network]
+port            = 4001
+bootstrap_peers = [
+  "/ip4/206.189.132.232/tcp/4001/p2p/12D3KooWRH4MGiaRYMZEr9LvdxYrpePT5LPbNqLTMGukD32yhkZ8",
+]</pre>
+
+  <h3>Environment variable (Docker / systemd)</h3>
+  <pre>BOOTSTRAP_PEERS=/ip4/206.189.132.232/tcp/4001/p2p/12D3KooWRH4MGiaRYMZEr9LvdxYrpePT5LPbNqLTMGukD32yhkZ8</pre>
+
+  <h3>CLI (<code>bring-up-validator.sh</code>)</h3>
+  <pre>sudo bash CELLS/deploy/bring-up-validator.sh \
+  --bootstrap /ip4/206.189.132.232/tcp/4001/p2p/12D3KooWRH4MGiaRYMZEr9LvdxYrpePT5LPbNqLTMGukD32yhkZ8</pre>
+
+  <p style="color:var(--muted); font-size:12.5px; margin-top:12px;">
+    Full procedure: see the <a href="https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/OPERATOR_GUIDE.md">Operator Guide</a>
+    (end-to-end) or <a href="https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/VALIDATOR_QUICKSTART.md">VALIDATOR_QUICKSTART.md</a>
+    (reference).
+  </p>
+</div>
+
+<div class="panel">
+  <h2>Why only one bootstrap peer?</h2>
+  <p style="color:var(--text-2);">
+    The public network is a pre-mainnet pilot. <code>api.CELLS.tech</code> is currently its official bootstrap validator. As more
+    operators stand up validators, this page will list multiple bootstrap peers (any single one is enough to
+    join the mesh). The protocol does not assign privileged status to the project's VPS; you are welcome to
+    stand up your own validator and become an alternate bootstrap peer. To have your validator listed here,
+    open an issue on
+    <a href="https://github.com/blackbeardONE/CELLS/issues">github.com/blackbeardONE/CELLS/issues</a>
+    with your public multiaddr and a brief ops description (uptime target, contact email).
+  </p>
+</div>
+
+<div class="panel">
+  <h2>If the multiaddr looks stale</h2>
+  <p style="color:var(--text-2);">
+    The libp2p <em>peer-id</em> (the <code>12D3Koo…</code> suffix) rotates whenever the node's
+    <code>node-p2p-id.json</code> is regenerated. If your validator logs show
+    <code>failed to dial bootstrap peer</code> errors or <code>connected_peers=0</code> that never
+    resolves, pull the current node-id live from the status endpoint and try again:
+  </p>
+  <pre>curl -s https://api.CELLS.tech/api/v1/status | jq -r .node_id</pre>
+  <p style="color:var(--muted); font-size:12.5px;">
+    The IP (<code>206.189.132.232</code>) and port (<code>4001/tcp</code>) are intentionally stable for
+    public bootstrap configuration.
+  </p>
+</div>
+
+<div class="row">
+  <a class="btn primary" href="https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/OPERATOR_GUIDE.md">Operator guide (end-to-end)</a>
+  <a class="btn" href="https://github.com/blackbeardONE/CELLS/blob/main/CELLS/docs/docs/VALIDATOR_QUICKSTART.md">VALIDATOR_QUICKSTART.md</a>
+  <a class="btn" href="/trust.html">Attestation transparency</a>
+  <a class="btn" href="/">Back to landing</a>
+</div>
+
+</main>
+
+<div class="q-wrap"><p class="q-note page-foot-note">© <span id="y"></span> CELLS · CELL. Public network bootstrap peer updated on every redeploy.</p></div>
+<footer id="site-footer"></footer>
+
+<script>
+  (function() {
+    "use strict";
+
+    document.getElementById('y').textContent = new Date().getFullYear();
+
+    // refresh() fetches /api/v1/status and updates the page:
+    //   1. The peer-id span + every 12D3Koo… occurrence inside <pre>
+    //      blocks (the TOML / env-var / CLI bootstrap examples below
+    //      the multiaddr panel).
+    //   2. The new live status strip — peers, chain tip, uptime,
+    //      version — and a small "refreshed HH:MM:SS" timestamp.
+    //
+    // Per-field defensive checks: each strip field only updates if
+    // /api/v1/status returned a value of the expected type. A future
+    // API change that drops a field or changes its shape silently
+    // leaves the prior value (or the initial "—" placeholder) in
+    // place — never NaN / "[object Object]" / "undefined".
+    //
+    // Hard-fails (network down, validator restart, CORS, 5xx) are
+    // swallowed by the catch — the static HTML rendered server-side
+    // is the always-good fallback, including for non-JS crawlers.
+    //
+    // Cadence: one refresh on DOMContentLoaded equivalent (this
+    // script tag sits at the bottom of <body> so the DOM is ready
+    // when it runs), then setInterval at 30 s. Single tab → ~2880
+    // requests/day; rate limiting at the validator is per-IP and
+    // does not gate this endpoint, so even hundreds of concurrent
+    // viewers stay comfortably under any threshold.
+    function setText(id, txt) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = txt;
+    }
+
+    function fmtNum(n) {
+      if (typeof n !== 'number' || !isFinite(n) || n < 0) return '—';
+      return n.toLocaleString();
+    }
+
+    function fmtRefreshedAt(d) {
+      // HH:MM:SS in the visitor's locale — the absolute clock-time
+      // is more useful for "is this stale?" than a "5 s ago" string
+      // that requires the visitor to keep doing the math.
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/v1/status', { cache: 'no-store' });
+        if (!res.ok) return;
+        const j = await res.json();
+        if (!j || typeof j !== 'object') return;
+
+        // (1) Peer-id propagation — original behaviour, kept byte-
+        // identical: validate against the libp2p multihash prefix
+        // (12D3Koo… + base58btc body) before any DOM write, so a
+        // bogus or empty node_id does not blow away the static
+        // fallback. Updates the headline #peer-id span first, then
+        // sweeps every <pre> block for any 12D3Koo… run so the
+        // copy-paste examples (TOML, env var, bring-up-validator.sh)
+        // also stay current. Guard on textContent !== node_id keeps
+        // us from churning the DOM (and any text-selection state)
+        // on every 30 s refresh when the value is unchanged.
+        if (typeof j.node_id === 'string' && /^12D3Koo[A-Za-z0-9]+$/.test(j.node_id)) {
+          const el = document.getElementById('peer-id');
+          if (el && el.textContent !== j.node_id) {
+            el.textContent = j.node_id;
+            document.querySelectorAll('pre').forEach(function(pre) {
+              pre.innerHTML = pre.innerHTML.replace(/12D3Koo[A-Za-z0-9]+/g, j.node_id);
+            });
+          }
+        }
+
+        // (2) Live status strip — each field only updates when the
+        // API returned a value of the expected type. Missing /
+        // wrong-type fields leave the prior rendered text intact.
+        if (typeof j.peers === 'number') setText('st-peers', fmtNum(j.peers));
+        if (typeof j.chain_tip === 'number') setText('st-tip', fmtNum(j.chain_tip));
+        if (typeof j.uptime === 'string' && j.uptime) setText('st-uptime', j.uptime);
+        if (typeof j.version === 'string' && j.version) setText('st-version', j.version);
+        setText('st-refreshed', fmtRefreshedAt(new Date()));
+      } catch (_e) {
+        // offline / CORS / 5xx — keep static value (and prior strip
+        // values if we've succeeded at least once this session).
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 30000);
+  })();
+</script>
+
+</body>
+</html>

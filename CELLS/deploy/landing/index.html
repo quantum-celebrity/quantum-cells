@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CELLS — CELL pilot network: ML-DSA-87 wallet signatures, NVIDIA GPU mining</title>
+  <meta name="description" content="CELLS is the public pilot network (pre-mainnet) for CELL: ML-DSA-87 post-quantum wallet signatures, 10-second target blocks, a 90,000,000 CELL cap, and NVIDIA GPU mining through CELLS Hive. Single block producer during recovery. Live chain stats and specs." />
+  <link rel="canonical" href="https://CELLS.tech/" />
+  <meta name="theme-color" content="#061116" />
+  <meta property="og:title" content="CELLS — CELL pilot network with post-quantum wallet signatures" />
+  <meta property="og:description" content="Pilot network (pre-mainnet). ML-DSA-87 wallet signatures, 10-second target blocks, 90,000,000 CELL cap, NVIDIA GPU mining via CELLS Hive." />
+  <meta property="og:url" content="https://CELLS.tech/" />
+  <meta property="og:type" content="website" />
+  <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/brand/favicon-16.png" />
+  <link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <meta property="og:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="CELLS logo: Quantum-Secure Dynamic Mesh ledger and the CELL coin" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+  <link rel="stylesheet" href="/assets/site.css" />
+  <link rel="stylesheet" href="/assets/site-shell.css" />
+  <style>
+    .home-hero { padding: 4rem 0 2rem; }
+    .home-hero h1 {
+      margin: 0 0 1rem;
+      font-size: clamp(2.2rem, 5.5vw, 3.8rem);
+      font-weight: 600;
+      line-height: 1.06;
+      max-width: 22ch;
+    }
+    .home-hero h1 .dim { color: var(--muted); }
+    .keyfacts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin: 1.4rem 0 0;
+      padding: 0;
+      list-style: none;
+    }
+    .keyfacts li {
+      padding: 0.3rem 0.75rem;
+      border: 1px solid var(--border-2);
+      border-radius: 999px;
+      color: var(--text-2);
+      font-size: 0.86rem;
+    }
+    .keyfacts .mono { color: var(--gold); }
+    .spec-wrap > * { max-width: 56rem; }
+    .cta {
+      padding: 3rem 1.5rem;
+      border: 1px solid var(--border-2);
+      border-radius: var(--radius);
+      background: linear-gradient(135deg, rgba(214, 183, 95, 0.10), rgba(142, 220, 224, 0.06));
+      text-align: center;
+    }
+    .cta h2 { margin: 0 0 0.6rem; font-size: clamp(1.6rem, 3.5vw, 2.3rem); font-weight: 600; }
+    .cta p { margin: 0 auto; max-width: 36rem; color: var(--muted); }
+    .cta .q-actions { justify-content: center; }
+  </style>
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "CELLS",
+      "applicationCategory": "FinanceApplication",
+      "operatingSystem": "Windows, Linux",
+      "description": "CELLS ecosystem with the CELL network, CELLS Hive, NVIDIA-attested mining, pooled edge compute, and CELLS VPN.",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+    }
+  </script>
+</head>
+<body data-page="home">
+  <header id="site-header"></header>
+  <script src="/assets/site-shell.js"></script>
+
+  <main id="main">
+    <section class="home-hero" aria-labelledby="hero-title">
+      <div class="q-wrap">
+        <span class="q-eyebrow">CELLS · CELL</span>
+        <h1 id="hero-title">Post-quantum wallet signatures <span class="dim">for the CELL coin, mined on NVIDIA GPUs.</span></h1>
+        <p class="lead">
+          CELL wallet transactions are signed with ML-DSA-87 (NIST FIPS 204). Blocks
+          target 10 seconds, supply is capped at 90,000,000 CELL, and anyone can read
+          the chain through the public API. CELLS is a pilot network (pre-mainnet) run by
+          a single block producer during recovery; consensus signing and independent
+          validators are on the roadmap.
+        </p>
+        <ul class="keyfacts" aria-label="Key facts">
+          <li>Wallet signatures <span class="mono">ML-DSA-87</span></li>
+          <li>Stage <span class="mono">Pilot · pre-mainnet</span></li>
+          <li>Block time <span class="mono">10 s</span></li>
+          <li>Max supply <span class="mono">90,000,000 CELL</span></li>
+          <li>Mining <span class="mono">NVIDIA GPU · CELLS Hive</span></li>
+        </ul>
+        <div class="q-actions">
+          <a class="site-btn site-btn-solid" href="/download.html">Download Hive</a>
+          <a class="site-btn site-btn-ghost" href="/mining.html">Start mining</a>
+          <a class="site-btn site-btn-ghost" href="/explorer.html">Open explorer</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="stats-sec" aria-labelledby="stats-title">
+      <div class="q-wrap">
+        <h2 id="stats-title" class="visually-hidden">Live network stats</h2>
+        <div class="stat-strip">
+          <div class="q-stat">
+            <span class="stat-label">Block height</span>
+            <span class="stat-value" id="s-height">—</span>
+            <span class="stat-sub">chain tip</span>
+          </div>
+          <div class="q-stat">
+            <span class="stat-label">Target block time</span>
+            <span class="stat-value" id="s-blocktime">10 s</span>
+            <span class="stat-sub">protocol target</span>
+          </div>
+          <div class="q-stat">
+            <span class="stat-label"><img class="cell-ico" src="/assets/brand/cell-coin-small.svg" alt="" width="14" height="14" />Emitted supply</span>
+            <span class="stat-value" id="s-emitted">—</span>
+            <span class="stat-sub">of <span id="s-cap">90,000,000</span> CELL cap · <span id="s-emitted-pct">—</span></span>
+            <div class="q-meter" aria-hidden="true"><span id="s-meter"></span></div>
+          </div>
+          <div class="q-stat">
+            <span class="stat-label"><img class="cell-ico" src="/assets/brand/cell-coin-small.svg" alt="" width="14" height="14" />Block reward</span>
+            <span class="stat-value" id="s-reward">3.56490987</span>
+            <span class="stat-sub">CELL per block · epoch <span id="s-epoch">0</span></span>
+          </div>
+          <div class="q-stat">
+            <span class="stat-label">Enrolled miners</span>
+            <span class="stat-value" id="s-miners">—</span>
+            <span class="stat-sub" id="s-miners-sub">NVIDIA nodes</span>
+          </div>
+          <div class="q-stat">
+            <span class="stat-label">Latest block</span>
+            <span class="stat-value" id="s-age">—</span>
+            <span class="stat-sub" id="s-age-sub">age of chain tip</span>
+          </div>
+        </div>
+        <p class="source-line" id="s-source">
+          Source: <code>api.CELLS.tech/api/v1</code> <code>/status</code>, <code>/mining/emission</code>,
+          <code>/mining/enrollments</code>, <code>/mining/blocks</code> · <span id="s-updated">loading…</span>
+        </p>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="why-title">
+      <div class="q-wrap">
+        <div class="sec-head">
+          <h2 id="why-title">Why CELLS</h2>
+          <p>Six facts, each one checkable on the live network or in the source.</p>
+        </div>
+        <ul class="facts">
+          <li><strong>Post-quantum signatures</strong><span>Wallets sign transactions with ML-DSA-87 (NIST FIPS 204), a lattice scheme designed to resist quantum attacks. Signed consensus messages are supported in the node but not yet switched on.</span></li>
+          <li><strong>Fixed, published supply</strong><span>The cap is 90,000,000 CELL and the block reward halves every 12,623,040 blocks (about four years at 10 s).</span></li>
+          <li><strong>GPU mining with attestation</strong><span>Miners enroll an NVIDIA GPU through CELLS Hive and earn CELL for accepted proof-of-work in capped windows.</span></li>
+          <li><strong>Self-custody by default</strong><span>Keys are generated and kept on your device; Hive and the web wallet sign locally and send only signed transactions.</span></li>
+          <li><strong>Open, keyless API</strong><span>Status, blocks, receipts, balances and miner enrollments are public HTTP reads with no account or API key.</span></li>
+          <li><strong>Public audit checklist</strong><span>An open internal checklist with live pass/pending counts is published at <a href="/audit.html">/audit.html</a>, and the source is MIT-licensed on GitHub. An independent external audit has not yet been completed.</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="spec-title">
+      <div class="q-wrap spec-wrap">
+        <div class="sec-head">
+          <h2 id="spec-title" class="spec-coin-head"><img src="/assets/brand/cell-coin.svg" alt="" width="40" height="40" />Specification</h2>
+          <p>Values marked <em>live</em> are read from the public API when the page loads.</p>
+        </div>
+        <table class="spec-table" aria-labelledby="spec-title">
+          <tbody>
+            <tr><th scope="row">Ticker</th><td><img class="cell-ico" src="/assets/brand/cell-coin-small.svg" alt="" width="16" height="16" /><span class="mono">CELL</span> <span class="q">(coin name: Cell)</span></td></tr>
+            <tr><th scope="row">Smallest unit</th><td><span class="mono">dust</span> <span class="q">(1 CELL = 100,000,000 dust)</span></td></tr>
+            <tr><th scope="row">Decimals</th><td><span class="mono">8</span></td></tr>
+            <tr><th scope="row">Target block time</th><td><span class="mono">10 s</span></td></tr>
+            <tr><th scope="row">Block reward</th><td><span class="mono" id="t-reward">3.56490987 CELL</span> <span class="q">(epoch <span id="t-epoch">0</span>; halves every <span class="mono">12,623,040</span> blocks; next halving at height <span class="mono" id="t-halving">12,623,041</span>, <span id="t-halving-eta">—</span>)</span></td></tr>
+            <tr><th scope="row">Max supply</th><td><span class="mono">90,000,000 CELL</span></td></tr>
+            <tr><th scope="row">Emitted <span class="q">(live)</span></th><td><span class="mono" id="t-emitted">—</span></td></tr>
+            <tr><th scope="row">Wallet transaction signatures</th><td><span class="mono">ML-DSA-87</span> <span class="q">(post-quantum, NIST FIPS 204)</span></td></tr>
+            <tr><th scope="row">Address format</th><td>64 hex characters = SHA-256 of the ML-DSA-87 public key <span class="q">(lowercase <span class="mono">0-9a-f</span>, no prefix)</span></td></tr>
+            <tr><th scope="row">Network stage</th><td>Pilot network (pre-mainnet). Treat balances and history as pilot data until the genesis, multisig and independent-audit milestones are complete.</td></tr>
+            <tr><th scope="row">Consensus / producer</th><td>Single block producer during recovery; a backup node follows the chain. Signed consensus votes are supported but not yet active. <a href="/network.html">Live status</a></td></tr>
+            <tr><th scope="row">Mining</th><td>NVIDIA GPU via CELLS Hive · mining protocol <span class="mono">v2</span> · attestation <span class="mono">nvidia-cc-v1</span> / <span class="mono">nvidia-hmac-v1</span></td></tr>
+            <tr><th scope="row">Enrolled miners <span class="q">(live)</span></th><td><span class="mono" id="t-miners">—</span></td></tr>
+            <tr><th scope="row">PoW difficulty</th><td><span class="mono" id="t-diff">2^24 (16,777,216)</span> <span class="q">per accepted proof, current mining window</span></td></tr>
+            <tr><th scope="row">Miner bond</th><td><span class="mono">10 CELL</span> per enrolled node <span class="q">(can be paid from mining rewards)</span></td></tr>
+            <tr><th scope="row">Node software <span class="q">(live)</span></th><td><span class="mono" id="t-version">—</span></td></tr>
+            <tr><th scope="row">API base URL</th><td><span class="mono">https://api.CELLS.tech/api/v1</span> <span class="q">(public, no auth)</span></td></tr>
+            <tr><th scope="row">Genesis block hash <span class="q">(live)</span></th><td><span class="mono" id="t-genesis">—</span> <span class="q" id="t-genesis-time"></span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="start-title">
+      <div class="q-wrap">
+        <div class="sec-head">
+          <h2 id="start-title">Get started</h2>
+          <p>Everything CELLS publishes, in one place.</p>
+        </div>
+        <div class="q-grid q-grid-3">
+          <a class="card" href="/download.html"><h3>Download Hive</h3><p>Desktop app for Windows and Linux: wallet, mining and tasks.</p><span class="go">Downloads →</span></a>
+          <a class="card" href="/mining.html"><h3>Mine CELL</h3><p>Requirements and how rewards are shared in each mining window.</p><span class="go">Mining guide →</span></a>
+          <a class="card" href="/wallet.html"><h3>Web wallet</h3><p>Create a wallet, check a balance or send CELL in the browser.</p><span class="go">Open wallet →</span></a>
+          <a class="card" href="/explorer.html"><h3>Explorer</h3><p>Search blocks, transactions and addresses.</p><span class="go">Open explorer →</span></a>
+          <a class="card" href="/network.html"><h3>Network status</h3><p>Producer, backup node, block-time check and API health.</p><span class="go">View status →</span></a>
+          <a class="card" href="/api.html"><h3>Public API</h3><p>Keyless HTTP endpoints with example requests and responses.</p><span class="go">API reference →</span></a>
+          <a class="card" href="/docs/"><h3>Docs</h3><p>Hive guide, miner quickstart, operator guide.</p><span class="go">Read docs →</span></a>
+          <a class="card" href="/audit.html"><h3>Public audit</h3><p>The live checklist of what is verified and what is pending.</p><span class="go">Open audit →</span></a>
+          <a class="card" href="https://github.com/blackbeardONE/CELLS" rel="noopener"><h3 class="ext">Source code</h3><p>MIT-licensed repository on GitHub.</p><span class="go">github.com/blackbeardONE/CELLS</span></a>
+        </div>
+      </div>
+    </section>
+
+    <section class="sec" aria-labelledby="cta-title">
+      <div class="q-wrap">
+        <div class="cta">
+          <h2 id="cta-title">Ready to mine CELL?</h2>
+          <p>Install CELLS Hive, enroll your NVIDIA GPU, and start earning in the current mining window.</p>
+          <div class="q-actions">
+            <a class="site-btn site-btn-solid" href="/download.html">Download Hive</a>
+            <a class="site-btn site-btn-ghost" href="/mining.html">Read the mining guide</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer id="site-footer"></footer>
+
+  <script>
+    (function () {
+      "use strict";
+      var Q = window.CELLS;
+      if (!Q) return;
+      var tipTime = null;
+
+      function tickAge() {
+        if (!tipTime) return;
+        var a = Q.ageOf(tipTime);
+        Q.setText("s-age", a === null ? "—" : Q.fmtDuration(a) + " ago");
+      }
+
+      function applyTokenomics(t) {
+        if (!t) return;
+        var emitted = t.emitted_cell;
+        Q.setText("s-emitted", Q.fmtDec(emitted, 0));
+        Q.setText("t-emitted", emitted ? Q.fmtDec(emitted, 8) + " CELL" : "—");
+        var cap = Number(t.cap_dust || t.mining_cap_dust);
+        var em = Number(t.emitted_dust);
+        if (cap > 0 && isFinite(em)) {
+          var pct = (em / cap) * 100;
+          Q.setText("s-emitted-pct", pct.toFixed(2) + "%");
+          var m = document.getElementById("s-meter");
+          if (m) m.style.width = Math.min(100, pct).toFixed(2) + "%";
+          Q.setText("s-cap", Q.fmtInt(cap / 1e8));
+        }
+        if (t.block_reward_cell) {
+          Q.setText("s-reward", t.block_reward_cell);
+          Q.setText("t-reward", t.block_reward_cell + " CELL");
+        }
+        if (t.current_epoch !== undefined) {
+          Q.setText("s-epoch", String(t.current_epoch));
+          Q.setText("t-epoch", String(t.current_epoch));
+        }
+        if (t.next_halving_height) Q.setText("t-halving", Q.fmtInt(t.next_halving_height));
+        if (t.next_halving_eta_seconds) Q.setText("t-halving-eta", "in about " + Q.fmtDuration(t.next_halving_eta_seconds));
+        if (t.target_block_time_seconds) Q.setText("s-blocktime", t.target_block_time_seconds + " s");
+      }
+
+      function refresh() {
+        var stamp = function () {
+          Q.setText("s-updated", "updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+        };
+        Q.api("/status").then(function (s) {
+          Q.setText("s-height", Q.fmtInt(s.chain_tip));
+          Q.setText("t-version", s.version || "—");
+          applyTokenomics(s.tokenomics);
+          stamp();
+        }).catch(function () { Q.setText("s-updated", "API unavailable, retrying"); });
+
+        Q.api("/mining/emission").then(applyTokenomics).catch(function () {});
+
+        Q.api("/mining/enrollments?limit=200").then(function (d) {
+          var recs = d.records || d.enrollments || [];
+          var total = typeof d.total_matches === "number" ? d.total_matches : recs.length;
+          var bonded = recs.filter(function (r) { return r.fully_bonded; }).length;
+          var txt = Q.fmtInt(total) + (d.has_more ? "+" : "");
+          Q.setText("s-miners", txt);
+          Q.setText("s-miners-sub", bonded + " fully bonded");
+          Q.setText("t-miners", txt + " (" + bonded + " fully bonded, " + (recs.length - bonded) + " paying bond from rewards)");
+        }).catch(function () {});
+
+        Q.api("/mining/blocks?limit=1").then(function (d) {
+          var h = (d.headers || [])[0];
+          if (!h) return;
+          tipTime = h.timestamp;
+          Q.setText("s-age-sub", "block " + Q.fmtInt(h.height));
+          tickAge();
+        }).catch(function () {});
+      }
+
+      function once() {
+        Q.api("/chain/blocks?from=0&to=0&limit=1").then(function (d) {
+          var b = (d.blocks || [])[0];
+          if (!b || !b.hash) return;
+          Q.setText("t-genesis", b.hash);
+          if (b.timestamp) Q.setText("t-genesis-time", "(" + String(b.timestamp).slice(0, 10) + " UTC)");
+        }).catch(function () {});
+        Q.api("/mining/work").then(function (w) {
+          var d = Number(w.difficulty);
+          if (!(d > 0)) return;
+          var bits = Math.log2(d);
+          var label = Number.isInteger(bits) ? "2^" + bits + " (" + Q.fmtInt(d) + ")" : Q.fmtInt(d);
+          Q.setText("t-diff", label);
+        }).catch(function () {});
+      }
+
+      refresh();
+      once();
+      setInterval(refresh, 15000);
+      setInterval(tickAge, 1000);
+    })();
+  </script>
+</body>
+</html>

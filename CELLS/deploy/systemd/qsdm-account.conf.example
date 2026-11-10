@@ -1,0 +1,21 @@
+# Copy to /etc/CELLS/account.conf with mode 0600. Never commit real values.
+CELLS_ACCOUNT_LISTEN=127.0.0.1:8092
+CELLS_ACCOUNT_PUBLIC_BASE_URL=https://CELLS.tech
+CELLS_ACCOUNT_STORE_PATH=/var/lib/CELLS-account/accounts.json
+
+# Exactly 32 random bytes encoded as base64url, base64, or hex.
+# Generate: openssl rand -base64 32
+CELLS_ACCOUNT_DATA_KEY=REPLACE_WITH_32_RANDOM_BYTES
+
+# Email magic links (optional when Telegram is configured).
+CELLS_ACCOUNT_SMTP_HOST=smtp.example.com
+CELLS_ACCOUNT_SMTP_PORT=587
+CELLS_ACCOUNT_SMTP_USERNAME=accounts@CELLS.tech
+CELLS_ACCOUNT_SMTP_PASSWORD=REPLACE_WITH_SMTP_SECRET
+CELLS_ACCOUNT_SMTP_FROM="CELLS Account <accounts@CELLS.tech>"
+CELLS_ACCOUNT_SMTP_TLS=true
+
+# Telegram OIDC (optional when SMTP is configured). Configure the allowed URL
+# https://CELLS.tech/api/account/telegram/callback in BotFather > Web Login.
+CELLS_ACCOUNT_TELEGRAM_CLIENT_ID=REPLACE_WITH_BOTFATHER_CLIENT_ID
+CELLS_ACCOUNT_TELEGRAM_CLIENT_SECRET=REPLACE_WITH_BOTFATHER_CLIENT_SECRET

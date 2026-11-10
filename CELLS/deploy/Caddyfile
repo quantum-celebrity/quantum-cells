@@ -1,0 +1,281 @@
+# CELLS public edge — Caddy reverse proxy (historically shipped as CELLS)
+# Let's Encrypt HTTP-01/TLS-ALPN-01 requires the A/AAAA records below to point at this VPS.
+#
+# Recommended DNS records (keep root CELLS.tech on GitHub Pages untouched):
+#   A   node.CELLS.tech      -> 206.189.132.232
+#   A   dashboard.CELLS.tech -> 206.189.132.232
+#   A   api.CELLS.tech       -> 206.189.132.232
+#
+# If you *do* flip the apex, add both:
+#   A   CELLS.tech     -> 206.189.132.232
+#   A   www.CELLS.tech -> 206.189.132.232
+# and remove the `# ` in front of the `CELLS.tech, www.CELLS.tech { ... }` block below.
+{
+	# ACME email for LE notifications
+	email admin@CELLS.tech
+	# No client/server telemetry to caddyserver.com
+	admin off
+}
+
+# API on :443 (reverse proxies to CELLS API backend on 127.0.0.1:8443).
+# NOTE: the CELLS binary listens on :8080 as the WEBVIEWER (log viewer, Basic Auth gated
+# by WEBVIEWER_USERNAME / WEBVIEWER_PASSWORD env vars — production deploys MUST set
+# both; the "admin/password" default is hard-fail unless CELLS_WEBVIEWER_ALLOW_DEFAULT_CREDS=1
+# is explicitly set, which the production systemd unit on BLR1 does NOT do). The webviewer
+# is intentionally NOT reverse-proxied here — :8080 is loopback-only and never reaches the
+# public internet via Caddy. Adding a reverse_proxy entry to :8080 would expose the local
+# log buffer to anyone who knows the webviewer creds; if that ever becomes desirable, do
+# it under a separate FQDN with explicit IP allowlisting in this Caddyfile, NOT alongside
+# the public API. :8443 is the real JSON API (HTTP since enable_tls=false — TLS is
+# terminated here at Caddy). :8081 is the dashboard (also loopback-only behind Caddy).
+api.CELLS.tech, node.CELLS.tech {
+	encode zstd gzip
+	import /etc/caddy/CELLS-edge-relay.caddy
+
+	@health path /api/v1/health /api/v1/health/live /api/v1/health/ready
+	handle @health {
+		reverse_proxy 127.0.0.1:8443
+	}
+
+	# Prometheus scrape lives on the dashboard port (:8081), not the API
+	# server (:8443) since Stage B (2026-05-06). External Prometheus uses
+	# Bearer = CELLS_DASHBOARD_METRICS_SCRAPE_SECRET (see secrets.conf).
+	@scrape path /api/metrics/prometheus
+	handle @scrape {
+		reverse_proxy 127.0.0.1:8081 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Tunnel handshake (attester -> relay) inbound on the tunnel-listen port :7700.
+	# Path is /_tunnel/connect with HTTP/1.1 Upgrade to CELLS-tunnel/1. Caddy passes
+	# the upgrade through transparently; yamux takes over on the hijacked conn.
+	# See CELLS/docs/docs/runbooks/DEPLOYMENT_TOPOLOGY.md for the home-attester
+	# bring-up and the docs/docs/TUNNEL_QUICKSTART.md companion in the source
+	# tree for the full wire protocol.
+	handle /_tunnel/connect {
+		reverse_proxy 127.0.0.1:7700 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Reverse-tunnel ingress (Public Challenge Issuer surface):
+	# /attest/<slot>/<path>  ->  CELLS-relay :7710  ->  yamux session  ->  home attester
+	# handle_path strips the /attest prefix so the relay sees /<slot>/<path>.
+	# Once a tunnel client is registered, miners anywhere on the internet can
+	# pull challenges signed by that attester via this path. With no live
+	# tunnel session for the slot, the relay returns 502 (NOT routed back to
+	# the main API — that would 401 with a misleading auth message).
+	handle_path /attest/* {
+		reverse_proxy 127.0.0.1:7710 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# NGC proof ingest is node-local trust telemetry, not a ledger write. Keep
+	# it on the authoritative VPS Core so its trust summary records every
+	# sidecar without depending on the optional home monitoring tunnel.
+	@localNGCProof {
+		method POST
+		path /api/v1/monitoring/ngc-proof
+	}
+	handle @localNGCProof {
+		reverse_proxy 127.0.0.1:8443 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# The VPS Core is the authoritative producer. Mining work, enrollment,
+	# submissions, and all state-changing API calls must stay on this Core.
+	# Home validators are followers and the reverse tunnel is monitoring-only.
+	@authoritativeMining path /api/v1/mining/*
+	handle @authoritativeMining {
+		reverse_proxy 127.0.0.1:8443 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	@authoritativeWrites {
+		method POST PUT PATCH DELETE
+		path /api/v1/*
+	}
+	handle @authoritativeWrites {
+		reverse_proxy 127.0.0.1:8443 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8443 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/api.CELLS.tech.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}
+
+# Dashboard on :443 (reverse proxies to CELLS on 127.0.0.1:8081)
+dashboard.CELLS.tech {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8081 {
+		header_up X-Forwarded-Proto https
+		header_up X-Real-IP {remote_host}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	log {
+		output file /var/log/caddy/dashboard.CELLS.tech.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}
+
+# Apex: www -> apex (301), apex serves the CELLS landing + API.
+# DNS prerequisite: A CELLS.tech -> 206.189.132.232  (and A www -> 206.189.132.232).
+www.CELLS.tech {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+	redir https://CELLS.tech{uri} permanent
+}
+
+CELLS.tech {
+	encode zstd gzip
+	root * /var/www/CELLS
+
+	# CELLS Account is a separate identity-only service. It stores no wallet
+	# keys and is intentionally not part of the validator API process.
+	handle /api/account/* {
+		reverse_proxy 127.0.0.1:8092 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	# Release binaries must download instead of being rendered as documents.
+	@hive_linux_packages path /downloads/*.AppImage /downloads/*.tar.gz
+	header @hive_linux_packages Content-Disposition "attachment"
+	@browser_extension_crx path /downloads/*.crx
+	header @browser_extension_crx Content-Type "application/x-chrome-extension"
+	@hive_preview_packages path /downloads/unsigned-preview/*.exe
+	header @hive_preview_packages Content-Disposition "attachment"
+
+	# Exact-version clients must revalidate release metadata on every check.
+	# The binaries are immutable and remain cacheable; only pointers and the
+	# human-facing release pages use this policy.
+	@hive_release_metadata path \
+		/downloads/latest.yml \
+		/downloads/alpha.yml \
+		/downloads/beta.yml \
+		/downloads/latest-linux.yml \
+		/downloads/alpha-linux.yml \
+		/downloads/beta-linux.yml \
+		/downloads/unsigned-preview/latest.yml \
+		/download.html \
+		/docs/docs.js \
+		/index.html
+	header @hive_release_metadata Cache-Control "no-cache, max-age=0, must-revalidate"
+
+	# Never send the HTML application shell for a missing release artifact.
+	# Installers and update metadata must either be the requested file or a 404.
+	handle /downloads/* {
+		file_server
+	}
+
+	# /app (+ trailing) goes to the operator dashboard
+	redir /app https://dashboard.CELLS.tech/ 302
+	redir /app/* https://dashboard.CELLS.tech/ 302
+
+	# Public wallet short path. Without this, /wallet can fall through to the
+	# apex landing if /var/www/CELLS/wallet/index.html is not present.
+	redir /wallet /wallet.html 302
+	redir /wallet/ /wallet.html 302
+	redir /account /account/ 302
+
+	# Public API pass-through (login/register/wallet/health) -> CELLS :8443
+	@api path /api/v1/* /api/metrics
+	handle @api {
+		reverse_proxy 127.0.0.1:8443 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Prometheus scrape lives on dashboard :8081 (Stage B, 2026-05-06).
+	@scrape path /api/metrics/prometheus
+	handle @scrape {
+		reverse_proxy 127.0.0.1:8081 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Everything else: serve the corporate landing site from /var/www/CELLS.
+	# `{path}/index.html` makes nested directory homes work — without it
+	# `/docs/` would fall through to the apex landing instead of serving
+	# the docs SPA shell at /var/www/CELLS/docs/index.html. The final
+	# `/index.html` fallback is the SPA-friendly catch-all for the apex.
+	handle {
+		try_files {path} {path}/index.html /index.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		# script-src adds `'wasm-unsafe-eval'` so the browser wallet at
+		# /wallet/ can instantiate /wallet.wasm via WebAssembly.instantiate
+		# (CSP Level 3 §"WebAssembly Integration"). Without it, the load
+		# fails with "Refused to compile or instantiate WebAssembly
+		# module because 'wasm-unsafe-eval' is not an allowed source of
+		# script". 'wasm-unsafe-eval' is strictly narrower than
+		# 'unsafe-eval' — it allows WebAssembly compilation but not
+		# eval() / Function() / setTimeout(string, …) — and is the
+		# minimum delta required for the wallet page to work.
+		#
+		# connect-src adds raw.githubusercontent.com so the /docs/ SPA can
+		# fetch markdown live from the main branch. The deployed-version pill
+		# reads CELLS Network through the same-origin /api/v1/status proxy. img-src
+		# adds raw.githubusercontent.com so embedded screenshots in
+		# docs render. No CDN is in script-src — markdown-it is vendored
+		# locally at /docs/lib/markdown-it.min.js with SRI.
+		# font-src / style-src allow Google Fonts for Syne + Figtree on the
+		# marketing landing (index.html, download.html). Docs SPA and wallet
+		# pages do not depend on those hosts.
+		Content-Security-Policy "default-src 'self'; img-src 'self' data: https://raw.githubusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https://api.CELLS.tech https://dashboard.CELLS.tech https://raw.githubusercontent.com; frame-ancestors 'none'; upgrade-insecure-requests"
+		X-Frame-Options DENY
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/CELLS.tech.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}

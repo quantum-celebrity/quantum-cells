@@ -1,0 +1,4504 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	cryptorand "crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"golang.org/x/term"
+
+	"github.com/blackbeardONE/CELLS/cmd/CELLS/governancecli"
+	"github.com/blackbeardONE/CELLS/cmd/CELLS/transaction"
+	"github.com/blackbeardONE/CELLS/internal/alerting"
+	"github.com/blackbeardONE/CELLS/internal/blockdriver"
+	"github.com/blackbeardONE/CELLS/internal/dashboard"
+	"github.com/blackbeardONE/CELLS/internal/legacymining"
+	"github.com/blackbeardONE/CELLS/internal/logging"
+	"github.com/blackbeardONE/CELLS/internal/miningsvc"
+	"github.com/blackbeardONE/CELLS/internal/v2wiring"
+	"github.com/blackbeardONE/CELLS/internal/webviewer"
+	"github.com/blackbeardONE/CELLS/pkg/api"
+	"github.com/blackbeardONE/CELLS/pkg/branding"
+	"github.com/blackbeardONE/CELLS/pkg/bridge"
+	"github.com/blackbeardONE/CELLS/pkg/buildinfo"
+	"github.com/blackbeardONE/CELLS/pkg/chain"
+	"github.com/blackbeardONE/CELLS/pkg/config"
+	"github.com/blackbeardONE/CELLS/pkg/consensus"
+	"github.com/blackbeardONE/CELLS/pkg/contracts"
+	"github.com/blackbeardONE/CELLS/pkg/envcompat"
+	"github.com/blackbeardONE/CELLS/pkg/governance"
+	"github.com/blackbeardONE/CELLS/pkg/mempool"
+	"github.com/blackbeardONE/CELLS/pkg/mesh3d"
+	"github.com/blackbeardONE/CELLS/pkg/mining"
+	"github.com/blackbeardONE/CELLS/pkg/mining/attest"
+	"github.com/blackbeardONE/CELLS/pkg/mining/attest/cc"
+	"github.com/blackbeardONE/CELLS/pkg/mining/attest/hmac"
+	"github.com/blackbeardONE/CELLS/pkg/mining/challenge"
+	"github.com/blackbeardONE/CELLS/pkg/mining/enrollment"
+	"github.com/blackbeardONE/CELLS/pkg/mining/roleguard"
+	"github.com/blackbeardONE/CELLS/pkg/monitoring"
+	"github.com/blackbeardONE/CELLS/pkg/networking"
+	poerules "github.com/blackbeardONE/CELLS/pkg/poe"
+	"github.com/blackbeardONE/CELLS/pkg/producerpolicy"
+	"github.com/blackbeardONE/CELLS/pkg/quarantine"
+	"github.com/blackbeardONE/CELLS/pkg/storage"
+	"github.com/blackbeardONE/CELLS/pkg/submesh"
+	"github.com/blackbeardONE/CELLS/pkg/wallet"
+	"github.com/blackbeardONE/CELLS/pkg/wasm"
+	"log"
+	"math/big"
+	"runtime/debug"
+)
+
+var logger *logging.Logger
+var metrics *monitoring.Metrics
+var healthChecker *monitoring.HealthChecker
+
+func printVersionIfRequested(args []string, w io.Writer) bool {
+	if len(args) != 1 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "--version", "-version", "version":
+		fmt.Fprintln(w, buildinfo.String("CELLS"))
+		return true
+	default:
+		return false
+	}
+}
+
+func replayTaskStateFromBlocks(taskState *chain.TaskStateStore, blocks []*chain.Block) (int, error) {
+	if taskState == nil {
+		return 0, nil
+	}
+	replayed := 0
+	for _, blk := range blocks {
+		if blk == nil {
+			continue
+		}
+		for _, tx := range blk.Transactions {
+			if tx == nil || tx.ContractID != chain.TaskContractID {
+				continue
+			}
+			if err := taskState.ApplyHistoricalTx(tx, blk.Height); err != nil {
+				if errors.Is(err, chain.ErrDuplicateTaskAction) ||
+					errors.Is(err, chain.ErrTaskActionNonceReplay) ||
+					errors.Is(err, chain.ErrTaskActionRequiresStake) {
+					continue
+				}
+				return replayed, fmt.Errorf("height %d tx %s: %w", blk.Height, tx.ID, err)
+			}
+			replayed++
+		}
+	}
+	return replayed, nil
+}
+
+func replayStreamStateFromBlocks(streamState *chain.StreamStateStore, blocks []*chain.Block) (int, error) {
+	if streamState == nil {
+		return 0, nil
+	}
+	replayed := 0
+	for _, blk := range blocks {
+		if blk == nil {
+			continue
+		}
+		for _, tx := range blk.Transactions {
+			if tx == nil || tx.ContractID != chain.StreamContractID {
+				continue
+			}
+			if err := streamState.ApplyHistoricalTx(tx, blk.Height); err != nil {
+				return replayed, fmt.Errorf("height %d tx %s: %w", blk.Height, tx.ID, err)
+			}
+			replayed++
+		}
+	}
+	return replayed, nil
+}
+
+func replayRecoveryCapsuleStateFromBlocks(recoveryState *chain.RecoveryCapsuleStateStore, blocks []*chain.Block) (int, error) {
+	if recoveryState == nil {
+		return 0, nil
+	}
+	replayed := 0
+	for _, blk := range blocks {
+		if blk == nil {
+			continue
+		}
+		for _, tx := range blk.Transactions {
+			if tx == nil || tx.ContractID != chain.RecoveryCapsuleContractID {
+				continue
+			}
+			if err := recoveryState.ApplyHistoricalTx(tx, blk.Height); err != nil {
+				return replayed, fmt.Errorf("height %d tx %s: %w", blk.Height, tx.ID, err)
+			}
+			replayed++
+		}
+	}
+	return replayed, nil
+}
+
+type persistedStateRestore struct {
+	blocks          []*chain.Block
+	taskState       *chain.TaskStateStore
+	taskActions     int
+	streamState     *chain.StreamStateStore
+	streamActions   int
+	recoveryState   *chain.RecoveryCapsuleStateStore
+	recoveryActions int
+	CELLS20State     *chain.CELLS20StateStore
+	CELLS20Actions   int
+	stateRoot       string
+	backupPath      string
+	discardedTail   int
+	recovered       bool
+}
+
+func evaluatePersistedState(accounts *chain.AccountStore, blocks []*chain.Block) (persistedStateRestore, error) {
+	return evaluatePersistedStateWithEnrollment(accounts, blocks, nil, 0)
+}
+
+func evaluatePersistedStateWithEnrollment(accounts *chain.AccountStore, blocks []*chain.Block, enrollmentState *enrollment.InMemoryState, rootHeight uint64) (persistedStateRestore, error) {
+	if accounts == nil {
+		return persistedStateRestore{}, errors.New("persisted state restore requires an account snapshot")
+	}
+	tasks := chain.NewTaskStateStore()
+	taskActions, err := replayTaskStateFromBlocks(tasks, blocks)
+	if err != nil {
+		return persistedStateRestore{}, err
+	}
+	streams := chain.NewStreamStateStore()
+	streamActions, err := replayStreamStateFromBlocks(streams, blocks)
+	if err != nil {
+		return persistedStateRestore{}, err
+	}
+	recovery := chain.NewRecoveryCapsuleStateStore()
+	recoveryActions, err := replayRecoveryCapsuleStateFromBlocks(recovery, blocks)
+	if err != nil {
+		return persistedStateRestore{}, err
+	}
+	CELLS20 := chain.NewCELLS20StateStore()
+	CELLS20Actions, err := replayCELLS20StateFromBlocks(CELLS20, blocks)
+	if err != nil {
+		return persistedStateRestore{}, err
+	}
+	var enrollApplier *chain.EnrollmentApplier
+	if enrollmentState != nil {
+		enrollApplier = chain.NewEnrollmentApplier(accounts, enrollmentState)
+	}
+	aware := chain.NewEnrollmentAwareApplier(accounts, enrollApplier)
+	aware.SetStateRootHeight(rootHeight)
+	aware.SetTaskStateStore(tasks)
+	aware.SetStreamStateStore(streams)
+	aware.SetRecoveryCapsuleStateStore(recovery)
+	aware.SetCELLS20StateStore(CELLS20)
+	return persistedStateRestore{
+		blocks:          blocks,
+		taskState:       tasks,
+		taskActions:     taskActions,
+		streamState:     streams,
+		streamActions:   streamActions,
+		recoveryState:   recovery,
+		recoveryActions: recoveryActions,
+		CELLS20State:     CELLS20,
+		CELLS20Actions:   CELLS20Actions,
+		stateRoot:       aware.StateRoot(),
+	}, nil
+}
+
+// transitionStateRootHeight preserves the immutable legacy checkpoint root.
+// Every new suffix uses its actual height and the configured enrollment-root
+// activation, so restart verifies precisely the state that new blocks commit.
+func transitionStateRootHeight(policy *producerpolicy.Transition, tip *chain.Block) uint64 {
+	if policy != nil && tip != nil && tip.Height >= policy.FirstHandoverHeight() {
+		return tip.Height
+	}
+	return 0
+}
+
+// producerScheduleSummary renders the active producer schedule for the boot
+// log as "producer@from_height" entries, oldest first.
+func producerScheduleSummary(policy *producerpolicy.Transition) string {
+	var parts []string
+	for _, e := range policy.Schedule() {
+		parts = append(parts, fmt.Sprintf("%s@%d", e.ProducerID, e.FromHeight))
+	}
+	return strings.Join(parts, ",")
+}
+
+func evaluateTransitionPersistedState(accounts *chain.AccountStore, blocks []*chain.Block, state *enrollment.InMemoryState, policy *producerpolicy.Transition) (persistedStateRestore, error) {
+	if policy == nil || state == nil || len(blocks) == 0 || blocks[len(blocks)-1] == nil {
+		return persistedStateRestore{}, errors.New("producer transition: persisted state requires policy, enrollment snapshot and chain tip")
+	}
+	return evaluatePersistedStateWithEnrollment(accounts, blocks, state, transitionStateRootHeight(policy, blocks[len(blocks)-1]))
+}
+
+// Transition recovery must never replace corrupt primary state with an older
+// last-good snapshot implicitly. Validate primary JSON before the legacy loader.
+func loadTransitionEnrollmentSnapshot(state *enrollment.InMemoryState, path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("producer transition: required enrollment snapshot: %w", err)
+	}
+	var snapshot struct {
+		Records         []enrollment.EnrollmentRecord `json:"records"`
+		SeenEvidenceHex []string                      `json:"seen_evidence_hex"`
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return 0, errors.New("producer transition: enrollment snapshot is invalid JSON/schema; automatic last-good recovery is disabled")
+	}
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil || fields["records"] == nil {
+		return 0, errors.New("producer transition: enrollment snapshot is missing its records field; automatic last-good recovery is disabled")
+	}
+	return state.Load(path)
+}
+
+func findPersistedSnapshotBlock(
+	accounts *chain.AccountStore,
+	blocks []*chain.Block,
+) (int, error) {
+	if accounts == nil {
+		return -1, errors.New("persisted state scan requires an account snapshot")
+	}
+	tasks := chain.NewTaskStateStore()
+	streams := chain.NewStreamStateStore()
+	recovery := chain.NewRecoveryCapsuleStateStore()
+	CELLS20 := chain.NewCELLS20StateStore()
+	aware := chain.NewEnrollmentAwareApplier(accounts, nil)
+	aware.SetTaskStateStore(tasks)
+	aware.SetStreamStateStore(streams)
+	aware.SetRecoveryCapsuleStateStore(recovery)
+	aware.SetCELLS20StateStore(CELLS20)
+
+	match := -1
+	for index, blk := range blocks {
+		if blk == nil {
+			return -1, fmt.Errorf("persisted state scan has a nil block at index %d", index)
+		}
+		if _, err := replayTaskStateFromBlocks(tasks, []*chain.Block{blk}); err != nil {
+			return -1, fmt.Errorf("replay task state at height %d: %w", blk.Height, err)
+		}
+		if _, err := replayStreamStateFromBlocks(streams, []*chain.Block{blk}); err != nil {
+			return -1, fmt.Errorf("replay CELL stream state at height %d: %w", blk.Height, err)
+		}
+		if _, err := replayRecoveryCapsuleStateFromBlocks(recovery, []*chain.Block{blk}); err != nil {
+			return -1, fmt.Errorf("replay wallet recovery capsule state at height %d: %w", blk.Height, err)
+		}
+		if _, err := replayCELLS20StateFromBlocks(CELLS20, []*chain.Block{blk}); err != nil {
+			return -1, fmt.Errorf("replay CELLS-20 token state at height %d: %w", blk.Height, err)
+		}
+		if aware.StateRoot() == blk.StateRoot {
+			match = index
+		}
+	}
+	return match, nil
+}
+
+// reconcilePersistedStateTail repairs a journal that advanced after its
+// account snapshot was last committed. The saved accounts plus task and stream
+// actions replayed through an earlier block must reproduce that block's
+// published state root exactly. The highest exact match wins, the full journal
+// is archived, and only the unmatched tail is removed. No matching root means
+// startup remains fail-closed.
+func reconcilePersistedStateTail(chainPath string, accounts *chain.AccountStore, blocks []*chain.Block, now time.Time) (persistedStateRestore, error) {
+	if len(blocks) == 0 {
+		return persistedStateRestore{}, errors.New("persisted state restore requires at least one block")
+	}
+	tip := blocks[len(blocks)-1]
+	if tip == nil {
+		return persistedStateRestore{}, fmt.Errorf("persisted state restore has a nil tip at index %d", len(blocks)-1)
+	}
+
+	current, err := evaluatePersistedState(accounts, blocks)
+	if err != nil {
+		return persistedStateRestore{}, fmt.Errorf("replay canonical tip height %d: %w", tip.Height, err)
+	}
+	if current.stateRoot == tip.StateRoot {
+		return current, nil
+	}
+	if len(blocks) < 2 {
+		return persistedStateRestore{}, fmt.Errorf(
+			"persisted state does not match canonical tip height=%d hash=%s (snapshot_root=%s tip_root=%s); no preceding block exists for bounded recovery",
+			tip.Height, tip.Hash, current.stateRoot, tip.StateRoot)
+	}
+
+	matchIndex, err := findPersistedSnapshotBlock(accounts, blocks)
+	if err != nil {
+		return persistedStateRestore{}, err
+	}
+	if matchIndex < 0 {
+		return persistedStateRestore{}, fmt.Errorf(
+			"persisted state matches no block in the canonical journal (tip_height=%d snapshot_root=%s tip_root=%s); refusing automatic recovery",
+			tip.Height, current.stateRoot, tip.StateRoot)
+	}
+
+	matchingBlocks := blocks[:matchIndex+1]
+	matchingTip := matchingBlocks[len(matchingBlocks)-1]
+	matching, err := evaluatePersistedState(accounts, matchingBlocks)
+	if err != nil {
+		return persistedStateRestore{}, fmt.Errorf("replay matching tip height %d: %w", matchingTip.Height, err)
+	}
+	if matching.stateRoot != matchingTip.StateRoot {
+		return persistedStateRestore{}, fmt.Errorf(
+			"persisted state scan selected height %d but replay root changed (snapshot_root=%s block_root=%s)",
+			matchingTip.Height, matching.stateRoot, matchingTip.StateRoot)
+	}
+
+	backupPath := fmt.Sprintf("%s.uncommitted-tail-%s.bak", chainPath, now.UTC().Format("20060102T150405.000000000Z"))
+	if err := chain.ReplaceChainFile(chainPath, backupPath, matchingBlocks); err != nil {
+		return persistedStateRestore{}, fmt.Errorf("archive unmatched journal tail: %w", err)
+	}
+	matching.backupPath = backupPath
+	matching.discardedTail = len(blocks) - len(matchingBlocks)
+	matching.recovered = true
+	return matching, nil
+}
+
+func canonicalPersistedChain(blocks []*chain.Block) ([]*chain.Block, int) {
+	if len(blocks) <= 1 {
+		return blocks, 0
+	}
+	type restoreNode struct {
+		block  *chain.Block
+		parent *restoreNode
+		index  int
+		length int
+	}
+	byHash := map[string]*restoreNode{}
+	var best *restoreNode
+	for i, blk := range blocks {
+		if blk == nil || strings.TrimSpace(blk.Hash) == "" {
+			continue
+		}
+		if _, exists := byHash[blk.Hash]; exists {
+			continue
+		}
+		var parent *restoreNode
+		if blk.PrevHash != "" {
+			parent = byHash[blk.PrevHash]
+		}
+		length := 1
+		if parent != nil {
+			if blk.Height != parent.block.Height+1 {
+				continue
+			}
+			length = parent.length + 1
+		} else if i > 0 && blk.PrevHash != "" {
+			continue
+		}
+		node := &restoreNode{
+			block:  blk,
+			parent: parent,
+			index:  i,
+			length: length,
+		}
+		byHash[blk.Hash] = node
+		if best == nil || node.length > best.length || (node.length == best.length && node.index > best.index) {
+			best = node
+		}
+	}
+	if best == nil {
+		return blocks, 0
+	}
+	out := make([]*chain.Block, best.length)
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = best.block
+		best = best.parent
+	}
+	if len(out) == len(blocks) {
+		return blocks, 0
+	}
+	return out, len(blocks) - len(out)
+}
+
+func envPublishMeshCompanion() bool {
+	return envcompat.Truthy("CELLS_PUBLISH_MESH_COMPANION", "CELLS_PUBLISH_MESH_COMPANION")
+}
+
+type Storage interface {
+	StoreTransaction(tx []byte) error
+	Close() error
+	GetBalance(address string) (float64, error)
+	Ready() error
+	// GetTransaction is the indexed lookup primitive added in
+	// v0.4.0 (Session 95) for the /wallet/submit-signed
+	// idempotency check. All three backends (SQLite, Scylla,
+	// FileStorage) already implement it; we surface it on the
+	// local interface so api.NewServer's StorageInterface
+	// satisfies-check passes against `storageBackend`.
+	GetTransaction(txID string) (map[string]interface{}, error)
+	// GetNonce + ApplyTransferAtomic are the v0.4.1 (Session 100)
+	// replay-protection + atomic-debit primitives. Surfaced on the
+	// local interface for the same reason as GetTransaction —
+	// keeps the api.NewServer satisfies-check honest. Defined on
+	// all three backends in pkg/storage/{sqlite_v041,scylla,
+	// file_storage,sqlite_stub}.go (the Scylla + file-storage
+	// stubs return wrapped errors so a misconfigured backend
+	// fails loud rather than silently allowing replays).
+	GetNonce(address string) (uint64, error)
+	ApplyTransferAtomic(
+		ctx context.Context,
+		sender, recipient string,
+		amount, fee float64,
+		envelopeNonce uint64,
+		txID string,
+		rawEnvelope []byte,
+	) error
+}
+
+type scyllaStorageAdapter struct {
+	*storage.ScyllaStorage
+}
+
+func (a *scyllaStorageAdapter) GetBalance(address string) (float64, error) {
+	return a.ScyllaStorage.GetBalance(address)
+}
+
+func (a *scyllaStorageAdapter) Close() error {
+	a.ScyllaStorage.Close()
+	return nil
+}
+
+func submeshCLI(dynamicManager *submesh.DynamicSubmeshManager, profilePath string) {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("Submesh CLI started. Type 'help' for commands.")
+	for {
+		fmt.Print("> ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading input:", err)
+			continue
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+		args := strings.Split(input, " ")
+		cmd := strings.ToLower(args[0])
+
+		switch cmd {
+		case "help":
+			fmt.Println("Available commands:")
+			fmt.Println("  list                             - List all submeshes")
+			fmt.Println("  add <name> <priority> [fee] [geotags] - Add a new submesh with name, priority, optional fee threshold and geotags (comma-separated)")
+			fmt.Println("  remove <name>                    - Remove a submesh by name")
+			fmt.Println("  update <name> <priority> [fee] [geotags] - Update priority, optional fee threshold and geotags of a submesh")
+			fmt.Println("  route <fee> <geotag>             - Show which submesh would route a P2P tx with given fee and geotag")
+			fmt.Println("  save                             - Write current submeshes to the configured profile YAML (if path set)")
+			fmt.Println("  exit                            - Exit the CLI")
+		case "list":
+			submeshes := dynamicManager.ListSubmeshes()
+			if len(submeshes) == 0 {
+				fmt.Println("No submeshes found.")
+			} else {
+				fmt.Println("Submeshes:")
+				for _, sm := range submeshes {
+					fmt.Printf("  Name: %s, Priority: %d, FeeThreshold: %.2f, GeoTags: %v\n", sm.Name, sm.PriorityLevel, sm.FeeThreshold, sm.GeoTags)
+				}
+			}
+		case "add":
+			if len(args) < 3 {
+				fmt.Println("Usage: add <name> <priority> [fee] [geotags]")
+				continue
+			}
+			name := args[1]
+			priority, err := strconv.Atoi(args[2])
+			if err != nil {
+				fmt.Println("Invalid priority:", args[2])
+				continue
+			}
+			feeThreshold := 0.0
+			if len(args) >= 4 {
+				feeThreshold, err = strconv.ParseFloat(args[3], 64)
+				if err != nil {
+					fmt.Println("Invalid fee threshold:", args[3])
+					continue
+				}
+			}
+			geoTags := []string{}
+			if len(args) >= 5 {
+				geoTags = strings.Split(args[4], ",")
+			}
+			ds := &submesh.DynamicSubmesh{
+				Name:          name,
+				PriorityLevel: priority,
+				FeeThreshold:  feeThreshold,
+				GeoTags:       geoTags,
+			}
+			dynamicManager.AddOrUpdateSubmesh(ds)
+			fmt.Println("Submesh added or updated:", name)
+		case "remove":
+			if len(args) < 2 {
+				fmt.Println("Usage: remove <name>")
+				continue
+			}
+			name := args[1]
+			err := dynamicManager.RemoveSubmesh(name)
+			if err != nil {
+				fmt.Println("Failed to remove submesh:", err)
+			} else {
+				fmt.Println("Submesh removed:", name)
+			}
+		case "route":
+			if len(args) < 3 {
+				fmt.Println("Usage: route <fee> <geotag>")
+				continue
+			}
+			fee, err := strconv.ParseFloat(args[1], 64)
+			if err != nil {
+				fmt.Println("Invalid fee:", args[1])
+				continue
+			}
+			tag := args[2]
+			ds, err := dynamicManager.RouteTransaction(fee, tag)
+			if err != nil {
+				fmt.Println("route:", err)
+				continue
+			}
+			if ds == nil {
+				fmt.Println("route: no matching submesh (nil)")
+			} else {
+				fmt.Printf("route: name=%s priority=%d fee_threshold=%.2f geotags=%v\n",
+					ds.Name, ds.PriorityLevel, ds.FeeThreshold, ds.GeoTags)
+			}
+		case "update":
+			if len(args) < 3 {
+				fmt.Println("Usage: update <name> <priority> [fee] [geotags]")
+				continue
+			}
+			name := args[1]
+			priority, err := strconv.Atoi(args[2])
+			if err != nil {
+				fmt.Println("Invalid priority:", args[2])
+				continue
+			}
+			feeThreshold := 0.0
+			if len(args) >= 4 {
+				feeThreshold, err = strconv.ParseFloat(args[3], 64)
+				if err != nil {
+					fmt.Println("Invalid fee threshold:", args[3])
+					continue
+				}
+			}
+			geoTags := []string{}
+			if len(args) >= 5 {
+				geoTags = strings.Split(args[4], ",")
+			}
+			ds := &submesh.DynamicSubmesh{
+				Name:          name,
+				PriorityLevel: priority,
+				FeeThreshold:  feeThreshold,
+				GeoTags:       geoTags,
+			}
+			dynamicManager.AddOrUpdateSubmesh(ds)
+			fmt.Println("Submesh updated:", name)
+		case "save":
+			if strings.TrimSpace(profilePath) == "" {
+				fmt.Println("save: no submesh profile path configured (set submesh profile in main config)")
+				continue
+			}
+			if err := submesh.SaveProfilesToPath(dynamicManager, profilePath); err != nil {
+				fmt.Println("save failed:", err)
+			} else {
+				fmt.Println("saved submesh profile to", profilePath)
+			}
+		case "exit":
+			fmt.Println("Exiting Submesh CLI.")
+			return
+		default:
+			fmt.Println("Unknown command. Type 'help' for commands.")
+		}
+	}
+}
+
+// SetupNetwork wires a libp2p host bound to the configured TCP port so ufw rules
+// and peer dial strings stay stable across restarts. Pass port=0 for ephemeral.
+// hostKeyPath, when non-empty, persists the libp2p host PrivateKey across
+// restarts so peer.ID is stable too — see pkg/networking/hostkey.go for the
+// on-disk format. An empty hostKeyPath preserves the legacy ephemeral-identity
+// behaviour (acceptable for tests and dev; on production it causes the
+// post-restart trust-attestation blip documented in RELEASE_NOTES_v0.3.0.md
+// "Session 87").
+//
+// limits bounds connections, streams and gossip (CELLS/docs/docs/P2P_LIMITS.md);
+// the zero value selects networking.DefaultP2PLimits.
+func SetupNetwork(ctx context.Context, logger *logging.Logger, port int, bindAddress string, hostKeyPath string, limits networking.P2PLimits) (*networking.Network, error) {
+	return networking.SetupLibP2PWithOptions(ctx, logger, networking.SetupOptions{
+		Port: port, BindAddress: bindAddress, HostKeyPath: hostKeyPath, Limits: limits,
+	})
+}
+
+// SetupNetworkPublic enables the explicit public-P2P path. The NAT option is
+// paired with the all-interface bind selected by the launcher; it maps only
+// the libp2p peer port and leaves the validator APIs on loopback.
+func SetupNetworkPublic(ctx context.Context, logger *logging.Logger, port int, bindAddress string, hostKeyPath string, limits networking.P2PLimits) (*networking.Network, error) {
+	return networking.SetupLibP2PWithOptions(ctx, logger, networking.SetupOptions{
+		Port: port, BindAddress: bindAddress, HostKeyPath: hostKeyPath, EnableNAT: true, Limits: limits,
+	})
+}
+
+// p2pLimitsFromConfig maps the [network] P2P limit keys onto the networking
+// limits. The limits are opt-in (p2p_limits_enabled): unless enabled, and
+// not switched off by p2p_limits_disabled, the result is Disabled, which
+// builds the host exactly as before these limits. Zero fields keep their
+// networking defaults.
+func p2pLimitsFromConfig(c config.P2PLimitsConfig) networking.P2PLimits {
+	var topics map[string]int
+	if len(c.GossipTopicMaxBytes) > 0 {
+		topics = make(map[string]int, len(c.GossipTopicMaxBytes))
+		for k, v := range c.GossipTopicMaxBytes {
+			topics[k] = v
+		}
+	}
+	return networking.P2PLimits{
+		Disabled:                  !c.Effective(),
+		ConnLowWater:              c.ConnLowWater,
+		ConnHighWater:             c.ConnHighWater,
+		ConnGracePeriod:           c.ConnGracePeriod,
+		MaxConns:                  c.MaxConns,
+		MaxInboundConns:           c.MaxInboundConns,
+		MaxStreams:                c.MaxStreams,
+		MaxInboundStreams:         c.MaxInboundStreams,
+		MaxConnsPerPeer:           c.MaxConnsPerPeer,
+		MaxStreamsPerPeer:         c.MaxStreamsPerPeer,
+		MaxInboundStreamsPerPeer:  c.MaxInboundStreamsPerPeer,
+		MaxConnsPerIP:             c.MaxConnsPerIP,
+		GossipMaxMessageBytes:     c.GossipMaxMessageBytes,
+		GossipTopicMaxBytes:       topics,
+		GossipPeerRate:            c.GossipPeerRate,
+		GossipPeerBurst:           c.GossipPeerBurst,
+		GossipPeerScoringDisabled: c.GossipPeerScoringDisabled,
+		GossipValidateQueue:       c.GossipValidateQueue,
+		GossipValidateThrottle:    c.GossipValidateThrottle,
+	}
+}
+
+func isPublicP2PBind(bindAddress string) bool {
+	switch strings.TrimSpace(strings.ToLower(bindAddress)) {
+	case "0.0.0.0", "::", "[::]":
+		return true
+	default:
+		return false
+	}
+}
+
+func HandleTransaction(logger *logging.Logger, msg []byte, dynamicManager *submesh.DynamicSubmeshManager, wasmSdk *wasm.WASMSDK, consensus *consensus.ProofOfEntanglement, storage Storage, nvidiaP2PGate *monitoring.NvidiaLockP2PGate) {
+	transaction.HandleTransaction(logger, msg, dynamicManager, wasmSdk, consensus, storage, nvidiaP2PGate)
+}
+
+func HandlePhase3Transaction(logger *logging.Logger, msg []byte, mesh3dValidator *mesh3d.Mesh3DValidator, quarantineManager *quarantine.QuarantineManager, reputationManager *quarantine.ReputationManager, consensus *consensus.ProofOfEntanglement, storage Storage, nvidiaP2PGate *monitoring.NvidiaLockP2PGate) {
+	transaction.HandlePhase3Transaction(logger, msg, mesh3dValidator, quarantineManager, reputationManager, consensus, storage, nvidiaP2PGate)
+}
+
+func main() {
+	// Global panic handler to catch any crashes during initialization
+	// This catches panics that occur before we can set up proper error handling
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "\n\nFATAL ERROR: Application panic during initialization\n")
+			fmt.Fprintf(os.Stderr, "Error: %v\n", r)
+			fmt.Fprintf(os.Stderr, "\nThis may be caused by:\n")
+			fmt.Fprintf(os.Stderr, "  - Missing OpenSSL DLLs (libcrypto-3-x64.dll, libssl-3-x64.dll)\n")
+			fmt.Fprintf(os.Stderr, "    Even if liboqs is statically linked, it depends on OpenSSL!\n")
+			fmt.Fprintf(os.Stderr, "  - Missing CUDA DLLs (cudart64_*.dll)\n")
+			fmt.Fprintf(os.Stderr, "  - Missing liboqs DLL (if dynamically linked)\n")
+			fmt.Fprintf(os.Stderr, "  - CGO initialization failure\n")
+			fmt.Fprintf(os.Stderr, "  - Stack overflow\n")
+			fmt.Fprintf(os.Stderr, "\nSolutions:\n")
+			fmt.Fprintf(os.Stderr, "  1. Ensure OpenSSL DLLs are in PATH or executable directory\n")
+			fmt.Fprintf(os.Stderr, "  2. Run: .\run.ps1 (sets up PATH correctly)\n")
+			fmt.Fprintf(os.Stderr, "  3. Check Event Viewer: Windows Logs > Application\n")
+			os.Stderr.Sync()
+			os.Exit(1)
+		}
+	}()
+
+	// Build metadata must be available without configuration, storage, crypto,
+	// or network initialization. Operators and release automation rely on this
+	// command being side-effect free and returning immediately.
+	if printVersionIfRequested(os.Args[1:], os.Stdout) {
+		return
+	}
+
+	// Reject inconsistent recovery admission before loading or modifying node state.
+	if err := api.ValidateRecoverySignedTransfersEnvironment(); err != nil {
+		log.Fatalf("API recovery admission: %v", err)
+	}
+
+	// Early console output to verify the application starts
+	// Use os.Stdout directly and flush to ensure output appears immediately
+	fmt.Fprintln(os.Stdout, branding.LogPrefix+"Starting application...")
+	os.Stdout.Sync()
+	fmt.Fprintln(os.Stdout, branding.LogPrefix+"Loading configuration...")
+	os.Stdout.Sync()
+
+	// Load configuration
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to load configuration: %v\n", err)
+		os.Stderr.Sync()
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+	// HL1 R-C4 (design rev 4 §4.7, §5 "Replay mode"): CELLS --hl1-tail-replay
+	// is the offline tail replay (hl1_replay.go). It takes the state lock
+	// itself (S0) and exits 0, 78 or 86; it never starts the node.
+	if hl1ReplayRequested(os.Args[1:]) {
+		hl1ReplayMain(cfg, os.Args[1:])
+		return
+	}
+	// Snapshot bootstrap (snapshot_bootstrap.go): CELLS --snapshot-export and
+	// --snapshot-import are offline modes. Import runs before the transition
+	// journal preflight because it fills an empty state directory; both take
+	// the state lock themselves and exit 0 or 78; neither starts the node.
+	if snapshotModeRequested(os.Args[1:]) {
+		snapshotMain(cfg, os.Args[1:])
+		return
+	}
+
+	if err := cfg.ProducerTransition.ValidateJournalPrefix(filepath.Join(filepath.Dir(cfg.SQLitePath), "CELLS_chain.ndjson")); err != nil {
+		log.Fatalf("producer transition preflight: %v", err)
+	}
+	fmt.Fprintf(os.Stdout, "%sConfiguration loaded successfully\n", branding.LogPrefix)
+	os.Stdout.Sync()
+	fmt.Fprintf(os.Stdout, "%sLog file: %s\n", branding.LogPrefix, cfg.LogFile)
+	os.Stdout.Sync()
+
+	// Major Update Phase 2.3 startup guard: refuse to start if the
+	// (node_role, mining_enabled) pair is inconsistent with either the
+	// configuration rules or the compile-time build profile. The guard must
+	// run BEFORE any listeners (HTTP, P2P, dashboard) open so misconfigured
+	// nodes do not advertise themselves on the network.
+	if err := roleguard.MustMatchRole(cfg.NodeRole, cfg.MiningEnabled); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: startup role guard rejected configuration: %v\n", err)
+		os.Stderr.Sync()
+		log.Fatalf("startup role guard: %v", err)
+	}
+	fmt.Fprintf(os.Stdout, "%sNode role: %s (build profile: %s, mining_enabled=%v)\n",
+		branding.LogPrefix, cfg.NodeRole.String(), roleguard.BuildProfile, cfg.MiningEnabled)
+	os.Stdout.Sync()
+
+	logger = logging.NewLoggerWithLevel(cfg.LogFile, true, cfg.LogLevel)
+	logger.Info(branding.FullTitle()+" node starting up...", "config", "loaded", "log_level", cfg.LogLevel)
+	fmt.Fprintln(os.Stdout, branding.LogPrefix+"Logger initialized")
+	os.Stdout.Sync()
+
+	// One AuthManager for API + dashboard: each NewAuthManager() generates a new ML-DSA keypair, so separate instances cannot verify each other's JWTs.
+	var sharedAuth *api.AuthManager
+	if sam, err := api.NewAuthManager(); err != nil {
+		logger.Warn("Failed to initialize shared auth manager", "error", err)
+	} else {
+		sam.SetJWTHMACFallbackSecret(cfg.JWTHMACSecret)
+		sam.SetJWTHMACFallbackSecondarySecret(cfg.JWTHMACSecretSecondary)
+		sharedAuth = sam
+		logger.Info("Shared JWT auth manager initialized for API and dashboard")
+		if cfg.JWTHMACSecretSecondary != "" {
+			logger.Warn("rotation-01: JWT/API-key VERIFY-ONLY secondary key is active; cutover gate is CELLS_security_jwt_secondary_key_hits_total going flat for >= max-token-TTL")
+		}
+	}
+
+	// Configure alerting webhook (env CELLS_ALERT_WEBHOOK or config)
+	if cfg.AlertWebhookURL != "" {
+		alerting.SetWebhookURL(cfg.AlertWebhookURL)
+		logger.Info("Alerting webhook configured", "url", cfg.AlertWebhookURL)
+	}
+
+	// Initialize monitoring
+	metrics = monitoring.GetMetrics()
+	healthChecker = monitoring.NewHealthChecker(metrics)
+
+	// Register components for health monitoring
+	healthChecker.RegisterComponent("network")
+	healthChecker.RegisterComponent("storage")
+	healthChecker.RegisterComponent("consensus")
+	healthChecker.RegisterComponent("governance")
+	healthChecker.RegisterComponent("wallet")
+	healthChecker.RegisterComponent("dashboard")
+	healthChecker.RegisterComponent("legacy_mining")
+
+	// Start periodic health checks
+	go func() {
+		ticker := time.NewTicker(cfg.HealthCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				healthChecker.CheckHealth()
+			}
+		}
+	}()
+
+	// Wire NGC attestation ring persistence (session 90) BEFORE the
+	// API server starts accepting ingest, so a fresh boot replays
+	// pre-restart bundles into the in-memory ring before any new
+	// POST /api/v1/monitoring/ngc-proofs can overwrite them. Empty
+	// path keeps the legacy in-memory-only posture.
+	if cfg.NGCProofPersistPath != "" {
+		if err := monitoring.SetNGCProofPersistPath(cfg.NGCProofPersistPath, 0); err != nil {
+			logger.Warn("NGC proof persistence disabled",
+				"path", cfg.NGCProofPersistPath,
+				"reason", err.Error(),
+				"fix", "ensure parent directory exists and is writable by the CELLS user")
+		} else if n, rerr := monitoring.RestoreNGCProofsFromDisk(); rerr != nil {
+			logger.Warn("NGC proof persistence replay failed (continuing with empty ring)",
+				"path", cfg.NGCProofPersistPath,
+				"error", rerr.Error())
+		} else if n > 0 {
+			logger.Info("NGC proof persistence: replayed pre-restart bundles into in-memory ring",
+				"path", cfg.NGCProofPersistPath,
+				"records_restored", n)
+		} else {
+			logger.Info("NGC proof persistence enabled (no pre-restart records to restore)",
+				"path", cfg.NGCProofPersistPath)
+		}
+	}
+
+	// Create dashboard instance (will be started in goroutine)
+	nonceTTL := int64(cfg.NvidiaLockIngestNonceTTL.Seconds())
+	if nonceTTL <= 0 && cfg.NvidiaLockRequireIngestNonce {
+		nonceTTL = int64((10 * time.Minute).Seconds())
+	}
+	dash := dashboard.NewDashboardWithBindAddress(metrics, healthChecker, fmt.Sprintf("%d", cfg.DashboardPort), cfg.DashboardBindAddress, cfg.NGCIngestSecret != "", dashboard.DashboardNvidiaLock{
+		Enabled:               cfg.NvidiaLockEnabled,
+		MaxProofAge:           cfg.NvidiaLockMaxProofAge,
+		ExpectedNodeID:        cfg.NvidiaLockExpectedNodeID,
+		ProofHMACSecret:       cfg.NvidiaLockProofHMACSecret,
+		RequireIngestNonce:    cfg.NvidiaLockRequireIngestNonce,
+		IngestNonceTTLSeconds: nonceTTL,
+		GateP2P:               cfg.NvidiaLockGateP2P,
+	}, cfg.JWTHMACSecret, cfg.DashboardMetricsScrapeSecret, cfg.DashboardStrictAuth, fmt.Sprintf("http://127.0.0.1:%d", cfg.APIPort), sharedAuth)
+
+	if err := webviewer.StartWebLogViewer(cfg.LogFile, fmt.Sprintf("%d", cfg.LogViewerPort)); err != nil {
+		logger.Warn("Web log viewer disabled",
+			"port", cfg.LogViewerPort,
+			"reason", err.Error(),
+			"fix", "set WEBVIEWER_USERNAME and WEBVIEWER_PASSWORD env vars (or CELLS_WEBVIEWER_ALLOW_DEFAULT_CREDS=1 for local dev only)",
+		)
+	}
+
+	dynamicManager := submesh.NewDynamicSubmeshManager()
+	if rp := cfg.ResolvedSubmeshConfigPath(); rp != "" {
+		loaded, err := submesh.ApplyProfilesFromFile(dynamicManager, rp)
+		if err != nil {
+			log.Fatalf("Failed to load submesh profile %q: %v", rp, err)
+		}
+		logger.Info("Loaded submesh profiles", "path", rp, "count", len(loaded))
+	}
+	// Check DISABLE_CLI environment variable first (for Docker/containerized environments)
+	disableCLI := os.Getenv("DISABLE_CLI") == "true" || os.Getenv("DISABLE_CLI") == "1"
+	// /dev/null is a character device but not a TTY; use a real terminal check (see golang.org/x/term).
+	stdinInteractive := term.IsTerminal(int(os.Stdin.Fd()))
+
+	// Only start submesh CLI when attached to a real TTY and CLI is not disabled
+	if !disableCLI {
+		if stdinInteractive {
+			go submeshCLI(dynamicManager, cfg.ResolvedSubmeshConfigPath())
+		} else {
+			logger.Info("Submesh CLI disabled (non-interactive mode)")
+		}
+	} else {
+		logger.Info("Submesh CLI disabled (DISABLE_CLI env set)")
+	}
+
+	governanceManager := governance.NewSnapshotVoting(cfg.ProposalFile)
+	healthChecker.UpdateComponentHealth("governance", monitoring.HealthStatusHealthy, "Governance system initialized")
+	if !disableCLI {
+		if stdinInteractive {
+			go governancecli.GovernanceCLI(governanceManager)
+		} else {
+			logger.Info("Governance CLI disabled (non-interactive mode)")
+		}
+	} else {
+		logger.Info("Governance CLI disabled (DISABLE_CLI env set)")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stateDir := filepath.Dir(cfg.SQLitePath)
+	networkedCatchupMode := envcompat.Truthy("CELLS_NETWORKED_CATCHUP_MODE", "CELLS_NETWORKED_CATCHUP_MODE")
+	networkHostKeyPath := strings.TrimSpace(cfg.NetworkHostKeyPath)
+	if networkHostKeyPath == "" && envcompat.Truthy("CELLS_PRODUCTION_MODE", "CELLS_PRODUCTION_MODE") {
+		networkHostKeyPath = filepath.Join(stateDir, "CELLS_network_host.key")
+		logger.Info("Production libp2p identity path defaulted to validator state directory",
+			"path", networkHostKeyPath)
+	}
+	// HL1 S0 (design rev 4 §5): the state lock comes first. A busy lock exits
+	// 78, which systemd does not auto-restart; nothing below runs, so no
+	// journal, snapshot, receipt, watermark or HL1 marker is touched.
+	stateLockPath := filepath.Join(stateDir, legacymining.StateLockFile)
+	stateLock := hl1AcquireStateLock(stateLockPath)
+	defer func() {
+		if err := stateLock.Close(); err != nil {
+			logger.Warn("validator state lock release failed", "path", stateLockPath, "error_str", err.Error())
+		}
+	}()
+	logger.Info("Validator state directory lock acquired", "path", stateLockPath)
+	// HL1 S1-S3, under the lock: FAILSTOP.json refusal, the
+	// CELLS_LEGACY_MINING_* environment and canary config, stale D1 temp
+	// cleanup and FAILSTOP.armed. Every failure exits 78.
+	hl1Boot := hl1BootS1S3(stateDir, buildinfo.Version)
+	logger.Info("hl1: boot checks passed; FAILSTOP armed",
+		"legacy_mining_mode", string(hl1Boot.Env.Mode),
+		"crashpoints_build", hl1CrashpointsEnabled)
+	if hl1CrashpointsEnabled {
+		logger.Warn("hl1: this is an hl_crashpoints TEST build; never run it in production")
+	}
+	// HL1 S4 begins: the transition journal-prefix check under the lock.
+	hl1LockedTransitionPreflight(cfg.ProducerTransition, filepath.Join(stateDir, "CELLS_chain.ndjson"))
+	consensusSignerKeyPath := strings.TrimSpace(cfg.ConsensusSignerKeyPath)
+	if consensusSignerKeyPath == "" {
+		consensusSignerKeyPath = filepath.Join(stateDir, "CELLS_consensus_signer.json")
+	} else if !filepath.IsAbs(consensusSignerKeyPath) {
+		consensusSignerKeyPath = filepath.Join(stateDir, consensusSignerKeyPath)
+	}
+	if cfg.ProducerTransition != nil && envcompat.Truthy("CELLS_NETWORK_BLOCK_PRODUCER", "CELLS_NETWORK_BLOCK_PRODUCER") {
+		if info, err := os.Stat(consensusSignerKeyPath); err != nil || !info.Mode().IsRegular() {
+			log.Fatal("producer transition: replacement signer must be provisioned as an existing regular file before startup")
+		}
+	}
+	consensusSigner, consensusSignerCreated, signerErr := chain.LoadOrCreateBFTSigner(consensusSignerKeyPath)
+	if signerErr != nil {
+		log.Fatalf("validator consensus signer: %v", signerErr)
+	}
+	logger.Info("Validator consensus signer ready",
+		"validator", consensusSigner.Address(),
+		"path", consensusSignerKeyPath,
+		"created", consensusSignerCreated,
+		"purpose", "consensus-only hot key; do not fund")
+	if consensusSignerCreated {
+		logger.Warn("Back up the validator consensus signer before coordinated signature activation",
+			"path", consensusSignerKeyPath,
+			"impact", "losing this file changes validator identity")
+	}
+	if strings.TrimSpace(os.Getenv("CELLS_TASK_ACTION_LOG_PATH")) == "" {
+		taskActionLogPath := filepath.Join(stateDir, "CELLS_task_actions.ndjson")
+		if err := os.Setenv("CELLS_TASK_ACTION_LOG_PATH", taskActionLogPath); err != nil {
+			log.Fatalf("configure signed task-action log path: %v", err)
+		}
+		logger.Info("Signed task-action log configured", "path", taskActionLogPath)
+	}
+
+	setupNetwork := SetupNetwork
+	p2pMode, p2pModeErr := resolveP2PStartupMode(cfg.NetworkBindAddress, cfg.PrivateP2P,
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_ALLOW_PUBLIC_DHT_FALLBACK")), "1"))
+	if p2pModeErr != nil {
+		log.Fatalf("private p2p: %v", p2pModeErr)
+	}
+	switch p2pMode {
+	case p2pModePublic:
+		setupNetwork = SetupNetworkPublic
+		logger.Info("Public P2P mode enabled", "nat_port_mapping", true, "hole_punching", true, "network_port", cfg.NetworkPort)
+	case p2pModePrivate:
+		allowedPeers := append([]string(nil), cfg.PrivateP2P.AllowedPeers...)
+		setupNetwork = func(ctx context.Context, logger *logging.Logger, port int, bindAddress string, hostKeyPath string, limits networking.P2PLimits) (*networking.Network, error) {
+			return SetupNetworkPrivate(ctx, logger, port, bindAddress, hostKeyPath, limits, allowedPeers)
+		}
+		logger.Info("Private P2P mode enabled", "bind_address", cfg.NetworkBindAddress, "network_port", cfg.NetworkPort,
+			"allowed_peers", strings.Join(allowedPeers, ","), "nat_port_mapping", false, "mdns", false)
+	}
+	net, err := setupNetwork(ctx, logger, cfg.NetworkPort, cfg.NetworkBindAddress, networkHostKeyPath, p2pLimitsFromConfig(cfg.P2PLimits))
+	if err != nil {
+		logger.Error("Failed to setup libp2p", "error", err)
+		metrics.RecordError("Network setup failed: " + err.Error())
+		healthChecker.UpdateComponentHealth("network", monitoring.HealthStatusUnhealthy, err.Error())
+		log.Fatalf("Failed to setup libp2p: %v", err)
+	}
+	healthChecker.UpdateComponentHealth("network", monitoring.HealthStatusHealthy, "Network initialized")
+
+	// Start explicit bootstrap dialing for WAN peer finding.
+	//
+	// Audit row net-02: Kad-DHT bootstrap discovery was removed so the
+	// node no longer imports the IPFS/Kad-DHT provider-record path covered
+	// by GO-2024-3218. BootstrapPeers is now the only WAN peer source; if
+	// it is empty, the node runs isolated until a peer connects inbound or
+	// mDNS finds a local peer. The old env knob is still read only so we
+	// can warn operators that public fallback is gone.
+	{
+		bsCfg := networking.BootstrapConfig{
+			BootstrapPeers:               cfg.BootstrapPeers,
+			AllowPublicBootstrapFallback: strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_ALLOW_PUBLIC_DHT_FALLBACK")), "1"),
+		}
+		if bsCfg.AllowPublicBootstrapFallback {
+			logger.Warn("DHT bootstrap: CELLS_ALLOW_PUBLIC_DHT_FALLBACK=1 — joining PUBLIC IPFS bootstrap network (DEV ONLY, weakens Sybil resistance)",
+				"audit_row", "net-02")
+		}
+		bsDisc, bsErr := networking.NewBootstrapDiscovery(ctx, net.Host, bsCfg, logger)
+		if bsErr != nil {
+			logger.Warn("Static bootstrap discovery failed to start", "error", bsErr)
+		} else {
+			logger.Info("Static bootstrap discovery started",
+				"bootstrap_peers", len(cfg.BootstrapPeers),
+				"public_fallback", bsCfg.AllowPublicBootstrapFallback,
+				"protocol_id", string(networking.CELLSBootstrapProtocolID),
+			)
+			defer bsDisc.Close()
+		}
+	}
+
+	// Initialize storage backend
+	fmt.Fprintln(os.Stdout, branding.LogPrefix+"Initializing storage...")
+	os.Stdout.Sync()
+	var storageBackend Storage
+	requireSQLiteStorage := strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_REQUIRE_SQLITE_STORAGE")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_REQUIRE_SQLITE_STORAGE")), "true") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_REQUIRE_SQLITE_STORAGE")), "yes")
+	// CELLS_REQUIRE_SETTLEABLE_STORAGE is a SEPARATE opt-in from
+	// CELLS_REQUIRE_SQLITE_STORAGE, deliberately.
+	//
+	// CELLS_REQUIRE_SQLITE_STORAGE is only consulted inside the Scylla-init
+	// FAILURE fallback below. An earlier version of the warning further down
+	// told operators to set it to "refuse to start on a backend that cannot
+	// settle" -- on the branch where Scylla connected SUCCESSFULLY, where that
+	// flag is never read. The instruction was inert: an operator who followed
+	// it got no protection at all. Caught in review.
+	//
+	// Widening the existing flag would have been worse: someone who set it for
+	// its documented meaning would suddenly find a healthy Scylla node refusing
+	// to boot. So the capability requirement gets its own name, and defaults
+	// off.
+	requireSettleableStorage := strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_REQUIRE_SETTLEABLE_STORAGE")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_REQUIRE_SETTLEABLE_STORAGE")), "true") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CELLS_REQUIRE_SETTLEABLE_STORAGE")), "yes")
+	if cfg.UseScylla() {
+		scyllaExtra := storage.ScyllaClusterConfigFromAuthTLS(
+			cfg.ScyllaUsername, cfg.ScyllaPassword,
+			cfg.ScyllaTLSCaPath, cfg.ScyllaTLSCertPath, cfg.ScyllaTLSKeyPath,
+			cfg.ScyllaTLSInsecureSkipVerify,
+		)
+		scyllaStorage, err := storage.NewScyllaStorage(cfg.ScyllaHosts, cfg.ScyllaKeyspace, scyllaExtra)
+		if err != nil {
+			logger.Error("Failed to initialize ScyllaDB storage", "error", err)
+			logger.Warn("Falling back to SQLite storage")
+			sqliteStorage, err := storage.NewStorage(cfg.SQLitePath)
+			if err != nil {
+				logger.Error("Failed to initialize SQLite storage", "error", err)
+				if requireSQLiteStorage {
+					log.Fatalf("CELLS_REQUIRE_SQLITE_STORAGE=1 but SQLite storage could not initialize after Scylla fallback: %v", err)
+				}
+				logger.Warn("Falling back to file storage (SQLite requires CGO)")
+				fileStorage, fileErr := storage.NewFileStorage("storage")
+				if fileErr != nil {
+					log.Fatalf("Failed to initialize any storage backend: SQLite=%v, File=%v", err, fileErr)
+				}
+				logger.Info("Using file storage (SQLite not available without CGO)")
+				storageBackend = fileStorage
+				if msg := settlementFile.OperatorWarning(); msg != "" {
+					logger.Error(msg)
+				}
+				if msg := settlementFile.FatalMessage(requireSettleableStorage); msg != "" {
+					log.Fatalf("%s", msg)
+				}
+				if settlementFile.HealthDegraded() {
+					healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusDegraded, settlementFile.HealthDetail())
+				} else {
+					healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusHealthy, settlementFile.HealthDetail())
+				}
+			} else {
+				logger.Info("Using SQLite storage")
+				storageBackend = sqliteStorage
+				healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusHealthy, settlementSQLite.HealthDetail())
+			}
+		} else {
+			logger.Info("Using ScyllaDB storage")
+			storageBackend = &scyllaStorageAdapter{scyllaStorage}
+			if msg := settlementScylla.OperatorWarning(); msg != "" {
+				logger.Error(msg)
+			}
+			if msg := settlementScylla.FatalMessage(requireSettleableStorage); msg != "" {
+				log.Fatalf("%s", msg)
+			}
+			if settlementScylla.HealthDegraded() {
+				healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusDegraded, settlementScylla.HealthDetail())
+			} else {
+				healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusHealthy, settlementScylla.HealthDetail())
+			}
+		}
+	} else {
+		sqliteStorage, err := storage.NewStorage(cfg.SQLitePath)
+		if err != nil {
+			logger.Warn("Failed to initialize SQLite storage", "error", err)
+			if requireSQLiteStorage {
+				log.Fatalf("CELLS_REQUIRE_SQLITE_STORAGE=1 but SQLite storage could not initialize: %v", err)
+			}
+			logger.Info("SQLite requires CGO. Falling back to file storage for non-CGO builds")
+			fileStorage, fileErr := storage.NewFileStorage("storage")
+			if fileErr != nil {
+				log.Fatalf("Failed to initialize storage: SQLite=%v, File=%v", err, fileErr)
+			}
+			logger.Info("Using file storage (SQLite not available without CGO)")
+			storageBackend = fileStorage
+			if msg := settlementFile.OperatorWarning(); msg != "" {
+				logger.Error(msg)
+			}
+			if msg := settlementFile.FatalMessage(requireSettleableStorage); msg != "" {
+				log.Fatalf("%s", msg)
+			}
+			if settlementFile.HealthDegraded() {
+				healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusDegraded, settlementFile.HealthDetail())
+			} else {
+				healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusHealthy, settlementFile.HealthDetail())
+			}
+		} else {
+			logger.Info("Using SQLite storage")
+			storageBackend = sqliteStorage
+			healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusHealthy, settlementSQLite.HealthDetail())
+		}
+	}
+	fmt.Fprintln(os.Stdout, branding.LogPrefix+"Storage initialized")
+	os.Stdout.Sync()
+	defer storageBackend.Close()
+
+	// Initialize consensus with error handling
+	fmt.Fprintln(os.Stdout, branding.LogPrefix+"Initializing consensus (quantum-safe)...")
+	os.Stdout.Sync()
+
+	var poe *consensus.ProofOfEntanglement
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic during consensus initialization", "error", r)
+				fmt.Fprintf(os.Stderr, "ERROR: Consensus initialization panic: %v\n", r)
+				fmt.Fprintf(os.Stderr, "This may indicate:\n")
+				fmt.Fprintf(os.Stderr, "  - Missing liboqs.dll (check executable directory or PATH)\n")
+				fmt.Fprintf(os.Stderr, "  - Missing OpenSSL DLLs (libcrypto, libssl)\n")
+				fmt.Fprintf(os.Stderr, "  - CGO initialization failure\n")
+				os.Stderr.Sync()
+			}
+		}()
+		fmt.Fprintln(os.Stdout, branding.LogPrefix+"Creating Proof-of-Entanglement instance...")
+		os.Stdout.Sync()
+		poe = consensus.NewProofOfEntanglement()
+		if poe == nil {
+			fmt.Fprintln(os.Stdout, branding.LogPrefix+"Proof-of-Entanglement returned nil (CGO/liboqs may not be available)")
+			os.Stdout.Sync()
+		} else {
+			fmt.Fprintln(os.Stdout, branding.LogPrefix+"Proof-of-Entanglement created successfully")
+			os.Stdout.Sync()
+		}
+	}()
+
+	if poe == nil {
+		logger.Warn("Consensus not available",
+			"reason", "Quantum-safe cryptography (liboqs) initialization failed",
+			"impact", "Transactions accepted without signature verification",
+			"note", "Check if liboqs DLLs are available and OpenSSL is in PATH")
+		healthChecker.UpdateComponentHealth("consensus", monitoring.HealthStatusDegraded,
+			"liboqs initialization failed - Quantum-safe signature verification unavailable. Node accepts transactions without signature verification. This is expected if liboqs/OpenSSL DLLs are not properly configured.")
+		fmt.Fprintf(os.Stderr, "WARNING: Consensus degraded - CGO and liboqs required for quantum-safe consensus\n")
+		fmt.Fprintf(os.Stderr, "Check that liboqs.dll is in PATH or executable directory\n")
+		os.Stderr.Sync()
+	} else {
+		logger.Info("Consensus initialized successfully", "type", "Proof-of-Entanglement")
+		healthChecker.UpdateComponentHealth("consensus", monitoring.HealthStatusHealthy, "Proof-of-Entanglement initialized with quantum-safe cryptography")
+		fmt.Fprintln(os.Stdout, branding.LogPrefix+"Consensus initialized (quantum-safe)")
+		os.Stdout.Sync()
+	}
+	consensus := poe
+
+	// Optional WASM contract modules. The non-CGO !cgo build defaults to the
+	// pure-Go wazero runtime via pkg/wasm; the .wasm files themselves are
+	// not shipped in the repo and the loader falls back gracefully when
+	// they are absent (production state on most validators).
+	//
+	// Logging policy: file-absent is the configured-off case (INFO);
+	// file-present-but-malformed and SDK-instantiation errors are real
+	// problems (WARN).
+	walletWasmPath := "wasm_modules/wallet/wallet.wasm"
+	walletBytes, err := wasm.LoadWASMFromFile(walletWasmPath)
+	var walletSdk *wasm.WASMSDK
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			logger.Info("WASM wallet module disabled (file absent)", "path", walletWasmPath)
+		} else {
+			logger.Warn("Failed to load wallet WASM module", "path", walletWasmPath, "error", err)
+		}
+	} else {
+		walletSdk, err = wasm.NewWASMSDK(walletBytes)
+		if err != nil {
+			logger.Warn("Failed to instantiate WASM SDK for wallet", "error", err)
+			walletSdk = nil
+		} else {
+			logger.Info("WASM wallet SDK initialized")
+		}
+	}
+
+	validatorWasmPath := "wasm_modules/validator/validator.wasm"
+	_, err = wasm.LoadWASMFromFile(validatorWasmPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			logger.Info("WASM validator module disabled (file absent)", "path", validatorWasmPath)
+		} else {
+			logger.Warn("Failed to load validator WASM module", "path", validatorWasmPath, "error", err)
+		}
+	} else {
+		logger.Info("WASM validator module loaded")
+	}
+
+	// Initialize contracts engine (uses WASM SDK for execution)
+	contractEngine := contracts.NewContractEngine(walletSdk)
+	if walletSdk != nil {
+		logger.Info("Contract engine initialized with wasmer WASM execution")
+	} else {
+		logger.Warn("Wasmer SDK not available; trying wazero (pure-Go) runtime")
+	}
+
+	// Try wazero as a pure-Go WASM runtime (no CGO or DLLs needed)
+	if walletSdk == nil {
+		if len(walletBytes) > 0 {
+			wrt, wrtErr := wasm.NewWazeroRuntime(walletBytes)
+			if wrtErr != nil {
+				logger.Warn("Wazero runtime failed to load wallet WASM", "error", wrtErr)
+			} else {
+				contractEngine.SetWazeroRuntime(wrt)
+				logger.Info("Contract engine using wazero (pure-Go) WASM runtime")
+			}
+		} else {
+			wrt, _ := wasm.NewWazeroRuntime(nil)
+			if wrt != nil {
+				contractEngine.SetWazeroRuntime(wrt)
+				logger.Info("Wazero runtime ready (no WASM module loaded yet — contracts will use simulation)")
+			}
+		}
+	}
+	_ = contractEngine
+
+	// Initialize cross-chain bridge (atomic swap + lock/unlock protocol)
+	bridgeProto, bridgeErr := bridge.NewBridgeProtocol()
+	if bridgeErr != nil {
+		logger.Warn("Bridge protocol not available", "error", bridgeErr)
+	} else {
+		logger.Info("Cross-chain bridge protocol initialized")
+	}
+	_ = bridgeProto
+
+	atomicSwap, swapErr := bridge.NewAtomicSwapProtocol()
+	if swapErr != nil {
+		logger.Warn("Atomic swap protocol not available", "error", swapErr)
+	} else {
+		logger.Info("Atomic swap protocol initialized")
+	}
+	// Derive persistent paths from the locked SQLite state directory.
+	bridgeStatePath := filepath.Join(stateDir, "CELLS_bridge_state.json")
+	tokenRegistryPath := filepath.Join(stateDir, "CELLS_tokens.json")
+	stakingPath := filepath.Join(stateDir, "CELLS_staking.json")
+	challengeKeyPath := filepath.Join(stateDir, "CELLS_challenge_hmac.key")
+
+	// v2 NVIDIA-locked mining activation (MINING_PROTOCOL_V2.md
+	// §0 / §10). Setting this env activates FORK_V2_HEIGHT=0 so
+	// the verifier engages the v2 attestation gate from genesis:
+	// every accepted proof must carry a valid nvidia-cc-v1 or
+	// nvidia-hmac-v1 attestation. CPU / non-NVIDIA proofs are
+	// rejected at the verifier without entering the mempool.
+	//
+	// Default OFF preserves v1 testnet behaviour (CPU proofs
+	// accepted economically only) so existing testnets keep
+	// running unchanged. The env-gated activation is the
+	// minimum-blast-radius switch: a misconfigured restart
+	// without CELLS_V2_ACTIVE=1 quietly reverts to v1, so
+	// operators must intentionally opt in.
+	v2Active := envcompat.Truthy("CELLS_V2_ACTIVE", "CELLS_V2_ACTIVE")
+	if v2Active {
+		mining.SetForkV2Height(0)
+		logger.Info("v2 NVIDIA-locked mining: ACTIVE from genesis",
+			"fork_v2_height", 0,
+			"env_var", "CELLS_V2_ACTIVE",
+			"effect", "non-NVIDIA / unattested proofs rejected at /api/v1/mining/submit",
+			"see", "MINING_PROTOCOL_V2.md §0 / §10")
+	} else {
+		logger.Info("v2 NVIDIA-locked mining: NOT active (v1 testnet protocol)",
+			"env_var", "CELLS_V2_ACTIVE",
+			"to_activate", "set CELLS_V2_ACTIVE=1 (chain reset required per §10.3)")
+	}
+	if cfg.MiningOperatorPublicKeyRetentionHeight > 0 {
+		enrollment.SetOperatorPublicKeyRetentionHeight(cfg.MiningOperatorPublicKeyRetentionHeight)
+		logger.Info("Mining enrollment operator public key retention scheduled",
+			"height", cfg.MiningOperatorPublicKeyRetentionHeight,
+			"effect", "signed mining enrollments retain operator ML-DSA public keys for proof verification")
+	}
+	// User store persistence: fall back to <stateDir>/CELLS_users.json
+	// when nothing was set explicitly (config file or env). This matches
+	// the sibling staking/bridge JSON files and keeps all ledger-local
+	// state under /opt/CELLS on the default systemd layout.
+	if strings.TrimSpace(cfg.UserStorePath) == "" {
+		cfg.UserStorePath = filepath.Join(stateDir, "CELLS_users.json")
+	}
+
+	tracePath := filepath.Join(stateDir, "contract_traces.ndjson")
+	contractEngine.Tracer().ConfigureRetention(tracePath, 7*24*time.Hour)
+	contractEngine.Tracer().StartTraceCompactionLoop(ctx, 1*time.Hour, 16<<20)
+
+	// Restore bridge/swap state from previous run
+	if bridgeProto != nil || atomicSwap != nil {
+		lc, sc, loadErr := bridge.LoadState(bridgeStatePath, bridgeProto, atomicSwap)
+		if loadErr != nil {
+			logger.Warn("Failed to load bridge state", "error", loadErr)
+		} else if lc > 0 || sc > 0 {
+			logger.Info("Restored bridge state from disk", "locks", lc, "swaps", sc)
+		}
+	}
+
+	// Start bridge auto-saver (flushes every 30 s and on shutdown)
+	var bridgeAutoSaver *bridge.AutoSaver
+	if bridgeProto != nil || atomicSwap != nil {
+		bridgeAutoSaver = bridge.NewAutoSaver(bridgeStatePath, bridgeProto, atomicSwap, 30*time.Second)
+		logger.Info("Bridge state auto-saver started", "path", bridgeStatePath)
+	}
+	_ = bridgeAutoSaver
+
+	// Bridge P2P relay — propagate lock/swap events across the network.
+	// Remote events are applied only when signed by a trusted bridge relayer
+	// key ([network] bridge_relay_*); by default none are
+	// (docs/docs/BRIDGE_RELAY_AUTH.md).
+	var bridgeRelay *bridge.P2PRelay
+	if bridgeProto != nil || atomicSwap != nil {
+		relayAuth, authErr := bridgeRelayAuthFromConfig(cfg.BridgeRelay, consensusSigner.GetPublicKey())
+		if authErr != nil {
+			log.Fatalf("bridge relay authentication config: %v", authErr)
+		}
+		var relayErr error
+		bridgeRelay, relayErr = bridge.NewP2PRelayWithAuth(net, bridgeProto, atomicSwap, net.Host.ID().String(), relayAuth)
+		if relayErr != nil {
+			logger.Warn("Bridge P2P relay not available", "error", relayErr)
+		} else {
+			remote := "ignored (no trusted bridge relayer keys)"
+			if bridgeRelay.TrustedKeyCount() > 0 {
+				remote = "applied only when signed by a trusted bridge relayer key"
+			}
+			logger.Info("Bridge P2P relay started on topic "+bridge.BridgeTopicName,
+				"trusted_relayer_keys", bridgeRelay.TrustedKeyCount(),
+				"signing", bridgeRelay.Signing(),
+				"remote_events", remote)
+			monitoring.GlobalScrapePrometheusExporter().RegisterCollector("bridge_relay", bridgeRelayMetricsCollector(bridgeRelay))
+		}
+	}
+	_ = bridgeRelay
+
+	nodeValidatorSet := chain.NewValidatorSet(chain.DefaultValidatorSetConfig())
+	minValStake := chain.DefaultValidatorSetConfig().MinStake
+	if err := nodeValidatorSet.Register(consensusSigner.Address(), minValStake); err != nil {
+		log.Fatalf("register validator consensus identity: %v", err)
+	}
+	nodeEvidenceManager := chain.NewEvidenceManager(nodeValidatorSet)
+
+	// Declare phase 3 components before use
+	// Initialize Mesh3D validator (may fail if CUDA/liboqs DLLs missing, but won't crash)
+	fmt.Fprintln(os.Stdout, branding.LogPrefix+"Initializing 3D mesh validator...")
+	os.Stdout.Sync()
+
+	var mesh3dValidator *mesh3d.Mesh3DValidator
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic during Mesh3D validator initialization", "error", r)
+				fmt.Fprintf(os.Stderr, "ERROR: Mesh3D validator initialization panic: %v\n", r)
+				fmt.Fprintf(os.Stderr, "This may indicate missing CUDA or liboqs DLLs\n")
+				os.Stderr.Sync()
+			}
+		}()
+		mesh3dValidator = mesh3d.NewMesh3DValidator()
+		if mesh3dValidator != nil {
+			fmt.Fprintln(os.Stdout, branding.LogPrefix+"3D mesh validator initialized")
+			os.Stdout.Sync()
+		} else {
+			fmt.Fprintln(os.Stdout, branding.LogPrefix+"3D mesh validator initialization returned nil")
+			os.Stdout.Sync()
+		}
+	}()
+
+	if mesh3dValidator == nil {
+		logger.Warn("Mesh3D validator not available",
+			"reason", "Initialization failed (CUDA/liboqs may be unavailable)",
+			"impact", "3D mesh validation will be limited")
+		// Try to create a minimal validator - NewMesh3DValidator should never return nil
+		// but if it does, we'll handle it gracefully
+		fmt.Fprintln(os.Stdout, branding.LogPrefix+"Warning - Mesh3D validator is nil, attempting to create minimal validator")
+		os.Stdout.Sync()
+		// Try one more time with explicit error handling
+		mesh3dValidator = mesh3d.NewMesh3DValidator()
+		if mesh3dValidator == nil {
+			logger.Error("Mesh3D validator creation failed completely",
+				"note", "Phase 3 validation may not work properly")
+			fmt.Fprintf(os.Stderr, "ERROR: Cannot create Mesh3D validator - Phase 3 features disabled\n")
+			os.Stderr.Sync()
+		}
+	}
+	quarantineManager := quarantine.NewQuarantineManager(0.5) // 0.5 threshold for quarantine
+	reputationManager := quarantine.NewReputationManager(10, 5)
+	monitor := quarantine.NewMonitor(quarantineManager, logger, 30*time.Second)
+	monitor.Start()
+
+	// Initialize wallet service for creating transactions
+	walletService, err := wallet.NewWalletService()
+	if err != nil {
+		logger.Warn("Failed to initialize wallet service", "error", err)
+		logger.Info("Node will operate in receive-only mode")
+		healthChecker.UpdateComponentHealth("wallet", monitoring.HealthStatusDegraded,
+			"Wallet service unavailable: "+err.Error()+". Node operating in receive-only mode. This is expected if liboqs/quantum-safe crypto is not available.")
+	} else {
+		logger.Info("Wallet service initialized", "address", walletService.GetAddress(), "balance", walletService.GetBalance())
+		healthChecker.UpdateComponentHealth("wallet", monitoring.HealthStatusHealthy, "Wallet service initialized")
+	}
+
+	nodeTxRep := networking.NewReputationTracker(networking.DefaultReputationConfig())
+	nodeEvidenceRep := networking.NewReputationTracker(networking.ReputationConfigForEvidence())
+
+	// Wire both reputation trackers into the monitoring
+	// scrape so CELLS_reputation_*{tracker="tx|evidence"}
+	// gauges reflect live state. Also start the per-tracker
+	// decay goroutine — without this, scores never decay
+	// back toward zero, which means historic peer
+	// behaviour permanently dominates current state.
+	monitoring.RegisterReputationProvider("tx", nodeTxRep)
+	monitoring.RegisterReputationProvider("evidence", nodeEvidenceRep)
+	nodeTxRep.Start()
+	nodeEvidenceRep.Start()
+	defer nodeTxRep.Stop()
+	defer nodeEvidenceRep.Stop()
+
+	// Enforce bans at the transport, not only in each ingress. Without this a
+	// banned peer keeps its connection, its stream slots and its pubsub fan-out,
+	// and every ingress has to remember to check it again -- which POL gossip did
+	// not, and the tx path did not before that.
+	//
+	// Wired to nodeTxRep because that is the tracker the tx, BFT and POL
+	// ingresses share. nodeEvidenceRep is deliberately NOT wired: it uses a
+	// harsher config (ReputationConfigForEvidence, -150 per violation) scoped to
+	// evidence handling, and letting it sever transport connections would give one
+	// subsystem's threshold authority over the whole node's connectivity.
+	// Bootstrap peers are exempt from the TRANSPORT gate only. A ban is
+	// permanent for the process lifetime -- DecayAll moves the score but never
+	// clears the Banned flag, and Unban has no production caller -- so a false
+	// positive against the peers this node needs in order to be on the network
+	// would partition it until restart. They remain fully banned at every
+	// ingress, so a misbehaving bootstrap peer is still ignored; it just cannot
+	// lock the node out while doing it.
+	net.SetReputationGate(nodeTxRep, networking.BootstrapPeerIDs(cfg.BootstrapPeers)...)
+
+	var evidenceRelay *networking.EvidenceP2PRelay
+	evIng := networking.NewEvidenceGossipIngress(nodeEvidenceManager, nodeEvidenceRep, networking.DefaultEvidenceGossipConfig())
+	if er, evErr := networking.NewEvidenceP2PRelay(net, evIng, net.Host.ID().String()); evErr != nil {
+		logger.Warn("Evidence P2P relay not started", "error", evErr)
+	} else {
+		evidenceRelay = er
+		logger.Info("Evidence P2P relay started", "topic", networking.EvidenceTopicName)
+	}
+
+	liveConsensusCfg := chain.DefaultConsensusConfig()
+	liveBFT := chain.NewBFTConsensus(nodeValidatorSet, liveConsensusCfg)
+	bftExec := chain.NewBFTExecutor(liveBFT)
+	bftIngressExec := bftExec
+	if networkedCatchupMode {
+		// A catch-up replica replays the pinned canonical chain but is not a
+		// member of the canonical validator set. Applying canonical votes to
+		// its locally-created validator set produces false "unknown validator"
+		// failures and can accidentally drive a local commit callback. Keep the
+		// authenticated GossipSub subscription for wire validation, dedupe, and
+		// network relay while leaving consensus application to full validators.
+		bftIngressExec = nil
+		logger.Info("Networked catch-up mode: BFT ingress is validate-and-relay only",
+			"env_var", "CELLS_NETWORKED_CATCHUP_MODE")
+	}
+	bftIngress := networking.NewBFTGossipIngress(networking.DefaultBFTGossipConfig(), bftIngressExec)
+	if networkedCatchupMode {
+		bftIngress.SetAuthenticationExecutor(bftExec)
+	}
+	bftIngress.SetReputationTracker(nodeTxRep)
+	bftExec.SetEvidenceManager(nodeEvidenceManager)
+
+	// Authenticate outbound consensus messages. Without a signer, prevotes
+	// and precommits go out unauthenticated and any gossip peer can forge
+	// votes for any validator — i.e. manufacture a quorum.
+	bftExec.SetVoteSigner(consensusSigner)
+	logger.Info("BFT vote signing enabled", "validator", consensusSigner.Address())
+	// Inbound enforcement is opt-in so a mixed-version validator set can
+	// roll forward: signed builds emit signatures immediately, and the
+	// operator turns rejection on once every peer is upgraded. A
+	// present-but-invalid signature is always rejected regardless.
+	bftExec.SetSignedVoteActivationHeight(cfg.SignedConsensusActivationHeight)
+	bftExec.SetRequireSignedVotes(cfg.RequireSignedVotes)
+
+	// Expire stalled BFT rounds.
+	//
+	// BFTConsensus.Propose stamps every round with a deadline
+	// (consensus.go:177, RoundTimeout, default 30s) and refuses a higher round
+	// while one is active at that height ("timeout or fail before proposing").
+	// TickRoundTimeouts is what clears an expired round and bumps the counter
+	// so the next proposer can take over -- and it had ZERO production callers,
+	// so nothing ever cleared one. A round that stalled blocked its height
+	// permanently, with recovery only via a local FailRound.
+	//
+	// This DOES change what the node accepts, and the trade is deliberate.
+	// ApplyInbound applies inbound Propose/PreVote/PreCommit to this same
+	// instance, so once a round is expired here, a peer's in-flight vote for it
+	// is refused with "no active round for height N", classified benign
+	// (bft_executor.go isBenignBFTErr) and dropped rather than counted. The
+	// result is a window after RoundTimeout in which votes for the expired
+	// round stop being counted -- bought in exchange for a height that no
+	// longer stalls forever, which is the whole point.
+	//
+	// The window closes for good. Propose now refuses any round number below
+	// bc.nextRound[height] (consensus.go), which TickRoundTimeouts sets when it
+	// retires a round -- so a retransmitted propose for the already-expired
+	// round number is rejected rather than rebuilding it with an empty vote
+	// slate. That reopen path used to exist and used to discard the votes
+	// gathered before the timeout; worse, it would have become
+	// self-equivocation the moment this node originated its own votes, since
+	// the same validator could then vote twice for one (height, round) with
+	// different values. Adversarial critique of the vote-origination design
+	// identified closing it as a prerequisite for that work.
+	//
+	// What it does NOT do: kill a round that reached quorum. PreCommit moves a
+	// committing round into bc.committed and deletes it from bc.rounds under
+	// the same mutex this takes (consensus.go), so a concurrent tick cannot
+	// observe it. And it carries the prevote lock forward
+	// (consensus.go:226-228), so escalation preserves POL safety.
+	// The loop body lives in chain.StartRoundTimeoutLoop so it can be tested.
+	// As an anonymous goroutine here it was unreachable by any test -- every
+	// round-timeout test drives TickRoundTimeouts directly -- so removing or
+	// gating this wiring would have compiled green while restoring the
+	// stuck-round bug. Passing liveConsensusCfg by value keeps the tick tied to
+	// the same RoundTimeout the instance above was built with.
+	go chain.StartRoundTimeoutLoop(ctx, liveBFT, liveConsensusCfg,
+		func(heights []uint64, nextRound uint32) {
+			logger.Warn("BFT round timed out; escalating proposer rotation",
+				"heights", heights,
+				"next_round", nextRound)
+		})
+	// The same switch governs POL certificates / lock proofs and block
+	// producer signatures: they are all part of one consensus-authentication
+	// rollout, so flipping them independently would leave a gap that is
+	// easy to misconfigure and hard to notice.
+	chain.SetSignedCertificateActivationHeight(cfg.SignedConsensusActivationHeight)
+	chain.SetSignedBlockActivationHeight(cfg.SignedConsensusActivationHeight)
+	chain.SetEvidenceProofActivationHeight(cfg.SignedConsensusActivationHeight)
+	// Task-action signature enforcement. Separate from the signed-consensus
+	// rollout on purpose: this one rejects unsigned CELLS/tasks/v1 actions at
+	// or above the height, so an operator must first confirm their own chain
+	// carries none above the value they set. Zero, the default, requires
+	// nothing -- but a signature that IS present is verified at every height
+	// regardless of this setting.
+	chain.SetTaskActionSignatureActivationHeight(cfg.TaskActionSignatureActivationHeight)
+	// Transaction-content root. Changing this changes BLOCK HASHES from the
+	// height onward, so unlike every other gate here it is not merely a local
+	// policy: a node with a different value computes different hashes and
+	// forks. Zero, the default, keeps the legacy ID-only root, which does not
+	// bind transaction contents.
+	chain.SetTxContentRootActivationHeight(cfg.TxContentRootActivationHeight)
+	if cfg.TxContentRootActivationHeight > 0 {
+		logger.Info("Block tx root commits transaction contents",
+			"from_height", cfg.TxContentRootActivationHeight,
+			"warning", "every node must use this exact value or block hashes diverge")
+	} else {
+		logger.Warn("Block tx root commits transaction IDs only: contents are not bound by the block hash",
+			"config", "[consensus] tx_content_root_activation_height",
+			"env", "CELLS_TX_CONTENT_ROOT_ACTIVATION_HEIGHT",
+			"note", "enabling this is a coordinated fork; every node must agree on the height")
+	}
+	chain.SetEnrollmentStateRootActivationHeight(cfg.EnrollmentStateRootActivationHeight)
+	if cfg.EnrollmentStateRootActivationHeight > 0 {
+		logger.Info("Block state root commits mining enrollment side state",
+			"from_height", cfg.EnrollmentStateRootActivationHeight,
+			"warning", "every node must use this exact value or block roots diverge")
+	} else {
+		logger.Warn("Block state root does not yet commit mining enrollment side state",
+			"config", "[consensus] enrollment_state_root_activation_height",
+			"env", "CELLS_ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT",
+			"note", "enabling this is a coordinated fork; every node must agree on the height")
+	}
+	if cfg.TaskActionSignatureActivationHeight > 0 {
+		logger.Info("Task-action signatures required",
+			"from_height", cfg.TaskActionSignatureActivationHeight)
+	} else {
+		logger.Warn("Task-action signatures are NOT required: an unsigned task action is accepted at any height",
+			"config", "[consensus] task_action_signature_activation_height",
+			"env", "CELLS_TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT",
+			"note", "a signature that is present is still verified; this gate only governs whether one is required")
+	}
+	// Proof-of-Entanglement parent rules for signed wallet transfers. Separate
+	// from the signed-consensus rollout: at or above the height every
+	// transfer must name at least two distinct parents committed in the last
+	// poe.ParentWindowBlocks blocks (or earlier in its block), and this node
+	// enforces that at admission, when producing, and when replaying blocks.
+	// Zero, the default, enforces nothing and replays history unchanged.
+	chain.SetPoEActivationHeight(cfg.PoEActivationHeight)
+	if cfg.PoEActivationHeight > 0 {
+		logger.Info("Proof-of-Entanglement parent rules scheduled",
+			"from_height", cfg.PoEActivationHeight,
+			"window_blocks", poerules.ParentWindowBlocks,
+			"warning", "every validator must use this exact value; wallets must send committed parents first")
+	} else {
+		logger.Info("Proof-of-Entanglement parent rules are not enforced (no activation height)",
+			"config", "[consensus] poe_activation_height",
+			"env", "CELLS_POE_ACTIVATION_HEIGHT")
+	}
+	// Post-quantum only: from this height a CELL stream open, which
+	// registers an Ed25519 usage-receipt session key, is refused in
+	// production, in validation and in replay. Streams opened below it can
+	// still take receipts, settle and close. Zero, the default, changes
+	// nothing. (Ed25519 SignedTx are refused at admission regardless.)
+	chain.SetStreamEd25519RetirementHeight(cfg.StreamEd25519RetirementHeight)
+	if cfg.StreamEd25519RetirementHeight > 0 {
+		logger.Info("Stream Ed25519 session-key retirement scheduled",
+			"from_height", cfg.StreamEd25519RetirementHeight,
+			"refuses", "CELLS/streams/v1 open",
+			"warning", "every validator must use this exact value")
+	} else {
+		logger.Info("Stream Ed25519 session keys are not retired (no retirement height)",
+			"config", "[consensus] stream_ed25519_retirement_height",
+			"env", "CELLS_STREAM_ED25519_RETIREMENT_HEIGHT")
+	}
+	// CELLS-20 tokens (CELLS/token/v1, CELLS/docs/docs/CELLS_20.md): below this
+	// height admission refuses every token transaction, and a block that
+	// carries one anyway is judged as by a node without CELLS-20 (a plain CELL
+	// transfer). Zero, the default, keeps them off, and the state root never
+	// gains its CELLS-20 segment.
+	chain.SetCELLS20ActivationHeight(cfg.CELLS20ActivationHeight)
+	if cfg.CELLS20ActivationHeight > 0 {
+		logger.Info("CELLS-20 tokens scheduled",
+			"from_height", cfg.CELLS20ActivationHeight,
+			"contract", chain.CELLS20ContractID,
+			"warning", "every validator must use this exact value")
+	} else {
+		logger.Info("CELLS-20 tokens are off (no activation height)",
+			"config", "[consensus] CELLS20_activation_height",
+			"env", "CELLS_CELLS20_ACTIVATION_HEIGHT")
+	}
+	chain.SetRequireSignedCertificates(cfg.RequireSignedVotes)
+	chain.SetRequireSignedBlocks(cfg.RequireSignedVotes)
+	chain.SetRequireEvidenceProof(cfg.RequireSignedVotes)
+	logger.Info("consensus message authentication enforcement",
+		"required", cfg.RequireSignedVotes,
+		"activation_height", cfg.SignedConsensusActivationHeight,
+		"covers", "bft votes, pol certificates, block producer signatures, equivocation proofs",
+		"hint", "set require_signed_votes and one shared future signed_message_activation_height only after every validator is upgraded")
+	var bftRelay *networking.BFTP2PRelay
+	if br, bftErr := networking.NewBFTP2PRelay(net, bftIngress, net.Host.ID().String()); bftErr != nil {
+		logger.Warn("BFT gossip relay not started", "error", bftErr)
+	} else {
+		bftRelay = br
+		if !networkedCatchupMode {
+			bftExec.SetPublisher(bftRelay.PublishRaw)
+		}
+		logger.Info("BFT gossip relay started", "topic", networking.BFTTopicName)
+	}
+	polFollower := chain.NewPolFollower(nodeValidatorSet, chain.DefaultConsensusConfig().QuorumFraction)
+	polIngressFollower := polFollower
+	if networkedCatchupMode {
+		// The canonical certificate names the canonical validator set. A
+		// catch-up replica has no authority to substitute its local bootstrap
+		// wallet into that set, so it validates framing and relays POL gossip
+		// without applying it to local finality state.
+		polIngressFollower = nil
+		logger.Info("Networked catch-up mode: POL ingress is validate-and-relay only",
+			"env_var", "CELLS_NETWORKED_CATCHUP_MODE")
+	}
+	polIngress := networking.NewPolGossipIngress(networking.DefaultPolGossipConfig(), polIngressFollower)
+	// Same tracker the tx and BFT ingresses use (nodeTxRep). Without this the
+	// POL ingress has no tracker and cannot refuse a banned peer at all --
+	// unlike the other three, which at least held one.
+	polIngress.SetReputationTracker(nodeTxRep)
+	var polRelay *networking.PolP2PRelay
+	if pr, polErr := networking.NewPolP2PRelay(net, polIngress, net.Host.ID().String()); polErr != nil {
+		logger.Warn("POL gossip relay not started", "error", polErr)
+	} else {
+		polRelay = pr
+		logger.Info("POL gossip relay started", "topic", networking.PolTopicName)
+	}
+
+	adminAccounts := chain.NewAccountStore()
+	// Report how much CELL exists. Nothing measured this before: the scrape
+	// carried peers, blocks, reputation and storage latency and said nothing
+	// about the money, while the float64 balance path is known to destroy value
+	// on transfer (the funder debit quantises to a 0.125-CELL ULP, the miner
+	// credit does not). Measurement only -- SupplyLedger's capped issuance stays
+	// unreachable until the dust transition, which is gated on an overflow.
+	monitoring.RegisterSupplyProvider(adminAccounts)
+	adminPool := mempool.New(mempool.DefaultConfig())
+	// New constructs the queue but deliberately does not start its background
+	// lifecycle. Without the sweeper, an uncommitted transaction can reserve a
+	// sender nonce forever and block every later signed wallet/task action.
+	adminPool.Start()
+	defer adminPool.Stop()
+	adminFinality := chain.NewFinalityGadget(chain.DefaultFinalityConfig())
+	polFollower.SetAnchorFinality(true)
+	adminFinality.SetPolFollower(polFollower)
+	adminReceipts := chain.NewReceiptStore()
+	prodCfg := chain.DefaultProducerConfig()
+	prodCfg.ProducerID = net.Host.ID().String()
+	stakingLedger, stakeErr := chain.LoadOrNewStakingLedger(stakingPath)
+	if stakeErr != nil {
+		logger.Warn("Failed to load staking ledger; using new ledger", "error", stakeErr, "path", stakingPath)
+		stakingLedger = chain.NewStakingLedger()
+	}
+	stakingLedger.SetPersistPath(stakingPath)
+	nodeEvidenceManager.SetStakingLedger(stakingLedger)
+	polTipSnap := struct {
+		mu        sync.RWMutex
+		height    uint64
+		stateRoot string
+		ok        bool
+	}{}
+	// v2 mining wiring (Phase 2c): see internal/v2wiring/v2wiring.go.
+	// Wire() constructs the on-chain enrollment state,
+	// EnrollmentApplier, EnrollmentAwareApplier, SlashApplier,
+	// monitoring gauge provider, mempool admission gate, and the
+	// HTTP submitter handle in one centralised, test-covered
+	// place. We pass BaseAdmit=nil here because the POL/BFT
+	// extension predicate is registered separately below — the
+	// pool admission gate set inside Wire is replaced once we
+	// install the composed BaseAdmit + enrollment.AdmissionChecker
+	// pair, ensuring both predicates run for non-enrollment txs.
+	govStorePath := filepath.Join(stateDir, "CELLS_governance.json")
+	v2Wired, v2WireErr := v2wiring.Wire(v2wiring.Config{
+		Accounts:       adminAccounts,
+		Pool:           adminPool,
+		BaseAdmit:      nil, // re-installed below alongside POL/BFT predicate.
+		SlashRewardBPS: chain.SlashRewardCap,
+		// Addresses permitted to submit `CELLS/gov/v1` param-set txs.
+		// Empty keeps the pre-governance posture (gov txs reject with
+		// ErrGovernanceNotConfigured and the slash applier reads static
+		// defaults). Operators activate governance by setting
+		// `[governance] authorities` in the config file or the
+		// CELLS_GOVERNANCE_AUTHORITIES env var.
+		GovernanceAuthorities: cfg.GovernanceAuthorities,
+		LogSweepError: func(h uint64, err error) {
+			logger.Warn("v2 mining: enrollment sweep failed",
+				"height", h, "error", err)
+		},
+		// GovParamStorePath persists the chain-parameter
+		// store (TCs / ForkV2TCHeight / activation params)
+		// across restarts via atomic-rename snapshots in the
+		// post-seal hook. Default value path lives next to
+		// the other state files; the directory is the same
+		// stateDir we already use for CELLS_chain.ndjson +
+		// CELLS_accounts.json + CELLS_enrollment.json so the
+		// operator's reset / backup ceremony covers all four
+		// in one step.
+		GovParamStorePath: govStorePath,
+		LogSnapshotError: func(h uint64, err error) {
+			logger.Warn("gov param store: snapshot failed",
+				"height", h, "path", govStorePath, "error", err)
+		},
+		// Slash receipts NDJSON persistence. Per-publish
+		// append + boot-time replay so the
+		// /api/v1/mining/slash/{tx_id} GET endpoint serves
+		// continuous history across restarts. Schema
+		// matches api.SlashReceiptView so an operator's
+		// `tail -f` shows the same fields the HTTP endpoint
+		// returns. The default path lives next to the other
+		// state files in stateDir.
+		SlashReceiptsPath: filepath.Join(stateDir, "CELLS_slash_receipts.ndjson"),
+		LogSlashReceiptsError: func(err error) {
+			logger.Warn("slash receipts: persistence error",
+				"path", filepath.Join(stateDir, "CELLS_slash_receipts.ndjson"),
+				"error_str", err.Error())
+		},
+	})
+	if v2WireErr != nil {
+		log.Fatalf("v2 mining wiring failed: %v", v2WireErr)
+	}
+	// Governance activates only when authorities are configured. Log the
+	// posture explicitly: a silently-disabled governance arm is exactly the
+	// failure mode that kept this subsystem unreachable in production.
+	if len(cfg.GovernanceAuthorities) == 0 {
+		logger.Info("on-chain governance disabled (no authorities configured)",
+			"hint", "set [governance] authorities or CELLS_GOVERNANCE_AUTHORITIES to activate")
+	} else {
+		logger.Info("on-chain governance enabled",
+			"authority_count", len(cfg.GovernanceAuthorities))
+	}
+	// Keep this explicit startup invariant next to the process entrypoint. Wire
+	// installs the same pool, while the second assignment makes configuration
+	// drift visible and prevents a validator from serving signed task actions
+	// with a nil process-wide submitter.
+	api.SetTaskActionMempool(adminPool)
+	if !api.TaskActionMempoolReady() {
+		log.Fatal("signed task-action mempool wiring failed")
+	}
+	if !api.TaskActionSubmissionReady() {
+		log.Fatal("signed task-action submission dependencies are not ready")
+	}
+	logger.Info("Signed task-action mempool ready", "audit_row", "task-actions")
+
+	adminProducer := chain.NewBlockProducer(adminPool, v2Wired.StateApplier, prodCfg)
+	v2Wired.AttachToProducer(adminProducer)
+	// Serialize wallet admission with block application so balance and nonce
+	// validation sees committed state, including while the pool is drained.
+	api.SetWalletTransferMempool(adminProducer.WalletTransferSubmitter())
+	// Defense in depth: Config.Validate rejects this already. Keep the process
+	// entrypoint fail-closed too, so a future alternate config loader cannot arm
+	// an incomplete consensus transition and zero legacy balances at the fork.
+	if cfg.ForkDustHeight != 0 {
+		log.Fatalf("refusing unsafe integer-dust activation at height %d: run CELLS-ledger-fork-plan and implement the capped-issuance transition first", cfg.ForkDustHeight)
+	}
+	logger.Info("integer-dust accounting fork locked",
+		"activation_ready", false,
+		"next", "reconcile a fork manifest and implement the capped-issuance transition")
+
+	adminProducer.SetAppendReceiptStore(adminReceipts)
+	// Authenticate blocks we seal. SignBlock derives ProducerID from the
+	// key, so a producer identity that disagrees with the signing key can
+	// never be sealed.
+	adminProducer.SetBlockSigner(consensusSigner)
+	adminProducer.SetPolFollower(polFollower)
+	// Restrict who may inject a block through the `CELLS-blocks` topic.
+	// TryAppendExternalBlock authenticates the block but not the right to
+	// produce one, so with this unset any peer that reaches the topic can build
+	// a block on our tip and have us replay its transactions. Empty preserves
+	// that pre-existing behaviour rather than failing closed, because a wrong
+	// value here stops the node following the chain -- so the open posture is
+	// logged at WARN to keep it visible instead of silently permissive.
+	adminProducer.SetAuthorizedBlockProducers(cfg.AuthorizedBlockProducers)
+	if err := adminProducer.SetProducerTransition(cfg.ProducerTransition); err != nil {
+		log.Fatalf("producer transition: %v", err)
+	}
+	if p := cfg.ProducerTransition; p != nil {
+		final := p.FinalEpoch()
+		logger.Info("Checkpoint-bound producer transition enforced", "version", p.Version, "epochs", producerScheduleSummary(p), "checkpoint_height", final.FromHeight-1, "checkpoint_hash", final.CheckpointHash, "effective_height", final.FromHeight, "replacement_producer", final.ProducerID)
+	}
+	if advice := producerAllowlistAdvice(cfg.AuthorizedBlockProducers, cfg.ProducerTransition); advice != "" {
+		logger.Warn("Stale external block producer allowlist", "detail", advice,
+			"config", "[consensus] authorized_block_producers", "see", "CELLS/docs/docs/PRIVATE_P2P.md")
+	}
+	if adminProducer.ExternalProducerGateEnforced() {
+		logger.Info("External block producer allowlist enforced",
+			"producer_count", len(adminProducer.AuthorizedBlockProducers()),
+			"producers", strings.Join(adminProducer.AuthorizedBlockProducers(), ","))
+	} else {
+		logger.Warn("External block producer allowlist is empty: any peer may inject blocks on the CELLS-blocks topic",
+			"config", "[consensus] authorized_block_producers",
+			"env", "CELLS_AUTHORIZED_BLOCK_PRODUCERS",
+			"hint", "pin the producer peer ID you already use as the bootstrap peer")
+	}
+	// Local block production has two explicit roles. Solo mode is isolated;
+	// network-producer mode is the one configured leader that seals and
+	// broadcasts blocks to append-only followers. Never infer producer status
+	// from peer count: doing so could create two independent histories.
+	soloValidatorMode := envcompat.Truthy("CELLS_SOLO_VALIDATOR_MODE", "CELLS_SOLO_VALIDATOR_MODE")
+	networkBlockProducerMode := envcompat.Truthy("CELLS_NETWORK_BLOCK_PRODUCER", "CELLS_NETWORK_BLOCK_PRODUCER")
+	productionRole, productionRoleErr := resolveBlockProductionRole(soloValidatorMode, networkBlockProducerMode)
+	if productionRoleErr != nil {
+		log.Fatalf("invalid block production role: %v", productionRoleErr)
+	}
+	localBlockProduction := productionRole.localProductionEnabled()
+	if cfg.ProducerTransition != nil && localBlockProduction && consensusSigner.Address() != cfg.ProducerTransition.FinalEpoch().ProducerID {
+		log.Fatal("producer transition: configured local signer is not the approved replacement producer")
+	}
+	if !localBlockProduction {
+		adminProducer.SetBFTSealGate(liveBFT)
+		adminProducer.SetPreSealBFTRound(func(blk *chain.Block) error {
+			return chain.RunSyntheticBFTRoundWithExecutor(bftExec, nodeValidatorSet, blk)
+		})
+	} else if productionRole == blockProductionRoleSolo {
+		logger.Info("Solo validator mode: BFT seal gate and pre-seal synthetic round disabled",
+			"env_var", "CELLS_SOLO_VALIDATOR_MODE",
+			"reason", "no peer validators to drive BFT quorum; internal/blockdriver will own block production")
+	} else {
+		logger.Info("Network producer mode: local block driver owns production and broadcasts sealed blocks",
+			"env_var", "CELLS_NETWORK_BLOCK_PRODUCER",
+			"role", productionRole,
+			"reason", "configured single leader; network followers remain append-only")
+	}
+	// Compose the admission gate. v2wiring.Wire() already
+	// installed enrollment.AdmissionChecker(nil); we replace it
+	// with the same checker wrapped around the POL/BFT base
+	// predicate. Order matters: enrollment txs go through the
+	// stateless enroll/unenroll validators FIRST (cheap,
+	// attributable), and non-enrollment txs fall through to
+	// the POL/BFT predicate (consensus-attributable). Without
+	// this composition either path would silently bypass one
+	// of the two gates.
+	baseAdmit := func(_ *mempool.Tx) error {
+		polTipSnap.mu.RLock()
+		h, sr, ok := polTipSnap.height, polTipSnap.stateRoot, polTipSnap.ok
+		polTipSnap.mu.RUnlock()
+		if !ok {
+			return nil
+		}
+		if polFollower != nil && polFollower.AnchorFinalityEnabled() {
+			if !polFollower.CanExtendFromTip(h, sr) {
+				return chain.ErrPolExtensionBlocked
+			}
+		}
+		if liveBFT != nil && !liveBFT.IsCommitted(h) {
+			return chain.ErrBFTExtensionBlocked
+		}
+		return nil
+	}
+	// The innermost admission layer applies the Proof-of-Entanglement parent
+	// rules to wallet transfers entering the pool by any path (submit-signed
+	// already checks them in WalletTransferSubmitter; follower gossip does
+	// not). It only intercepts CELLS/wallet-transfer/v1, so heartbeat, mining
+	// reward and every other transaction family pass through unchanged, and
+	// it rejects nothing below the PoE activation height.
+	if localBlockProduction {
+		// A configured local producer owns extension decisions. The current
+		// one-validator set cannot satisfy the peer-driven BFT predicate.
+		v2wiring.ReinstallAdmissionGate(adminPool, adminProducer.WalletTransferPoEAdmission(nil))
+		logger.Info("Local block producer admission gate ignores peer-driven BFT/POL predicates",
+			"role", productionRole,
+			"reason", "configured producer owns block extension")
+	} else {
+		v2wiring.ReinstallAdmissionGate(adminPool, adminProducer.WalletTransferPoEAdmission(baseAdmit))
+	}
+	adminProducer.OnSealed = func() {
+		if blk, ok := adminProducer.LatestBlock(); ok {
+			polTipSnap.mu.Lock()
+			polTipSnap.height = blk.Height
+			polTipSnap.stateRoot = blk.StateRoot
+			polTipSnap.ok = true
+			polTipSnap.mu.Unlock()
+			stakingLedger.ProcessCommittedHeight(adminAccounts, blk.Height, blk.StateRoot)
+			// HL1 (f): the POL publish moved to hook step H10, after the
+			// block is durable. Staking and finality stay here.
+			bftExec.PrunePendingHeight(blk.Height)
+			adminFinality.TrackBlockWithMeta(blk.Height, blk.Hash, blk.StateRoot)
+			adminFinality.UpdateTip(blk.Height)
+		}
+		chain.SyncValidatorStakesFromCommittedTip(nodeValidatorSet, adminAccounts, adminProducer, stakingLedger)
+	}
+
+	// v1 mining service (Phase 2c-v wiring): install the
+	// concrete api.MiningService that backs /api/v1/mining/work
+	// and /api/v1/mining/submit. Without this, both endpoints
+	// return 503 mining_unavailable — the pre-2026-05-06 BLR1
+	// posture confirmed by the curl probe in commit history.
+	//
+	// Bring-up parameters (deliberately conservative):
+	//   - WorkSet: a deterministic 3-batch / 3-cell-per-batch
+	//     synthetic. Mining cells are ID-sorted so any miner
+	//     re-canonicalises to byte-identical content.
+	//   - DAGSize: 1024 entries (32 KiB resident). Enough to
+	//     exercise the DAG-walk path; small enough that a
+	//     fresh validator boots in ms. Production mainnet
+	//     re-targets to mining.ProductionDAGSize.
+	//   - Difficulty: the protocol minimum (2^16). Serving the old
+	//     self-test value of 2 made production work complete in roughly two
+	//     hashes, so neither the CPU nor CUDA solver performed meaningful
+	//     proof search. Retargeting still needs chain-state wiring, but no
+	//     public node may advertise a target below the consensus floor.
+	//     HL2 WP-E: a writable legacy-mining service takes the config's
+	//     difficulty instead (hl1MiningServiceConfig: 2^16 for a v1
+	//     config, 2^difficulty_bits >= 2^16 for v2).
+	//
+	// All three values are static for now. They can be
+	// promoted to operator-tunable config keys once we have a
+	// second validator that needs to agree on them. Until
+	// then, hardcoding keeps consensus byte-identical.
+	// blockDriver is constructed AFTER specCheck so the
+	// optional Tier-3 RewardPenalty can be wired in at New
+	// time (the Driver field is read-only after construction
+	// to keep the buildTxs hot path branch-free). The
+	// declaration stays here so the rest of the boot code
+	// can reference it; the construction itself is below.
+	var blockDriver *blockdriver.Driver
+
+	// v2 attestation dispatcher. Wired UNCONDITIONALLY (whether
+	// or not CELLS_V2_ACTIVE is set) because:
+	//
+	//   - With v2 NOT active, ForkV2Height defaults to MaxUint64
+	//     and the verifier never invokes the dispatcher. Wiring
+	//     it costs ~one nonce-store map and a per-validator
+	//     HMAC-key file; nothing consensus-touching.
+	//
+	//   - With v2 ACTIVE, the dispatcher is the consensus rule
+	//     that rejects CPU / non-NVIDIA proofs. A miswired
+	//     dispatcher (nil) silently falls through to
+	//     FailClosedVerifier, which rejects everything — safe,
+	//     but the operator gets no diagnostics. Wiring eagerly
+	//     means a startup-time failure (e.g. unreadable HMAC
+	//     key file) surfaces clearly here rather than silently
+	//     during the first /api/v1/mining/submit request.
+	//
+	// Collaborators:
+	//   Registry        — enrollment.NewStateBackedRegistry over
+	//                     the live on-chain enrollment state, so
+	//                     the HMAC verifier resolves operator
+	//                     entries against the same state the
+	//                     EnrollmentApplier mutates.
+	//   ChallengeVerifier — challenge.NewHMACSignerVerifier
+	//                       seeded with this validator's local
+	//                       signer key. Multi-validator setups
+	//                       Register() each peer's key here at
+	//                       genesis; for the solo deploy the
+	//                       single-key registration is enough.
+	//   NonceStore      — per-(node_id, nonce) replay cache,
+	//                     in-memory with 2*FreshnessWindow
+	//                     retention. Production multi-validator
+	//                     deployments will swap this for a
+	//                     persistent store; the interface stays
+	//                     unchanged.
+	//   CCConfig        — populated from cc.LoadVerifierConfig
+	//                     when CELLS_CC_ROOTS_DIR is set; nil
+	//                     otherwise (cc.NewStubVerifier handles
+	//                     nvidia-cc-v1 proofs as ErrNotYetAvailable
+	//                     so the bring-up posture does not pretend
+	//                     to verify CC bundles without a trust
+	//                     anchor).
+	//
+	// The validator's HMAC key is a per-process secret persisted
+	// to <stateDir>/CELLS_challenge_hmac.key. Auto-generated on
+	// first boot via crypto/rand; the key never leaves the file
+	// and never appears in logs (only the signer_id, derived
+	// from the key's first 8 bytes via hex, is logged).
+	chSignerID, chSignerKey, chKeyErr := loadOrCreateChallengeKey(challengeKeyPath)
+	if chKeyErr != nil {
+		log.Fatalf("v2 challenge key init: %v", chKeyErr)
+	}
+	chSigner, chSignerErr := challenge.NewHMACSigner(chSignerID, chSignerKey)
+	if chSignerErr != nil {
+		log.Fatalf("v2 challenge signer: %v", chSignerErr)
+	}
+	chSignerVerifier := challenge.NewHMACSignerVerifier()
+	if regErr := chSignerVerifier.Register(chSignerID, chSignerKey); regErr != nil {
+		log.Fatalf("v2 challenge signer-verifier registration: %v", regErr)
+	}
+	// Peer-signer allowlist. Lets the validator accept v2
+	// challenges minted by remote cmd/CELLS-attester instances
+	// (e.g. an operator's home machine running on a 3050).
+	// The file path is opt-in via CELLS_PEER_SIGNERS_FILE; an
+	// unset/missing file is a no-op so existing deployments
+	// keep their pre-Phase-2c-attester posture.
+	if peerSignersPath := strings.TrimSpace(os.Getenv("CELLS_PEER_SIGNERS_FILE")); peerSignersPath != "" {
+		peers, peersErr := LoadPeerSignersFile(peerSignersPath)
+		if peersErr != nil {
+			log.Fatalf("v2 peer-signers load: %v", peersErr)
+		}
+		registered, regErrs := RegisterPeerSigners(chSignerVerifier, peers)
+		for _, e := range regErrs {
+			logger.Warn("v2 peer-signer rejected",
+				"signer_id", e.PeerSigner.SignerID,
+				"note", e.PeerSigner.Note,
+				"reason", e.Err.Error())
+		}
+		if len(regErrs) > 0 {
+			log.Fatalf("v2 peer-signers: %d entries rejected; fix peer_signers.toml and restart", len(regErrs))
+		}
+		logger.Info("v2 peer-signers loaded",
+			"path", peerSignersPath,
+			"registered", registered)
+	}
+	chIssuer, chIssuerErr := challenge.NewIssuer(chSigner)
+	if chIssuerErr != nil {
+		log.Fatalf("v2 challenge issuer: %v", chIssuerErr)
+	}
+	api.SetChallengeIssuer(chIssuer)
+	logger.Info("v2 challenge issuer wired",
+		"signer_id", chSigner.SignerID(),
+		"key_path", challengeKeyPath,
+		"endpoint", "/api/v1/mining/challenge")
+
+	hmacNonceStore := hmac.NewInMemoryNonceStore(2 * mining.FreshnessWindow)
+	attestProdCfg := attest.ProductionConfig{
+		Registry:                 enrollment.NewStateBackedRegistry(v2Wired.EnrollmentState),
+		ChallengeVerifier:        chSignerVerifier,
+		NonceStore:               hmacNonceStore,
+		RequireOperatorSignature: cfg.RequireMiningOperatorSignatures,
+		// DenyList nil → hmac.EmptyDenyList (genesis posture).
+		// FreshnessWindow / AllowedFutureSkew zero → spec defaults.
+	}
+
+	// Optional: Tier-2 telemetry advisory checker. Wired
+	// only when the operator opts in via
+	// CELLS_SPEC_CHECK_ENABLED — keeps the bit-for-bit
+	// behaviour of pre-Tier-2 deployments unchanged. See
+	// cmd/CELLS/spec_check.go for the wiring rationale.
+	specCheck, specCheckErr := buildSpecCheckWiring(context.Background(), logger.Info)
+	if specCheckErr != nil {
+		log.Fatalf("spec-check wiring: %v", specCheckErr)
+	}
+	if specCheck != nil {
+		attestProdCfg.HMACOnAccept = specCheck.Adapter.OnHMACAccept
+		total, signers, skus := specCheck.Catalog.Counters()
+		logger.Info("spec-check: Tier-2 advisory checker active",
+			"catalog_entries", total,
+			"catalog_signers", signers,
+			"catalog_skus", skus,
+			"peer_urls", strings.Join(specCheck.PeerURLs, ","),
+			"refresh_every", specCheck.RefreshEvery.String(),
+			"ring_cap", specCheck.RingCap)
+		go runSpecCheckPoller(context.Background(), specCheck, logger.Info)
+		api.SetSpecAnomaliesProbe(specAnomaliesProbe(specCheck))
+		monitoring.SetSpecCheckProbe(specCheckMonitoringProbe(specCheck))
+		logger.Info("/api/v1/mining/spec-anomalies probe wired")
+		logger.Info("CELLS_spec_check_* Prometheus collector wired")
+		// Tier-3 wiring — only when the operator turned on
+		// CELLS_SPEC_PENALTY_ENABLED, in which case
+		// specCheck.Penalty is non-nil and the probes have
+		// real data to publish. Pre-Tier-3 deployments
+		// short-circuit the SetSpec*Probe calls (probe
+		// returns nil) and the endpoints serve 503.
+		if specCheck.Penalty != nil {
+			api.SetSpecPenaltyProbe(specPenaltyProbe(specCheck))
+			monitoring.SetSpecPenaltyProbe(specPenaltyMonitoringProbe(specCheck))
+			logger.Info("/api/v1/mining/penalty probe wired")
+			logger.Info("CELLS_spec_penalty_* Prometheus collector wired")
+		}
+	} else {
+		logger.Info("spec-check: Tier-2 advisory checker disabled (set CELLS_SPEC_CHECK_ENABLED=1 to enable)")
+	}
+	if ccRootsDir := strings.TrimSpace(os.Getenv("CELLS_CC_ROOTS_DIR")); ccRootsDir != "" {
+		// CC trust anchor is operator-supplied: if the dir is
+		// configured but unreadable, refuse to boot rather than
+		// silently fall back to the stub. A v2-active validator
+		// that pretends to verify nvidia-cc-v1 but actually
+		// rejects every CC proof is exactly the silent-failure
+		// posture the activation gate exists to prevent.
+		ccCfg, ccErr := cc.LoadVerifierConfig(cc.VerifierConfigOptions{
+			RootPaths:  []string{ccRootsDir},
+			NonceStore: hmacNonceStore,
+		})
+		if ccErr != nil {
+			log.Fatalf("v2 cc verifier config: %v", ccErr)
+		}
+		if ccCfg != nil {
+			attestProdCfg.CCConfig = ccCfg
+			logger.Info("v2 nvidia-cc-v1 verifier wired",
+				"roots_dir", ccRootsDir,
+				"pinned_root_count", len(ccCfg.PinnedRoots))
+		}
+	} else {
+		logger.Info("v2 nvidia-cc-v1 verifier: stub (datacenter Hopper/Blackwell path disabled)",
+			"env_var", "CELLS_CC_ROOTS_DIR",
+			"effect", "consumer NVIDIA GPUs only, via nvidia-hmac-v1; CC proofs reject as ErrNotYetAvailable")
+	}
+	v2Dispatcher, v2DispErr := attest.NewProductionDispatcher(attestProdCfg)
+	if v2DispErr != nil {
+		log.Fatalf("v2 attestation dispatcher wiring failed: %v", v2DispErr)
+	}
+	logger.Info("v2 attestation dispatcher wired",
+		"hmac_path_active", true,
+		"cc_path_active", attestProdCfg.CCConfig != nil,
+		"operator_signature_required", attestProdCfg.RequireOperatorSignature,
+		"fork_v2_active", v2Active,
+		"effect_when_active", "post-fork proofs require nvidia-cc-v1 or nvidia-hmac-v1 attestation")
+
+	// HL1 (a) mining wiring (design rev 4 §2). The canary machinery (Guard,
+	// Store, Ledger) exists only with CELLS_LEGACY_MINING_MODE=canary and local
+	// block production. The Guard is built before Store.Open so an S7 failure
+	// can trip FROZEN; Reconcile opens the Store after S5. Otherwise the
+	// mining service is read-only and the driver seals heartbeats only (S6).
+	hl1Durable := &hl1DurableTip{}
+	var hl1LocalSeal atomic.Bool
+	hl1Mining := hl1NewCanary(hl1Boot, localBlockProduction, adminAccounts, v2Wired.EnrollmentState)
+	if localBlockProduction {
+		// For the configured producer, the blockdriver pays accepted proofs
+		// from the HL1 Ledger (canary) or seals heartbeats only. Tier-3 reward
+		// downgrade is wired here
+		// (the deferred construction is the whole reason
+		// the blockDriver var was declared earlier instead of
+		// allocated inline). Pre-Tier-3 deployments leave
+		// RewardPenalty nil → noopRewardPenalty inside the
+		// driver, byte-identical to before.
+		blockdriverCfg := blockdriver.Config{
+			Producer:  adminProducer,
+			Pool:      adminPool,
+			Accounts:  adminAccounts,
+			Logger:    logger,
+			FailStop:  failStop,
+			LocalSeal: &hl1LocalSeal,
+		}
+		if hl1Mining.enabled() {
+			blockdriverCfg.Ledger = hl1Mining.ledger
+			blockdriverCfg.Guard = hl1Mining.guard
+		}
+		if productionRole == blockProductionRoleNetworkProducer {
+			blockdriverCfg.ProducerID = "CELLS-network-producer"
+		}
+		if specCheck != nil && specCheck.Penalty != nil {
+			// Cast: telemetrycheck.PerMinerStats already
+			// satisfies blockdriver.RewardPenalty by virtue
+			// of MultiplierFor(string) float64. Go's
+			// structural interface check makes this a no-
+			// op assignment at runtime.
+			blockdriverCfg.RewardPenalty = specCheck.Penalty
+			logger.Info("blockdriver: Tier-3 reward downgrade wired",
+				"role", productionRole,
+				"window_size", specCheck.Penalty.Config().WindowSize,
+				"threshold_pct", specCheck.Penalty.Config().MismatchThresholdPct,
+				"multiplier", specCheck.Penalty.Config().PenaltyMultiplier)
+		}
+		drv, drvErr := blockdriver.New(blockdriverCfg)
+		if drvErr != nil {
+			log.Fatalf("%s blockdriver wiring failed: %v", productionRole, drvErr)
+		}
+		blockDriver = drv
+		// Publish the driver to the Tier-3 monitoring probe
+		// so /metrics surfaces blockdriver-side withheld-dust
+		// counters. Safe to call even when Tier-3 is off —
+		// the probe is nil-checked at scrape time.
+		SetSoloDriverForMonitoring(blockDriver)
+	}
+
+	// HL1: the mining service is installed after reconciliation (S7-S14),
+	// once it is known whether the legacy-mining Store opened; see
+	// hl1MiningServiceConfig below. The API server starts after that.
+	accountProbe := accountProbeFromStore(adminAccounts)
+	// Referral qualification and starter-grant balance checks need a
+	// read-only view of canonical account activity in every node mode.
+	api.SetReferralRewardPoolLedger(accountProbe)
+	// Miner enrollment needs the same canonical balance and next nonce in
+	// every validator mode. This endpoint is read-only; keeping it limited to
+	// solo mode made networked validators return 503 and prevented a new
+	// zero-balance wallet from selecting deferred bonding.
+	api.SetMiningAccountProbe(accountProbe)
+	logger.Info("/api/v1/mining/account canonical balance probe wired")
+	// Signed wallet transfers are admitted to adminPool above and mutate the
+	// account store only when their containing block commits. Never wire the
+	// legacy direct-write ledger here: it bypasses persistence and peer replay.
+	api.SetLocalWalletTransferLedger(nil)
+	logger.Info("/api/v1/wallet/submit-signed block-commit path wired")
+	if err := rejectDevelopmentFundingInProduction(); err != nil {
+		log.Fatalf("production funding configuration: %v", err)
+	}
+	if err := wireTreasuryPayoutServices(logger); err != nil {
+		log.Fatalf("treasury payout configuration: %v", err)
+	}
+	// Wire the emission probe regardless of solo mode — it
+	// reads pure schedule state, no AccountStore peek, so
+	// it's always safe to expose. SDK clients render
+	// tokenomics widgets from this endpoint.
+	api.SetMiningEmissionProbe(emissionProbeFromProducer(adminProducer))
+	logger.Info("/api/v1/mining/emission probe wired (chain.DefaultEmissionSchedule)")
+	// HL1 (c): the block and receipt-list surfaces never serve a height
+	// above the durable tip (W5).
+	api.SetMiningBlocksProbe(blocksProbeFromProducer(adminProducer, hl1Durable))
+	logger.Info("/api/v1/mining/blocks probe wired (BlockProducer header projection, durable tip)")
+	api.SetChainBlocksProbe(blocksProbeFromProducer(adminProducer, hl1Durable))
+	logger.Info("/api/v1/chain/blocks probe wired (BlockProducer full block projection, durable tip)")
+	api.SetPoEParentSource(poeParentsProbe{producer: adminProducer, durable: hl1Durable})
+	logger.Info("/api/v1/chain/parents probe wired (recent committed transaction IDs, durable tip)")
+	api.SetMiningReceiptProbe(receiptProbeFromStore(adminReceipts))
+	logger.Info("/api/v1/receipts/{tx_id} probe wired (ReceiptStore lookup)")
+	api.SetMiningReceiptsListProbe(receiptsListProbeFromStore(adminReceipts, adminProducer, hl1Durable))
+	logger.Info("/api/v1/receipts probe wired (ReceiptStore height-range list, durable tip)")
+
+	// Chain + accounts persistence (Phase 2c-vii follow-up).
+	// Without this, every restart wipes both the BlockProducer
+	// chain (in-memory `[]*Block`) and the AccountStore (in-
+	// memory map), so the genesis-seal block below fires on
+	// every boot and re-credits the funder + re-seeds the
+	// prefund address. The NDJSON chain log is appended per
+	// seal, the accounts JSON is overwritten per seal; on the
+	// next boot we hydrate both before the genesis-seal block
+	// runs so HasTip()=true and the seal is skipped.
+	//
+	// State files live under stateDir (the dir holding
+	// CELLS.db). On a fresh host both paths are absent and the
+	// genesis seal runs as before. On a returning host the
+	// files exist and the genesis seal is skipped — exactly
+	// the contract the seal-skip branch was already written
+	// against, so no other code-paths change.
+	//
+	// Order matters during hydrate: read CHAIN first, then load
+	// ACCOUNTS before installing either into the live producer.
+	// This lets startup prove the account/task snapshot matches
+	// the journal tip and remove a fully appended but uncommitted
+	// journal tail after a crash or disk-full event. If
+	// the chain shows blocks but the accounts file is missing, we fail-fast
+	// rather than boot a half-restored state where balances
+	// are zero but tip is non-zero — that combination would
+	// cause the next reward tx (funder.nonce>0 expected) to
+	// fail the nonce check and stall the chain.
+	chainStatePath := filepath.Join(stateDir, "CELLS_chain.ndjson")
+	accountsStatePath := filepath.Join(stateDir, "CELLS_accounts.json")
+	enrollmentStatePath := filepath.Join(stateDir, "CELLS_enrollment.json")
+	// Receipts are NDJSON-append-only (CELLS_receipts.ndjson). The
+	// legacy whole-store JSON path (CELLS_receipts.json) is kept
+	// only for one-shot migration of pre-existing deployments —
+	// see the boot block below. New installs go straight to
+	// NDJSON; the legacy path is never written.
+	receiptsNDJSONPath := filepath.Join(stateDir, "CELLS_receipts.ndjson")
+	receiptsLegacyJSONPath := filepath.Join(stateDir, "CELLS_receipts.json")
+	// HL1 S4: the restore block. Every fatal in it exits 78 (fatalRestore),
+	// and a non-empty journal must end with a newline (R-C3).
+	var hl1RestoredBlocks []*chain.Block
+	if err := hl1RequireFinalNewline(hl1OSFS{}, chainStatePath); err != nil {
+		fatalRestore("chain restore: journal: %v", err)
+	}
+	// With a producer transition the load authenticates every block once
+	// (hash, links, schedule, ML-DSA-87) and keeps no verified signature in
+	// memory but the tip's; RelayBlocks reads them back from the journal.
+	// RestoreVerifiedChain installs exactly the verified blocks without
+	// verifying them again.
+	var persistedBlocks []*chain.Block
+	var verifiedChain *chain.VerifiedChain
+	var restoreErr error
+	if cfg.ProducerTransition != nil {
+		if verifiedChain, restoreErr = adminProducer.LoadVerifiedJournal(chainStatePath); restoreErr != nil {
+			fatalRestore("producer transition persisted chain: %v", restoreErr)
+		}
+		persistedBlocks = verifiedChain.Blocks()
+	} else {
+		persistedBlocks, restoreErr = chain.LoadChainNDJSON(chainStatePath)
+	}
+	if restoreErr != nil {
+		fatalRestore("chain restore: read %s: %v", chainStatePath, restoreErr)
+	} else if len(persistedBlocks) > 0 {
+		restoreBlocks, droppedForkBlocks := canonicalPersistedChain(persistedBlocks)
+		if cfg.ProducerTransition != nil && droppedForkBlocks != 0 {
+			fatalRestore("producer transition: automatic journal canonicalization is disabled; preserve immutable history and review the suffix")
+		}
+		if droppedForkBlocks > 0 {
+			logger.Warn("chain restore: ignored forked duplicate persisted blocks",
+				"loaded_blocks", len(persistedBlocks),
+				"canonical_blocks", len(restoreBlocks),
+				"dropped_blocks", droppedForkBlocks,
+				"chain_path", chainStatePath)
+			backupPath := fmt.Sprintf("%s.forked-%s.bak", chainStatePath, time.Now().UTC().Format("20060102T150405Z"))
+			if err := chain.ReplaceChainFile(chainStatePath, backupPath, restoreBlocks); err != nil {
+				fatalRestore("chain restore: canonical journal rewrite failed for %s: %v", chainStatePath, err)
+			}
+			logger.Warn("chain restore: archived forked journal and installed canonical branch",
+				"canonical_blocks", len(restoreBlocks),
+				"chain_path", chainStatePath,
+				"backup_path", backupPath)
+		}
+		loadedAccounts, loadErr := adminAccounts.Load(accountsStatePath)
+		if loadErr != nil {
+			fatalRestore("chain restore: accounts file %s missing or unreadable while chain has %d blocks (%v) — refusing to boot a half-restored state. Either restore the matching accounts file or wipe %s to reset the chain.",
+				accountsStatePath, len(restoreBlocks), loadErr, chainStatePath)
+		}
+		loadedEnrollments := 0
+		var enrollErr error
+		if cfg.ProducerTransition != nil {
+			loadedEnrollments, enrollErr = loadTransitionEnrollmentSnapshot(v2Wired.EnrollmentState, enrollmentStatePath)
+			if enrollErr != nil {
+				fatalRestore("producer transition: enrollment restore: %v", enrollErr)
+			}
+		}
+		discardedTailHeight := restoreBlocks[len(restoreBlocks)-1].Height
+		var restoredState persistedStateRestore
+		var reconcileErr error
+		if cfg.ProducerTransition != nil {
+			restoredState, reconcileErr = evaluateTransitionPersistedState(adminAccounts, restoreBlocks, v2Wired.EnrollmentState, cfg.ProducerTransition)
+			if reconcileErr == nil && restoredState.stateRoot != restoreBlocks[len(restoreBlocks)-1].StateRoot {
+				reconcileErr = errors.New("producer transition: account snapshot does not match journal tip; automatic tail truncation is disabled")
+			}
+		} else {
+			restoredState, reconcileErr = reconcilePersistedStateTail(chainStatePath, adminAccounts, restoreBlocks, time.Now())
+		}
+		if reconcileErr != nil {
+			fatalRestore("chain restore: %v", reconcileErr)
+		}
+		restoreBlocks = restoredState.blocks
+		if restoredState.recovered {
+			logger.Warn("chain restore: removed journal tail newer than the committed account snapshot",
+				"recovered_tip_height", restoreBlocks[len(restoreBlocks)-1].Height,
+				"discarded_through_height", discardedTailHeight,
+				"discarded_blocks", restoredState.discardedTail,
+				"chain_path", chainStatePath,
+				"backup_path", restoredState.backupPath)
+		}
+		if err := adminProducer.RestoreVerifiedChain(restoreBlocks, verifiedChain); err != nil {
+			fatalRestore("chain restore: producer hydrate from %s (%d blocks): %v",
+				chainStatePath, len(restoreBlocks), err)
+		}
+		hl1RestoredBlocks = restoreBlocks
+		if err := v2Wired.TaskState.RestoreFromChainReplay(restoredState.taskState); err != nil {
+			fatalRestore("chain restore: install replayed task state from %s: %v", chainStatePath, err)
+		}
+		if err := v2Wired.StreamState.RestoreFromChainReplay(restoredState.streamState); err != nil {
+			fatalRestore("chain restore: install replayed CELL stream state from %s: %v", chainStatePath, err)
+		}
+		if err := v2Wired.RecoveryState.RestoreFromChainReplay(restoredState.recoveryState); err != nil {
+			fatalRestore("chain restore: install replayed wallet recovery capsule state from %s: %v", chainStatePath, err)
+		}
+		if err := v2Wired.CELLS20State.RestoreFromChainReplay(restoredState.CELLS20State); err != nil {
+			fatalRestore("chain restore: install replayed CELLS-20 token state from %s: %v", chainStatePath, err)
+		}
+		loadedTaskActions := restoredState.taskActions
+		loadedStreamActions := restoredState.streamActions
+		loadedRecoveryActions := restoredState.recoveryActions
+		loadedCELLS20Actions := restoredState.CELLS20Actions
+		if tip, ok := adminProducer.LatestBlock(); ok {
+			if cfg.ProducerTransition != nil {
+				v2Wired.Aware.SetStateRootHeight(transitionStateRootHeight(cfg.ProducerTransition, tip))
+			}
+			if stateRoot := v2Wired.StateApplier.StateRoot(); stateRoot != tip.StateRoot {
+				fatalRestore("chain restore: reconciled state does not match canonical tip height=%d hash=%s (snapshot_root=%s tip_root=%s). Refusing to produce on an inconsistent ledger.",
+					tip.Height, tip.Hash, stateRoot, tip.StateRoot)
+			}
+		}
+		// Enrollment state is hydrated next so the registry is
+		// populated before the v2 attestation gate ever sees a
+		// /api/v1/mining/submit. Missing file is OK (operator
+		// nuked /opt/CELLS/CELLS_enrollment.json by hand to clear
+		// enrollments without resetting the chain) — the
+		// validator boots with an empty registry and any v2
+		// proof rejects until the operator re-enrolls.
+		if cfg.ProducerTransition == nil {
+			loadedEnrollments, enrollErr = v2Wired.EnrollmentState.Load(enrollmentStatePath)
+		}
+		if enrollErr != nil {
+			fatalRestore("chain restore: enrollment file %s unreadable (%v) — refusing to boot. Either restore the file or remove it (the chain will continue without enrollments and v2 proofs will reject).",
+				enrollmentStatePath, enrollErr)
+		}
+		// Receipts: NDJSON-first. If CELLS_receipts.ndjson
+		// exists we use it. Otherwise, if a legacy
+		// CELLS_receipts.json is present, we one-shot
+		// migrate by Load-ing the legacy JSON into the
+		// in-memory store and re-flushing every receipt as
+		// NDJSON via AppendBlockNDJSON; the legacy file is
+		// then renamed to CELLS_receipts.json.legacy so the
+		// operator has a backup for one boot, after which
+		// the validator will only ever touch the .ndjson
+		// path. A missing receipts file at all is fine —
+		// fresh chain or operator hand-cleared it. A
+		// corrupt receipts file is a hard error so the
+		// operator notices instead of silently losing tx
+		// history.
+		loadedReceipts := 0
+		_, ndjsonStatErr := os.Stat(receiptsNDJSONPath)
+		_, legacyStatErr := os.Stat(receiptsLegacyJSONPath)
+		switch {
+		case ndjsonStatErr == nil:
+			// HL1 S4: a complete but unterminated last receipt parses
+			// cleanly, and the next H5 would glue onto it (R-C3).
+			if err := hl1RequireFinalNewline(hl1OSFS{}, receiptsNDJSONPath); err != nil {
+				fatalRestore("chain restore: receipts NDJSON: %v", err)
+			}
+			n, recErr := adminReceipts.LoadNDJSON(receiptsNDJSONPath)
+			if recErr != nil {
+				fatalRestore("chain restore: receipts NDJSON %s unreadable (%v) — trim the offending trailing line or delete the file to continue without receipt history.",
+					receiptsNDJSONPath, recErr)
+			}
+			loadedReceipts = n
+		case legacyStatErr == nil:
+			n, recErr := adminReceipts.Load(receiptsLegacyJSONPath)
+			if recErr != nil {
+				fatalRestore("chain restore: legacy receipts JSON %s unreadable (%v) — delete the file to continue without receipt history.",
+					receiptsLegacyJSONPath, recErr)
+			}
+			loadedReceipts = n
+			// Re-flush as NDJSON so subsequent boots
+			// take the cheap path. We walk the legacy
+			// store's per-block index and append each
+			// block's slice; this preserves height
+			// ordering on disk, which is the same
+			// order LoadNDJSON observes.
+			migrated := 0
+			for h := uint64(0); h <= adminProducer.TipHeight(); h++ {
+				if got := adminReceipts.GetByBlock(h); len(got) == 0 {
+					continue
+				}
+				w, werr := adminReceipts.AppendBlockNDJSON(receiptsNDJSONPath, h)
+				if werr != nil {
+					fatalRestore("receipts migration: append height=%d failed: %v — leave CELLS_receipts.json in place and re-run", h, werr)
+				}
+				migrated += w
+			}
+			backupPath := receiptsLegacyJSONPath + ".legacy"
+			if err := os.Rename(receiptsLegacyJSONPath, backupPath); err != nil {
+				logger.Warn("receipts migration: rename legacy file failed (NDJSON is now the source of truth, but the JSON file remains)",
+					"src", receiptsLegacyJSONPath, "dst", backupPath, "error_str", err.Error())
+			}
+			logger.Info("Receipts migrated: legacy JSON → NDJSON append-only",
+				"loaded_legacy", n,
+				"written_ndjson", migrated,
+				"legacy_renamed_to", backupPath,
+				"ndjson_path", receiptsNDJSONPath)
+		default:
+			// Neither file present — fresh chain or hand-cleared. No-op.
+		}
+		logger.Info("Chain + accounts + enrollments + receipts restored from disk",
+			"blocks", len(restoreBlocks),
+			"journal_blocks_loaded", len(persistedBlocks),
+			"tip_height", adminProducer.TipHeight(),
+			"accounts_loaded", loadedAccounts,
+			"enrollments_loaded", loadedEnrollments,
+			"task_actions_replayed", loadedTaskActions,
+			"stream_actions_replayed", loadedStreamActions,
+			"recovery_capsules_replayed", loadedRecoveryActions,
+			"CELLS20_actions_replayed", loadedCELLS20Actions,
+			"receipts_loaded", loadedReceipts,
+			"chain_path", chainStatePath,
+			"accounts_path", accountsStatePath,
+			"enrollment_path", enrollmentStatePath,
+			"receipts_path", receiptsNDJSONPath,
+			"genesis_seal_will_skip", true)
+		// HL1 S4r (errata E7): in the producer role, when S5 rule 6 is about
+		// to advance W over the tip N (tip = W+1), complete N's receipts
+		// first. A crash after H3/H4 (C5, C6a) or an I/O error at H5 (F1)
+		// leaves N durable without them. S4r replays N onto the .h<N-1>
+		// generation in scratch state, checks the result against the durable
+		// N state and appends only the missing receipts (fsynced). It never
+		// writes W; every refusal exits 78 with W still at N-1 (R-C6).
+		hl1LiveApplier, _ := v2Wired.StateApplier.(chain.ChainReplayApplier)
+		if _, err := hl1RepairTipReceipts(hl1RepairOptions{
+			ProducerRole:   localBlockProduction,
+			StateDir:       stateDir,
+			AccountsPath:   accountsStatePath,
+			EnrollmentPath: enrollmentStatePath,
+			ReceiptsPath:   receiptsNDJSONPath,
+			Transition:     cfg.ProducerTransition,
+			Authorized:     cfg.AuthorizedBlockProducers,
+			Blocks:         hl1RestoredBlocks,
+			Verified:       verifiedChain,
+			Live:           hl1LiveApplier,
+			Receipts:       adminReceipts,
+			FS:             hl1OSFS{},
+			Log:            logger,
+		}); err != nil {
+			fatalRestore("hl1 S4r: %v", err)
+		}
+	} else {
+		logger.Info("No persisted chain found; genesis seal will run on a fresh chain",
+			"chain_path", chainStatePath)
+	}
+	// Snapshot bootstrap: with [snapshot_bootstrap] enabled, a restored chain
+	// that reaches the trusted checkpoint height must hold the checkpoint
+	// block (off: no-op).
+	if err := snapshotCheckpointGuard(cfg.SnapshotBootstrap, adminProducer.GetBlock); err != nil {
+		fatalRestore("snapshot bootstrap checkpoint: %v", err)
+	}
+
+	var journalTip *chain.Block
+	if tip, ok := adminProducer.LatestBlock(); ok {
+		journalTip = tip
+	}
+	// HL1 S5: the served watermark W. It runs after the whole restore block
+	// (S4, including the receipts load), so any S4 refusal leaves W
+	// untouched, and before OpenChainJournal. Producer role: W must exist
+	// and match the restored chain (rules 1-5), and a tip one block above W
+	// advances W (rule 6). Follower role: W is ignored. Either way the durable
+	// tip starts at the restored tip.
+	hl1S5, hl1S5Err := hl1StartupWatermark(hl1OSFS{}, stateDir, localBlockProduction, journalTip, adminProducer.GetBlock, time.Now())
+	if hl1S5Err != nil {
+		fatalRestore("hl1 S5: %v", hl1S5Err)
+	}
+	if hl1S5.DurableTipSet {
+		hl1Durable.Store(hl1S5.DurableTip)
+	}
+	if localBlockProduction {
+		hl1Metrics.served.Store(hl1S5.Watermark.Height)
+		logger.Info("hl1: served watermark verified",
+			"watermark_height", hl1S5.Watermark.Height,
+			"watermark_source", hl1S5.Watermark.Source,
+			"advanced_at_boot", hl1S5.Wrote,
+			"durable_tip", hl1S5.DurableTip)
+	} else {
+		logger.Info("hl1: follower role: watermark not used", "durable_tip_set", hl1S5.DurableTipSet, "durable_tip", hl1S5.DurableTip)
+	}
+	chainJournal := hl1OpenChainJournal(chainStatePath, journalTip)
+	defer func() {
+		if err := chainJournal.Close(); err != nil {
+			logger.Warn("chain persistence: journal close failed", "path", chainStatePath, "error_str", err.Error())
+		}
+	}()
+	// Under a producer transition, every block appended from here on (the
+	// genesis seal, the block driver, gossip, catch-up, BFT commits, the
+	// HTTPS sync) keeps its signature only in the journal once the next block
+	// is durable there (H2), as the start keeps the restored blocks'
+	// signatures: the heap no longer grows by a signature per block. Before
+	// the hook, so before anything can append. Refused, appended blocks keep
+	// their signatures in memory, as before.
+	if cfg.ProducerTransition != nil {
+		if err := adminProducer.KeepSignaturesInJournal(chainJournal); err != nil {
+			logger.Warn("chain persistence: appended blocks keep their signatures in memory",
+				"path", chainStatePath, "error_str", err.Error())
+		}
+	}
+	persistenceReserve := hl1PersistenceReserve(os.Getenv(persistenceReserveEnv))
+	logger.Info("Chain persistence disk reserve enabled",
+		"state_path", stateDir,
+		"minimum_free_bytes", persistenceReserve)
+	var persistenceMu sync.RWMutex
+	var persistenceErr error
+	markPersistenceFailed := func(err error) {
+		if err == nil {
+			return
+		}
+		persistenceMu.Lock()
+		if persistenceErr == nil {
+			persistenceErr = err
+			healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusUnhealthy, err.Error())
+			logger.Error("chain persistence failed closed; block production is now disabled until restart",
+				"path", chainStatePath,
+				"error_str", err.Error())
+		}
+		persistenceMu.Unlock()
+	}
+	var diskPressureMu sync.Mutex
+	diskPressureActive := false
+	adminProducer.SetSealGuard(func() error {
+		// Crash point C1 (hl_crashpoints builds only): the driver's own txs
+		// are in the pool and ProduceBlock has not drained them yet.
+		hl1Crashpoint("produce:seal-guard")
+		persistenceMu.RLock()
+		failed := persistenceErr
+		persistenceMu.RUnlock()
+		if failed != nil {
+			return failed
+		}
+
+		available, capacityErr := checkPersistenceCapacity(stateDir, persistenceReserve, availableDiskBytes)
+		diskPressureMu.Lock()
+		defer diskPressureMu.Unlock()
+		if capacityErr != nil {
+			if !diskPressureActive {
+				healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusUnhealthy, capacityErr.Error())
+				logger.Error("chain persistence paused before sealing because the disk reserve is unavailable",
+					"state_path", stateDir,
+					"available_bytes", available,
+					"minimum_free_bytes", persistenceReserve,
+					"error_str", capacityErr.Error())
+			}
+			diskPressureActive = true
+			return capacityErr
+		}
+		if diskPressureActive {
+			diskPressureActive = false
+			healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusHealthy, "Persistence disk reserve restored")
+			logger.Info("Chain persistence resumed after disk reserve recovery",
+				"state_path", stateDir,
+				"available_bytes", available,
+				"minimum_free_bytes", persistenceReserve)
+		}
+		return nil
+	})
+
+	// HL1 (b): the persistence hook H0-H10 (design rev 4 §4.4) replaces the
+	// former append/save/receipts hook. H0 is the v2wiring hook (enrollment
+	// sweep and gov promotion), whose mutations must land before the
+	// snapshots. H1-H7 make block N durable in this order: generation links,
+	// journal append + fsync, accounts, enrollment, receipts + fsync,
+	// fsync(stateDir), then the served watermark W (producer role). Any H1-H7
+	// error fail-stops with exit 86. Only then does H8 run the family audit and
+	// the canary ledger, H9 advance the durable tip (nothing above it is
+	// served), and H10 publish POL and broadcast the block.
+	var blockPropagator *chain.BlockPropagator
+	hl1Hook := &hl1PersistHook{
+		Mode:          hl1HookNormal,
+		ProducerRole:  localBlockProduction,
+		StateDir:      stateDir,
+		JournalPath:   chainStatePath,
+		AccountsPath:  accountsStatePath,
+		FS:            hl1OSFS{},
+		Prior:         adminProducer.OnSealedBlock,
+		AppendJournal: chainJournal.Append,
+		SaveAccounts:  adminAccounts.Save,
+		LocalSeal:     &hl1LocalSeal,
+		Canary:        hl1Mining.enabled(),
+		Durable:       hl1Durable,
+		PublishPol: func(blk *chain.Block) {
+			networking.PublishPolAfterBlockSeal(logger, polRelay, polFollower, bftExec, liveBFT, nodeValidatorSet, blk)
+		},
+		Broadcast: func(blk *chain.Block) {
+			if blockPropagator == nil {
+				return
+			}
+			if err := blockPropagator.BroadcastBlock(blk); err != nil {
+				logger.Warn("block propagation: broadcast failed",
+					"height", blk.Height,
+					"hash", blk.Hash,
+					"error_str", err.Error())
+			}
+		},
+		FailStop:         failStop,
+		OnFailStopReturn: markPersistenceFailed,
+		Log:              logger,
+	}
+	// Enrollment state must persist alongside accounts (H4): the v2
+	// attestation gate consults the registry on every mining submit.
+	if v2Wired.EnrollmentState != nil {
+		hl1Hook.EnrollmentPath = enrollmentStatePath
+		hl1Hook.SaveEnrollment = v2Wired.EnrollmentState.Save
+	}
+	// Receipts: NDJSON append-only (H5), O(receipts in this block).
+	if adminReceipts != nil {
+		hl1Hook.ReceiptsPath = receiptsNDJSONPath
+		hl1Hook.AppendReceipts = adminReceipts.AppendBlockNDJSON
+	}
+	if hl1Mining.enabled() {
+		hl1Hook.Ledger = hl1Mining.ledger
+		hl1Hook.Guard = hl1Mining.guard
+	}
+	adminProducer.OnSealedBlock = hl1Hook.OnSealedBlock
+	monitoring.GlobalScrapePrometheusExporter().RegisterCollector("hl1", hl1MetricsCollector(hl1Durable))
+	monitoring.GlobalScrapePrometheusExporter().RegisterCollector("poe", poeMetricsCollector(adminProducer))
+	monitoring.GlobalScrapePrometheusExporter().RegisterCollector("pq_only", pqOnlyMetricsCollector())
+
+	// HL1 (d): in the producer role a gossiped block is never appended
+	// (errHL1ExternalAppendDisabled). HL1 (c): catch-up responses never carry
+	// a block above the durable tip.
+	if bp, bpErr := chain.NewBlockPropagator(net, net.Host.ID().String(),
+		hl1ExternalAppend(localBlockProduction, adminProducer.TryAppendExternalBlock)); bpErr != nil {
+		logger.Warn("Block propagation failed to start", "error_str", bpErr.Error())
+	} else {
+		blockPropagator = bp
+		blockPropagator.SetBlockProvider(hl1BlockProvider(adminProducer, hl1Durable))
+		defer blockPropagator.Close()
+		logger.Info("Block propagation started",
+			"topic", chain.BlockTopicName,
+			"catchup_window_blocks", 64)
+
+		go func() {
+			requestNextWindow := func() {
+				if blockPropagator == nil || net == nil || net.PeerCount() == 0 {
+					return
+				}
+				from := uint64(0)
+				if adminProducer.HasTip() {
+					from = adminProducer.TipHeight() + 1
+				}
+				to := from + 63
+				if to < from {
+					to = ^uint64(0)
+				}
+				if err := blockPropagator.RequestBlocks(from, to, 64); err != nil {
+					logger.Warn("block propagation: catch-up request failed",
+						"from", from,
+						"to", to,
+						"error_str", err.Error())
+				}
+			}
+
+			requestNextWindow()
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					requestNextWindow()
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	syncURLs := chainSyncURLsFromEnv()
+	if hl1ShouldStartChainSync(localBlockProduction, syncURLs) {
+		startHTTPChainSync(ctx, logger, adminProducer, adminAccounts, syncURLs)
+	}
+
+	// Single-validator genesis seal. /api/v1/mining/work
+	// requires the producer to have at least one sealed
+	// block — without it, every miner request returns 503
+	// "mining: work unavailable" because chainAdapter has no
+	// HeaderHashAt(0) to anchor the proof. On a fresh BLR1-
+	// only network there are no peer validators to drive
+	// BFT-committed external blocks via TryAppendExternalBlock,
+	// so we must seal genesis ourselves. The producer's POL
+	// and BFT gates short-circuit when len(bp.chain) == 0
+	// (see pkg/chain/block.go:229-241), making this the only
+	// height at which a solo validator can advance the tip
+	// without violating consensus invariants.
+	//
+	// The preSealBFTRound hook installed above (line ~855)
+	// trips a type guard that requires the applier to be a
+	// *AccountStore — our live applier is the
+	// EnrollmentAwareApplier wrapper, so we must temporarily
+	// clear preSealBFTRound, seal, then restore. The
+	// synthetic BFT round is unnecessary at genesis (the BFT
+	// and POL gates aren't active yet anyway) so skipping it
+	// is safe.
+	if productionRole == blockProductionRoleNetworkProducer && !adminProducer.HasTip() {
+		log.Fatal("network producer requires an existing synchronized chain tip; start this node as a follower, let it catch up, then enable CELLS_NETWORK_BLOCK_PRODUCER")
+	}
+	if !adminProducer.HasTip() && shouldDeferLocalGenesis(networkedCatchupMode, cfg.BootstrapPeers, syncURLs) {
+		logger.Info("Networked catch-up mode: deferring local genesis seal; waiting for blocks from bootstrap peers",
+			"env_var", "CELLS_NETWORKED_CATCHUP_MODE",
+			"bootstrap_peers", len(cfg.BootstrapPeers),
+			"http_sync_sources", len(syncURLs),
+			"block_topic", chain.BlockTopicName)
+	} else if !adminProducer.HasTip() {
+		// In solo mode, fund and use the blockdriver's
+		// canonical funder address so the genesis tx and the
+		// driver's subsequent reward txs share a single nonce
+		// stream. Outside solo mode (peer cluster), genesis
+		// would arrive via TryAppendExternalBlock from a
+		// peer's BFT-committed proposal, so this whole branch
+		// is dead code; we still run it for resilience —
+		// worst case the chain gets a 1-CELL transfer at
+		// height 0 that any peer's chain would replay safely.
+		genesisFunder := blockdriver.FunderAddress
+
+		// Genesis prefund: when CELLS_GENESIS_PREFUND_ADDR is
+		// set (canonical for v2 testnet activation per spec
+		// §10.3 — the fresh chain commits at least one
+		// pre-funded operator wallet so an HMAC enrollment
+		// can land before any block reward has emitted), the
+		// genesis tx becomes a transfer of
+		// CELLS_GENESIS_PREFUND_AMOUNT_CELL from the funder to
+		// that address. The default branch (env unset) keeps
+		// the legacy 1-CELL transfer to CELLS-genesis-anchor —
+		// useful for the no-prefund testnet where operators
+		// arrive after some block rewards have minted CELL
+		// the natural way.
+		genesisDest := "CELLS-genesis-anchor"
+		genesisAmount := 1.0
+		genesisPrefundAddr := strings.TrimSpace(os.Getenv("CELLS_GENESIS_PREFUND_ADDR"))
+		if genesisPrefundAddr != "" {
+			rawAmount := strings.TrimSpace(os.Getenv("CELLS_GENESIS_PREFUND_AMOUNT_CELL"))
+			parsedAmount, parseErr := strconv.ParseFloat(rawAmount, 64)
+			switch {
+			case parseErr != nil || parsedAmount <= 0:
+				logger.Warn("CELLS_GENESIS_PREFUND_ADDR set but AMOUNT_CELL missing/invalid; ignoring prefund",
+					"addr", genesisPrefundAddr,
+					"raw_amount", rawAmount,
+					"parse_error_str", func() string {
+						if parseErr != nil {
+							return parseErr.Error()
+						}
+						return ""
+					}())
+			default:
+				genesisDest = genesisPrefundAddr
+				genesisAmount = parsedAmount
+				logger.Info("Genesis prefund configured",
+					"addr", genesisDest,
+					"amount_cell", genesisAmount,
+					"env_addr", "CELLS_GENESIS_PREFUND_ADDR",
+					"env_amount", "CELLS_GENESIS_PREFUND_AMOUNT_CELL")
+			}
+		}
+
+		// Save & clear preSealBFTRound only when it's set
+		// (non-solo). The solo-mode skip earlier means it is
+		// already nil and Restore would be a no-op; we still
+		// re-set it on the off chance the caller flips solo
+		// mode mid-boot via another goroutine.
+		var preSealRestore func(blk *chain.Block) error
+		if !localBlockProduction {
+			preSealRestore = func(blk *chain.Block) error {
+				return chain.RunSyntheticBFTRoundWithExecutor(bftExec, nodeValidatorSet, blk)
+			}
+			adminProducer.SetPreSealBFTRound(nil)
+		}
+		// Seed the funder. In solo mode the blockdriver was
+		// already constructed and credited the funder from
+		// blockdriver.DefaultFunderBalance — Credit here adds
+		// 1 more CELL on top, harmless. Outside solo mode
+		// this is a fresh credit. When prefund is configured
+		// we top up to genesisAmount + 1 to guarantee the
+		// transfer (and any nonce-1 follow-on) succeeds even
+		// if the blockdriver auto-credit didn't run for some
+		// reason.
+		adminAccounts.Credit(genesisFunder, genesisAmount+1.0)
+		seedTx := &mempool.Tx{
+			ID:        fmt.Sprintf("genesis-seed-%d", time.Now().UnixNano()),
+			Sender:    genesisFunder,
+			Recipient: genesisDest,
+			Amount:    genesisAmount,
+			Fee:       0,
+			Nonce:     0,
+			AddedAt:   time.Now(),
+		}
+		if err := adminPool.Add(seedTx); err != nil {
+			logger.Warn("Genesis seal: mempool admission failed; chain will stay at tip=0 and /api/v1/mining/work will return 503 until a peer-driven external block lands",
+				"error_str", err.Error())
+		} else {
+			blk, prodErr := adminProducer.ProduceBlock()
+			if prodErr != nil {
+				logger.Warn("Genesis seal: ProduceBlock failed; chain stays at tip=0",
+					"error_str", prodErr.Error(),
+					"validator_set_active", len(nodeValidatorSet.ActiveValidators()),
+					"mempool_size", adminPool.Size())
+			} else if blk != nil {
+				logger.Info("Genesis block sealed by solo validator; chain tip advanced",
+					"height", blk.Height,
+					"hash", blk.Hash,
+					"tx_count", len(blk.Transactions),
+					"prefund_addr", genesisDest,
+					"prefund_amount_cell", genesisAmount)
+			} else {
+				logger.Warn("Genesis seal: ProduceBlock returned nil with no error")
+			}
+		}
+		if preSealRestore != nil {
+			adminProducer.SetPreSealBFTRound(preSealRestore)
+		}
+	}
+
+	// HL1 S7-S14 (design rev 4 §5): canary reconciliation, before
+	// SyncFunderNonce and the driver start. Every anomaly or failure trips
+	// FREEZE and never exits; admission then never opens in this process.
+	hl1Reconciled := hl1ReconcileCanary(hl1Mining, hl1Boot, hl1RestoredBlocks, adminAccounts)
+	// HL2 WP-C "S14b": a version 2 config indexes the owners' operator keys
+	// from the restored chain and operator_keys before admission can open.
+	hl2HydrateOperatorKeys(hl1Mining, hl1RestoredBlocks, hl1Reconciled.StoreOpen)
+	// HL2 WP-H: the v2 guard, owner-epoch and operator-key metrics. A v1
+	// config registers nothing, so an HL1 boot exports the HL1 set only.
+	if hl2IsV2(hl1Mining) {
+		monitoring.GlobalScrapePrometheusExporter().RegisterCollector("hl2", hl2MetricsCollector(hl1Mining))
+	}
+	go hl1LegacyMiningHealthLoop(ctx, healthChecker, hl1Mining)
+	// HL1 (a): the mining service. It is writable only in canary mode with
+	// local block production, an open Store and a loaded Guard. Otherwise it
+	// is read-only, so /work and /submit return 503 (this closes the loopback
+	// GET /work hole). Its chain view is clamped to the durable tip, and the
+	// RewardSink path is gone.
+	miningSvcCfg := hl1MiningServiceConfig(miningsvc.Config{
+		WorkSet:        bringUpWorkSet(),
+		DAGSize:        1024,
+		Difficulty:     new(big.Int).Set(mining.DefaultMinDifficulty),
+		BlocksPerEpoch: mining.DefaultBlocksPerMiningEpoch,
+		Attestation:    v2Dispatcher,
+	}, &durableChainView{tip: hl1Durable, producer: adminProducer}, hl1Mining, hl1Reconciled.StoreOpen)
+	miningSvc, miningErr := miningsvc.New(miningSvcCfg)
+	if miningErr != nil {
+		// Mining wiring failure is operator-actionable; refuse
+		// to boot in a half-wired state where /work and /submit
+		// would return 503 silently.
+		log.Fatalf("mining service wiring failed: %v", miningErr)
+	}
+	api.SetMiningService(miningSvc)
+	if !miningSvcCfg.ReadOnly {
+		// §4.1 step 2: the recovery middleware admits the canonical POST
+		// /api/v1/mining/submit only while the guard reports admission open.
+		api.SetMiningCanaryAdmission(hl1Mining.guard.AdmissionOpen)
+	}
+	logger.Info("Mining service installed",
+		"dag_size", uint32(1024),
+		"difficulty", miningSvcCfg.Difficulty.String(),
+		"difficulty_bits", miningSvcCfg.Difficulty.BitLen()-1,
+		"blocks_per_epoch", mining.DefaultBlocksPerMiningEpoch,
+		"read_only", miningSvcCfg.ReadOnly,
+		"legacy_mining", hl1Mining.status(),
+		"block_production_role", productionRole,
+		"endpoints", "/api/v1/mining/work, /api/v1/mining/submit")
+
+	// Start the configured block driver after genesis has
+	// settled. If the genesis seal failed (e.g. mempool
+	// admission rejected the seed for an unexpected reason),
+	// the driver will still try every Period — its own
+	// heartbeat tx funds the chain forward.
+	if blockDriver != nil {
+		// Re-sync the driver's funder nonce. The genesis seal
+		// above used the same funder account at nonce=0, so
+		// the AccountStore now has funder.Nonce=1 but the
+		// driver's in-memory counter is still 0. Without this
+		// call the very first tick would issue a reward tx at
+		// nonce=0 → ApplyTx rejects → "all transactions failed
+		// state application" → tip never advances past 0.
+		blockDriver.SyncFunderNonce()
+		// Use a fresh background context so the driver
+		// outlives any request-scoped contexts. Stop is
+		// triggered by the existing graceful-shutdown handler
+		// (SIGINT/SIGTERM); see the deferred blockDriver.Stop()
+		// registered just below.
+		blockDriver.Start(context.Background())
+		// HL1 S16: admission can open only after the driver has started,
+		// the quiet period has passed and reconciliation was clean.
+		if hl1Mining.enabled() {
+			hl1Mining.guard.Activate(hl1Reconciled.Clean)
+		}
+		// Best-effort hook into the existing shutdown path —
+		// the validator's main shutdown closure runs on Ctrl-C
+		// and SIGTERM and should drain in-flight ticks before
+		// closing the network.
+		defer blockDriver.Stop()
+	}
+
+	// HL1 (d): in the producer role a BFT commit never appends an external
+	// block; the append returns errHL1ExternalAppendDisabled.
+	bftCommitAppend := hl1ExternalAppend(localBlockProduction, adminProducer.TryAppendExternalBlock)
+	bftExec.SetOnCommitted(func(height uint64, round uint32, blockHash string) {
+		defer bftExec.ClearLastInboundBFTGossipPeer()
+		logger.Info("BFT committed height", "height", height, "round", round, "block_hash", blockHash)
+		if blk, ok := bftExec.PendingBlock(height, blockHash); ok {
+			err := bftCommitAppend(blk)
+			bftExec.NoteFollowerAppend(err)
+			if err != nil {
+				var ace *chain.ExternalAppendConflictError
+				if errors.As(err, &ace) {
+					relayPeer, _ := bftExec.PendingProposeSource(height, blockHash)
+					if relayPeer == "" {
+						relayPeer = bftExec.LastInboundBFTGossipPeer()
+					}
+					details := fmt.Sprintf(
+						"TryAppendExternalBlock conflict after BFT commit height=%d round=%d vote_value=%q",
+						ace.Height, round, blockHash,
+					)
+					if relayPeer != "" {
+						details += fmt.Sprintf(" pending_propose_relay_peer=%q", relayPeer)
+					}
+					nodeEvidenceManager.SubmitEvidenceBestEffort(chain.ConsensusEvidence{
+						Type:        chain.EvidenceForkWitness,
+						Height:      ace.Height,
+						Round:       round,
+						BlockHashes: []string{ace.ExistingHash, ace.NewHash},
+						Details:     details,
+						Timestamp:   time.Now(),
+					})
+					if relayPeer != "" {
+						nodeTxRep.RecordEvent(relayPeer, networking.EventInvalidBlock, 0)
+					}
+					bftExec.ClearPendingProposeSource(height, blockHash)
+				}
+				logger.Debug("BFT follower append skipped", "height", height, "error", err)
+			} else {
+				bftExec.PrunePendingHeight(height)
+			}
+		}
+		if height > 128 {
+			bftExec.PrunePendingBelow(height - 64)
+		}
+	})
+	if prefunded, prefundErr := applyPrefundAccounts(adminAccounts, os.Getenv(CELLSPrefundAccountsEnv)); prefundErr != nil {
+		log.Fatalf("%s: %v", CELLSPrefundAccountsEnv, prefundErr)
+	} else {
+		for _, entry := range prefunded {
+			logger.Info("Account prefunded from environment",
+				"env", CELLSPrefundAccountsEnv,
+				"address", entry.Address,
+				"amount", entry.Amount)
+		}
+	}
+	chain.SyncValidatorStakesFromCommittedTip(nodeValidatorSet, adminAccounts, adminProducer, stakingLedger)
+
+	txGossipIng := networking.NewTxGossipIngress(
+		chain.NewGossipValidator(chain.NewSigVerifier(), chain.NewTxValidator(adminAccounts), chain.DefaultGossipValidationConfig()),
+		adminPool,
+		nodeTxRep,
+	)
+	txGossipRelay := networking.NewTxGossipRelay(net.Broadcast, networking.DefaultTxGossipRelayConfig())
+	txGossipIng.SetTxGossipRelay(txGossipRelay)
+	// HL1 (d2): the ingress is installed by wireTxGossip below (follower
+	// role only).
+	monitoring.SetScrapeProcessIdentity(net.Host.ID().String())
+	auditSecret := cfg.JWTHMACSecret
+	if auditSecret == "" {
+		auditSecret = "CELLS-admin-audit-default"
+	}
+	var adminHot *config.HotReloader
+	if cfg.ConfigFileUsed != "" {
+		if hr, hrErr := config.NewHotReloader(config.HotReloadConfig{FilePath: cfg.ConfigFileUsed, PollInterval: 30 * time.Second}, cfg); hrErr != nil {
+			logger.Warn("Admin hot reloader not attached", "error", hrErr)
+		} else {
+			adminHot = hr
+		}
+	}
+
+	// Dashboard topology + WS metrics share the same libp2p network and node subsystems as the API admin view.
+	if dash != nil {
+		dash.SetNetwork(net)
+		logger.Info("Network topology monitoring enabled in dashboard")
+		pe := monitoring.GlobalScrapePrometheusExporter()
+		pe.RegisterCollector("node_chain", monitoring.ChainCollector(
+			adminProducer.ChainHeight,
+			func() int { return len(nodeValidatorSet.ActiveValidators()) },
+		))
+		pe.RegisterCollector("node_mempool", monitoring.MempoolCollector(
+			func() int { return adminPool.Size() },
+			func() map[string]interface{} { return adminPool.Stats() },
+		))
+		pe.RegisterCollector("node_bft_gossip", func() []monitoring.Metric {
+			s := bftIngress.Stats()
+			auth := bftExec.AuthStats()
+			return []monitoring.Metric{
+				{Name: "CELLS_bft_gossip_ingress_ok_total", Help: "BFT gossip messages accepted (dedupe passed, apply ok or no executor)", Type: monitoring.MetricCounter, Value: float64(s.IngressOK)},
+				{Name: "CELLS_bft_gossip_dedupe_drops_total", Help: "BFT gossip duplicate payloads dropped", Type: monitoring.MetricCounter, Value: float64(s.DedupeDropped)},
+				{Name: "CELLS_bft_gossip_rate_limited_total", Help: "BFT gossip messages rejected by per-peer rate limit", Type: monitoring.MetricCounter, Value: float64(s.RateLimited)},
+				{Name: "CELLS_bft_gossip_rejected_wire_total", Help: "BFT gossip wire rejects (decode / empty / unknown kind)", Type: monitoring.MetricCounter, Value: float64(s.RejectedWire)},
+				{Name: "CELLS_bft_gossip_apply_errors_total", Help: "BFT gossip executor apply errors after validation", Type: monitoring.MetricCounter, Value: float64(s.ApplyErrors)},
+				{Name: "CELLS_bft_auth_signed_accepted_total", Help: "BFT consensus messages whose ML-DSA authenticator verified", Type: monitoring.MetricCounter, Value: float64(auth.SignedAccepted)},
+				{Name: "CELLS_bft_auth_unsigned_accepted_total", Help: "Unsigned BFT consensus messages accepted while compatibility mode is still open", Type: monitoring.MetricCounter, Value: float64(auth.UnsignedAccepted)},
+				{Name: "CELLS_bft_auth_unsigned_rejected_total", Help: "Unsigned BFT consensus messages rejected after signed-vote enforcement", Type: monitoring.MetricCounter, Value: float64(auth.UnsignedRejected)},
+				{Name: "CELLS_bft_auth_bad_signature_rejected_total", Help: "Signed BFT consensus messages rejected because the authenticator was invalid", Type: monitoring.MetricCounter, Value: float64(auth.BadSignatureRejected)},
+			}
+		})
+		pe.RegisterCollector("node_bft_follower", func() []monitoring.Metric {
+			ok, sk, cx := bftExec.FollowerAppendStats()
+			return []monitoring.Metric{
+				{Name: "CELLS_bft_follower_append_ok_total", Help: "Successful TryAppendExternalBlock calls after BFT commit", Type: monitoring.MetricCounter, Value: float64(ok)},
+				{Name: "CELLS_bft_follower_append_skip_total", Help: "Failed TryAppendExternalBlock calls excluding hash conflicts", Type: monitoring.MetricCounter, Value: float64(sk)},
+				{Name: "CELLS_bft_follower_append_conflict_total", Help: "TryAppendExternalBlock hash conflicts at same height", Type: monitoring.MetricCounter, Value: float64(cx)},
+			}
+		})
+		// Quarantine transparency surface. Mirrors the trust_aggregator
+		// collector's contract: nil-safe, O(1) per scrape, closes over
+		// live state so /metrics always reflects the latest Stats()
+		// without a parallel update path. Paired with the
+		// CELLS-quarantine alert group in
+		// deploy/prometheus/alerts_CELLS.example.yml.
+		pe.RegisterCollector("quarantine_manager", quarantine.MetricsCollector(quarantineManager))
+		dash.SetRealtimeMetricsSource(dashboard.MetricsSource{
+			Prometheus: pe,
+			Accounts:   adminAccounts,
+			Validators: nodeValidatorSet,
+			Finality:   adminFinality,
+			Mempool:    adminPool,
+			Receipts:   adminReceipts,
+			Peers:      nodeTxRep,
+			Producer:   adminProducer,
+		})
+		go func() {
+			logger.Info("Starting dashboard server", "port", cfg.DashboardPort)
+			if err := dash.Start(); err != nil {
+				logger.Error("Dashboard server failed", "error", err)
+				log.Printf("CRITICAL: Dashboard server error: %v", err)
+				log.Printf("Dashboard will not be available. Check if port %d is in use.", cfg.DashboardPort)
+			}
+		}()
+		time.Sleep(2 * time.Second)
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, derr := client.Get(fmt.Sprintf("http://localhost:%d/api/health", cfg.DashboardPort))
+		if derr == nil {
+			resp.Body.Close()
+			logger.Info("Monitoring dashboard verified and running", "url", fmt.Sprintf("http://localhost:%d", cfg.DashboardPort))
+			healthChecker.UpdateComponentHealth("dashboard", monitoring.HealthStatusHealthy, "Dashboard running")
+		} else {
+			logger.Warn("Dashboard may not be running",
+				"url", fmt.Sprintf("http://localhost:%d", cfg.DashboardPort),
+				"error", derr,
+				"hint", "Check if port is available or if another service is using it")
+			healthChecker.UpdateComponentHealth("dashboard", monitoring.HealthStatusUnhealthy, "Dashboard not responding: "+derr.Error())
+			log.Printf("WARNING: Dashboard verification failed. Error: %v", derr)
+			log.Printf("You can still try accessing http://localhost:%d manually", cfg.DashboardPort)
+		}
+	}
+
+	// -------------------------------------------------------------------
+	// Trust / attestation transparency wiring (Major Update §8.5).
+	//
+	// The trust surface is a *transparency signal*, not a consensus rule
+	// (see docs/docs/NVIDIA_LOCK_CONSENSUS_SCOPE.md). The node therefore:
+	//
+	//   1. Opts in by default (TrustEndpointsDisabled defaults to false).
+	//   2. Publishes the size of its known active-validator set as the
+	//      "total public" denominator.
+	//   3. Publishes its own NGC proof (from the monitoring ring buffer)
+	//      as the sole numerator, because this build does not yet gossip
+	//      cross-peer NGC attestations. That yields an honest 0/N or 1/N
+	//      ratio — exactly the anti-over-claim posture the widget wants.
+	//   4. Refreshes the cached summary every cfg.TrustRefreshInterval
+	//      (default 10 s), so HTTP reads are O(1) memory reads.
+	//
+	// If TrustEndpointsDisabled is true, the singleton is intentionally
+	// left nil *and* the disabled flag is set, so the handlers return
+	// HTTP 404 per §8.5.3 ("a node that does not serve the trust surface
+	// must not answer the endpoint").
+	// -------------------------------------------------------------------
+	if cfg.TrustEndpointsDisabled {
+		api.SetTrustAggregator(nil, true)
+		logger.Info("Trust transparency endpoints disabled by config",
+			"knob", "[trust] disabled=true / CELLS_TRUST_DISABLED=1",
+			"surface", "/api/v1/trust/attestations/* will return 404")
+	} else {
+		localNodeID := net.Host.ID().String()
+		trustPeerProvider := api.NewValidatorSetPeerProvider(
+			api.ValidatorEnumeratorFunc(func() []string {
+				vs := nodeValidatorSet.ActiveValidators()
+				out := make([]string, 0, len(vs))
+				for _, v := range vs {
+					out = append(out, v.Address)
+				}
+				return out
+			}),
+		)
+		trustLocalSource := &api.MonitoringLocalSource{
+			NodeID:     localNodeID,
+			RegionHint: cfg.TrustRegionHint,
+		}
+		trustAgg := api.NewTrustAggregator(api.TrustConfig{
+			PeerProvider: trustPeerProvider,
+			LocalSource:  trustLocalSource,
+			FreshWithin:  cfg.TrustFreshWithin,
+		})
+		// Seed the cache synchronously so the first HTTP scrape after
+		// boot does not see an empty summary. The aggregator's warm-up
+		// window is separate and still governs the 200 / 503 split.
+		trustAgg.Refresh()
+		api.SetTrustAggregator(trustAgg, false)
+		// Expose the aggregator's cached numbers on /metrics so
+		// Alertmanager can page on attested-count drops without
+		// having to poll the JSON endpoint. Registered
+		// unconditionally whenever the trust surface is enabled —
+		// the collector is nil-safe and O(1), so there is no reason
+		// to gate it behind the dashboard UI.
+		monitoring.GlobalScrapePrometheusExporter().RegisterCollector(
+			"trust_aggregator",
+			api.TrustMetricsCollector(trustAgg),
+		)
+		logger.Info("Trust transparency endpoints wired",
+			"node_id", localNodeID,
+			"region_hint", cfg.TrustRegionHint,
+			"fresh_within", cfg.TrustFreshWithin.String(),
+			"refresh_interval", cfg.TrustRefreshInterval.String())
+		go func() {
+			t := time.NewTicker(cfg.TrustRefreshInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					trustAgg.Refresh()
+				}
+			}
+		}()
+	}
+
+	// Start secure HTTP API server (optional, requires CGO for quantum-safe crypto)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				stack := debug.Stack()
+				logger.Error("Panic during API server initialization",
+					"error_str", fmt.Sprintf("%v", r),
+					"stack", string(stack))
+				log.Printf("API server initialization panic: %v (this is normal if CGO/liboqs is not available)\nstack:\n%s", r, stack)
+			}
+		}()
+
+		apiServer, err := api.NewServer(cfg, logger, walletService, storageBackend, dynamicManager, sharedAuth)
+		if err != nil {
+			logger.Warn("API server not available",
+				"error", err,
+				"reason", "CGO and liboqs required for quantum-safe authentication",
+				"note", "Node will continue without API server")
+			log.Printf("API server will not be available: %v", err)
+			log.Printf("To enable API server: build with CGO_ENABLED=1 and install liboqs")
+		} else {
+			apiServer.SetContractEngine(contractEngine)
+			if bridgeProto != nil {
+				apiServer.SetBridgeProtocol(bridgeProto)
+			}
+			if atomicSwap != nil {
+				apiServer.SetAtomicSwapProtocol(atomicSwap)
+			}
+			if bridgeRelay != nil {
+				apiServer.SetBridgeRelay(bridgeRelay, net.Host.ID().String())
+			}
+			// Wire the live chain tip into /api/v1/status so the
+			// status endpoint reflects what the producer
+			// actually has. Without this hook the response
+			// hardcodes chain_tip=0, which made the
+			// blockdriver advance look invisible.
+			apiServer.SetChainTipSource(func() uint64 {
+				if adminProducer == nil {
+					return 0
+				}
+				return adminProducer.TipHeight()
+			})
+			apiServer.SetPeerCountSource(func() int {
+				if net == nil || net.Host == nil {
+					return 0
+				}
+				return len(net.Host.Network().Peers())
+			})
+			apiServer.SetTxGossipBroadcast(func(b []byte) error {
+				if txGossipRelay != nil {
+					return txGossipRelay.MaybePublishOpaque(b)
+				}
+				return net.Broadcast(b)
+			})
+			apiServer.SetTokenRegistryPath(tokenRegistryPath)
+			apiServer.SetAdminAPI(&api.AdminAPI{
+				Accounts:    adminAccounts,
+				Validators:  nodeValidatorSet,
+				Finality:    adminFinality,
+				Mempool:     adminPool,
+				Receipts:    adminReceipts,
+				Peers:       nodeTxRep,
+				Tracer:      contractEngine.Tracer(),
+				Producer:    adminProducer,
+				BFTExecutor: bftExec,
+				PolFollower: polFollower,
+				Audit:       api.NewAdminAuditTrail(auditSecret),
+				HotReloader: adminHot,
+			})
+			logger.Info("Starting secure HTTP API server", "port", cfg.APIPort)
+			if err := apiServer.Start(); err != nil {
+				logger.Error("API server failed", "error", err)
+				log.Printf("API server error: %v", err)
+			}
+		}
+	}()
+
+	var nvidiaP2PGate *monitoring.NvidiaLockP2PGate
+	if cfg.NvidiaLockEnabled && cfg.NvidiaLockGateP2P {
+		maxAge := cfg.NvidiaLockMaxProofAge
+		if maxAge <= 0 {
+			maxAge = 15 * time.Minute
+		}
+		nvidiaP2PGate = &monitoring.NvidiaLockP2PGate{
+			Enabled:         true,
+			MaxProofAge:     maxAge,
+			ExpectedNodeID:  cfg.NvidiaLockExpectedNodeID,
+			ProofHMACSecret: cfg.NvidiaLockProofHMACSecret,
+		}
+		logger.Info("NVIDIA-lock P2P gate enabled: libp2p transactions require a qualifying ingested NGC proof (non-consuming check)")
+	}
+
+	// Inbound pubsub: dispatch JSON wallet txs vs mesh3d wire (`CELLS_mesh3d_v1`) without double-processing the same payload.
+	// HL1 (d2): wireTxGossip installs this handler and the tx gossip ingress
+	// in the follower role only; the producer role drops the tx topic.
+	legacyTxTopicHandler := func(msg []byte) {
+		metrics.IncrementNetworkMessagesRecv()
+		metrics.IncrementTransactionsProcessed()
+		transaction.DispatchInboundP2P(transaction.DispatchDeps{
+			Logger:            logger,
+			Msg:               msg,
+			DynamicManager:    dynamicManager,
+			WasmSdk:           walletSdk,
+			Consensus:         consensus,
+			Storage:           transaction.AdaptStorage(storageBackend),
+			NvidiaGate:        nvidiaP2PGate,
+			Mesh3dValidator:   mesh3dValidator,
+			QuarantineManager: quarantineManager,
+			ReputationManager: reputationManager,
+			ParentCheck:       adminProducer.CheckWalletTransferParents,
+		})
+	}
+	wireTxGossip(net, localBlockProduction, txGossipIng, legacyTxTopicHandler)
+
+	// Optional demo transaction generation. This is useful for local demos, but
+	// production and home validators should leave it disabled so the node does
+	// not spend its own wallet balance on synthetic transfers.
+	if walletService != nil && cfg.DemoTransactionsEnabled {
+		go func() {
+			// Wait a bit for network to stabilize
+			time.Sleep(5 * time.Second)
+
+			txCounter := 0
+			seq := 0
+			for {
+				seq++
+				// Parent cells: the two most recently committed transactions
+				// of this node's canonical chain, the same source GET
+				// /api/v1/chain/parents serves, so the parents satisfy the
+				// Proof-of-Entanglement rules on every peer.
+				var parentCells []string
+				for _, ref := range adminProducer.PoEParentCandidates(adminProducer.TipHeight(), 2) {
+					parentCells = append(parentCells, ref.ID)
+				}
+
+				// Before two transactions are committed there is nothing to
+				// reference; fall back to deterministic synthetic IDs, which
+				// peers accept only below the PoE activation height.
+				if len(parentCells) < 2 {
+					a, b := wallet.StableParentCellIDs(seq, walletService.GetAddress())
+					parentCells = []string{a, b}
+				}
+
+				// Create a real transaction
+				// For demo: send to a test recipient (in production, this would come from user input)
+				recipient := "test_recipient_address"
+				amount := 10
+				fee := 0.1
+				geotag := "US"
+
+				txBytes, err := walletService.CreateTransaction(recipient, amount, fee, geotag, parentCells)
+				if err != nil {
+					logger.Error("Failed to create transaction", "error", err)
+					time.Sleep(30 * time.Second)
+					continue
+				}
+
+				// Broadcast via gossip relay (dedupe + rate limit) then libp2p publish
+				err = txGossipRelay.MaybePublishOpaque(txBytes)
+				if err != nil {
+					logger.Error("Failed to broadcast transaction", "error", err)
+					metrics.RecordError("Broadcast failed: " + err.Error())
+				} else {
+					txCounter++
+					metrics.IncrementNetworkMessagesSent()
+					logger.Info("Transaction created and broadcasted",
+						"tx_number", txCounter,
+						"sender", walletService.GetAddress(),
+						"recipient", recipient,
+						"amount", amount,
+						"balance", walletService.GetBalance())
+
+					if envPublishMeshCompanion() && len(parentCells) >= 2 {
+						sm := "default-submesh"
+						if ds, e1 := dynamicManager.MatchP2POrReject(fee, geotag, txBytes); e1 == nil && ds != nil {
+							sm = ds.Name
+						} else if ds, e2 := dynamicManager.RouteTransaction(fee, geotag); e2 == nil && ds != nil {
+							sm = ds.Name
+						}
+						wire, werr := mesh3d.BuildMeshCompanionFromWalletJSON(txBytes, parentCells[:2], sm)
+						if werr != nil {
+							logger.Warn("mesh companion build failed", "error", werr)
+						} else if cerr := txGossipRelay.MaybePublishOpaque(wire); cerr != nil {
+							logger.Warn("mesh companion gossip failed", "error", cerr)
+						} else {
+							monitoring.RecordMeshCompanionPublish()
+							metrics.IncrementNetworkMessagesSent()
+						}
+					}
+				}
+
+				// Generate transactions at configured interval
+				time.Sleep(cfg.TransactionInterval)
+			}
+		}()
+	} else if walletService != nil {
+		logger.Info("Demo transaction generator disabled",
+			"config", "performance.demo_transactions",
+			"env", "CELLS_DEMO_TRANSACTIONS")
+	} else {
+		logger.Info("Wallet service not available - node operating in receive-only mode")
+	}
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	shutdownDone := make(chan struct{})
+
+	// Graceful shutdown
+	go func() {
+		<-sigs
+		logger.Info("Shutdown signal received, initiating graceful shutdown...")
+
+		// Stop block production before closing storage or returning from main.
+		// Calling os.Exit from this goroutine used to bypass the deferred
+		// blockDriver.Stop and could leave CELLS_chain.ndjson one block ahead of
+		// the accounts/enrollment snapshots during a systemd restart.
+		if blockDriver != nil {
+			blockDriver.Stop()
+			logger.Info("Block driver stopped and in-flight persistence drained", "role", productionRole)
+		}
+		cancel()
+
+		// Update health status
+		healthChecker.UpdateComponentHealth("network", monitoring.HealthStatusDegraded, "Shutting down")
+		healthChecker.UpdateComponentHealth("storage", monitoring.HealthStatusDegraded, "Shutting down")
+
+		// Flush bridge state to disk before closing
+		if bridgeAutoSaver != nil {
+			bridgeAutoSaver.Stop()
+			logger.Info("Bridge state saved to disk")
+		}
+
+		if err := chain.SaveStakingLedger(stakingLedger, stakingPath); err != nil {
+			logger.Warn("Staking ledger flush on shutdown failed", "error", err, "path", stakingPath)
+		} else {
+			logger.Info("Staking ledger saved to disk", "path", stakingPath)
+		}
+
+		if evidenceRelay != nil {
+			evidenceRelay.Close()
+		}
+		if polRelay != nil {
+			polRelay.Close()
+		}
+
+		// Close network
+		if err := net.Close(); err != nil {
+			logger.Error("Error closing libp2p host", "error", err)
+		}
+
+		// Close storage
+		if err := storageBackend.Close(); err != nil {
+			logger.Error("Error closing storage", "error", err)
+		}
+
+		// Log final metrics
+		stats := metrics.GetStats()
+		logger.Info("Final metrics", "stats", stats)
+
+		logger.Info(branding.Name + " node stopped gracefully.")
+		close(shutdownDone)
+	}()
+
+	// Keep main goroutine alive
+	logger.Info(branding.Name + " node running. Press Ctrl+C to shutdown.")
+
+	// Use os.Stdout and flush to ensure output appears immediately
+	fmt.Fprintln(os.Stdout, "="+strings.Repeat("=", 60)+"=")
+	os.Stdout.Sync()
+	fmt.Fprintln(os.Stdout, branding.Name+" node is RUNNING")
+	os.Stdout.Sync()
+	fmt.Fprintln(os.Stdout, "="+strings.Repeat("=", 60)+"=")
+	os.Stdout.Sync()
+	fmt.Fprintf(os.Stdout, "Dashboard:     http://localhost:%d\n", cfg.DashboardPort)
+	os.Stdout.Sync()
+	fmt.Fprintf(os.Stdout, "Log Viewer:    http://localhost:%d\n", cfg.LogViewerPort)
+	os.Stdout.Sync()
+	if cfg.EnableTLS {
+		fmt.Fprintf(os.Stdout, "API Server:    https://localhost:%d (TLS 1.3)\n", cfg.APIPort)
+	} else {
+		fmt.Fprintf(os.Stdout, "API Server:    http://localhost:%d (INSECURE - dev only)\n", cfg.APIPort)
+	}
+	os.Stdout.Sync()
+	fmt.Fprintf(os.Stdout, "Log File:      %s\n", cfg.LogFile)
+	os.Stdout.Sync()
+	fmt.Fprintln(os.Stdout, "="+strings.Repeat("=", 60)+"=")
+	os.Stdout.Sync()
+	fmt.Fprintln(os.Stdout, "Press Ctrl+C to shutdown gracefully")
+	os.Stdout.Sync()
+	fmt.Fprintln(os.Stdout, "="+strings.Repeat("=", 60)+"=")
+	os.Stdout.Sync()
+
+	<-shutdownDone
+}
+
+// bringUpWorkSet returns the deterministic v1 mining workset
+// the validator serves to every miner during the bring-up
+// posture. Two requirements:
+//
+//  1. Stable across runs and platforms (every miner sees the
+//     same WorkSet.Root() so DAG entries match between
+//     miner and validator).
+//  2. Passes mining.WorkSet.Validate() — which means each
+//     batch must have 3..5 cells, and each cell ID must be
+//     non-empty and globally unique within the workset.
+//
+// HTTP chain catch-up helpers. These let a validator follow a gateway-exposed
+// chain feed when direct libp2p reachability is unavailable.
+func chainSyncURLsFromEnv() []string {
+	raw := strings.TrimSpace(os.Getenv("CELLS_CHAIN_SYNC_URLS"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		u := strings.TrimRight(strings.TrimSpace(part), "/")
+		if u == "" {
+			continue
+		}
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	return out
+}
+
+func shouldDeferLocalGenesis(networkedCatchupMode bool, bootstrapPeers, syncURLs []string) bool {
+	return networkedCatchupMode && (len(bootstrapPeers) > 0 || len(syncURLs) > 0)
+}
+
+type httpChainBlocksResponse struct {
+	Tip    uint64            `json:"tip"`
+	From   uint64            `json:"from"`
+	To     uint64            `json:"to"`
+	Blocks []json.RawMessage `json:"blocks"`
+}
+
+const (
+	httpChainSyncWindowBlocks     = 64
+	httpChainSyncMaxWindowsPerRun = 32
+	httpChainSyncPollInterval     = 2 * time.Second
+
+	CELLSCanonicalGenesisHash      = "b6119386bb6918d0716ab9d7f51864b58c20d542e6beab261151e8d4f9a8feb6"
+	CELLSCanonicalGenesisStateRoot = "1667aa6937305e49b2bf489aec03dbb6a12ecddef89c1ad884ebe368d29c3998"
+	CELLSCanonicalGenesisAmount    = 100.0
+	CELLSCanonicalGenesisReserve   = 1.0
+)
+
+type httpChainSyncProducer interface {
+	HasTip() bool
+	TipHeight() uint64
+	TryAppendExternalBlock(*chain.Block) error
+}
+
+func fetchHTTPChainWindow(
+	ctx context.Context,
+	client *http.Client,
+	base string,
+	from uint64,
+) (httpChainBlocksResponse, error) {
+	endpoint := fmt.Sprintf(
+		"%s/chain/blocks?from=%d&limit=%d",
+		strings.TrimRight(base, "/"),
+		from,
+		httpChainSyncWindowBlocks,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return httpChainBlocksResponse{}, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return httpChainBlocksResponse{}, fmt.Errorf("request source: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return httpChainBlocksResponse{}, fmt.Errorf(
+			"source returned HTTP %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
+	}
+
+	var decoded httpChainBlocksResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&decoded); err != nil {
+		return httpChainBlocksResponse{}, fmt.Errorf("decode response: %w", err)
+	}
+	return decoded, nil
+}
+
+func syncHTTPChainSource(
+	ctx context.Context,
+	client *http.Client,
+	producer httpChainSyncProducer,
+	base string,
+	maxWindows int,
+	prepareGenesis func(*chain.Block) error,
+) (int, uint64, error) {
+	if producer == nil {
+		return 0, 0, fmt.Errorf("chain producer is nil")
+	}
+	if maxWindows <= 0 {
+		maxWindows = 1
+	}
+
+	totalAppended := 0
+	var remoteTip uint64
+	for window := 0; window < maxWindows; window++ {
+		from := uint64(0)
+		if producer.HasTip() {
+			from = producer.TipHeight() + 1
+		}
+
+		decoded, err := fetchHTTPChainWindow(ctx, client, base, from)
+		if err != nil {
+			return totalAppended, remoteTip, err
+		}
+		remoteTip = decoded.Tip
+		if from > remoteTip {
+			return totalAppended, remoteTip, nil
+		}
+		if len(decoded.Blocks) == 0 {
+			return totalAppended, remoteTip, nil
+		}
+
+		expectedHeight := from
+		appendedThisWindow := 0
+		for _, raw := range decoded.Blocks {
+			var blk chain.Block
+			if err := json.Unmarshal(raw, &blk); err != nil {
+				return totalAppended, remoteTip, fmt.Errorf("decode block at height %d: %w", expectedHeight, err)
+			}
+			if blk.Height != expectedHeight {
+				return totalAppended, remoteTip, fmt.Errorf(
+					"non-contiguous source response: expected height %d, got %d",
+					expectedHeight,
+					blk.Height,
+				)
+			}
+			if blk.Height == 0 && !producer.HasTip() && prepareGenesis != nil {
+				if err := prepareGenesis(&blk); err != nil {
+					return totalAppended, remoteTip, fmt.Errorf("prepare canonical genesis replay: %w", err)
+				}
+			}
+			if err := producer.TryAppendExternalBlock(&blk); err != nil {
+				return totalAppended, remoteTip, err
+			}
+			appendedThisWindow++
+			expectedHeight++
+		}
+		totalAppended += appendedThisWindow
+
+		if producer.HasTip() && producer.TipHeight() >= remoteTip {
+			return totalAppended, remoteTip, nil
+		}
+		if appendedThisWindow < httpChainSyncWindowBlocks {
+			return totalAppended, remoteTip, fmt.Errorf(
+				"source stopped at height %d before advertised tip %d",
+				producer.TipHeight(),
+				remoteTip,
+			)
+		}
+	}
+	return totalAppended, remoteTip, nil
+}
+
+func prepareCanonicalGenesisReplay(accounts *chain.AccountStore, blk *chain.Block) error {
+	if accounts == nil {
+		return fmt.Errorf("account store is nil")
+	}
+	if blk == nil {
+		return fmt.Errorf("genesis block is nil")
+	}
+	if blk.Height != 0 || blk.PrevHash != "" {
+		return fmt.Errorf("block is not genesis")
+	}
+	if blk.Hash != CELLSCanonicalGenesisHash || blk.StateRoot != CELLSCanonicalGenesisStateRoot {
+		return fmt.Errorf(
+			"unrecognized genesis manifest hash=%s state_root=%s",
+			blk.Hash,
+			blk.StateRoot,
+		)
+	}
+	if len(blk.Transactions) != 1 || blk.Transactions[0] == nil {
+		return fmt.Errorf("canonical genesis must contain exactly one transaction")
+	}
+	tx := blk.Transactions[0]
+	if tx.Sender != blockdriver.FunderAddress ||
+		tx.Amount != CELLSCanonicalGenesisAmount ||
+		tx.Fee != 0 ||
+		tx.Nonce != 0 {
+		return fmt.Errorf("canonical genesis transaction does not match the pinned opening allocation")
+	}
+
+	openingBalance := blockdriver.DefaultFunderBalance + CELLSCanonicalGenesisAmount + CELLSCanonicalGenesisReserve
+	seeded := chain.NewAccountStore()
+	seeded.Credit(blockdriver.FunderAddress, openingBalance)
+	if err := seeded.ApplyTx(tx); err != nil {
+		return fmt.Errorf("verify opening allocation: %w", err)
+	}
+	if got := seeded.StateRoot(); got != CELLSCanonicalGenesisStateRoot {
+		return fmt.Errorf(
+			"opening allocation root mismatch: got %s want %s",
+			got,
+			CELLSCanonicalGenesisStateRoot,
+		)
+	}
+
+	existing := accounts.AllAccounts()
+	if len(existing) == 0 {
+		accounts.Credit(blockdriver.FunderAddress, openingBalance)
+		return nil
+	}
+	if len(existing) != 1 ||
+		existing[0].Address != blockdriver.FunderAddress ||
+		existing[0].Balance != openingBalance ||
+		existing[0].Nonce != 0 {
+		return fmt.Errorf("local account state is not empty and does not match the pinned genesis opening allocation")
+	}
+	return nil
+}
+
+func startHTTPChainSync(
+	ctx context.Context,
+	logger *logging.Logger,
+	producer *chain.BlockProducer,
+	accounts *chain.AccountStore,
+	bases []string,
+) {
+	if producer == nil || len(bases) == 0 {
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	logger.Info("HTTP chain catch-up configured",
+		"sources", len(bases),
+		"env_var", "CELLS_CHAIN_SYNC_URLS",
+		"window_blocks", httpChainSyncWindowBlocks,
+		"max_windows_per_run", httpChainSyncMaxWindowsPerRun,
+		"poll_interval", httpChainSyncPollInterval.String())
+
+	syncOnce := func() {
+		for _, base := range bases {
+			appended, remoteTip, err := syncHTTPChainSource(
+				ctx,
+				client,
+				producer,
+				base,
+				httpChainSyncMaxWindowsPerRun,
+				func(blk *chain.Block) error {
+					return prepareCanonicalGenesisReplay(accounts, blk)
+				},
+			)
+			if err != nil {
+				var conflict *chain.ExternalAppendConflictError
+				if errors.As(err, &conflict) {
+					logger.Warn("HTTP chain catch-up: remote fork rejected",
+						"source", base,
+						"height", conflict.Height,
+						"existing_hash", conflict.ExistingHash,
+						"remote_hash", conflict.NewHash)
+				} else {
+					logger.Warn("HTTP chain catch-up: source failed",
+						"source", base,
+						"error_str", err.Error())
+				}
+				continue
+			}
+			if appended > 0 {
+				logger.Info("HTTP chain catch-up: appended blocks",
+					"source", base,
+					"count", appended,
+					"tip_height", producer.TipHeight(),
+					"remote_tip", remoteTip)
+			}
+			if producer.HasTip() && producer.TipHeight() >= remoteTip {
+				if appended > 0 {
+					logger.Info("HTTP chain catch-up: canonical tip reached",
+						"source", base,
+						"tip_height", producer.TipHeight(),
+						"remote_tip", remoteTip)
+				}
+				break
+			}
+			// A responsive source made progress. Prefer it for this run instead
+			// of mixing block windows from multiple gateways.
+			if appended > 0 {
+				break
+			}
+		}
+	}
+
+	go func() {
+		syncOnce()
+		ticker := time.NewTicker(httpChainSyncPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				syncOnce()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// accountProbeFromStore adapts a *chain.AccountStore to the
+// api.MiningAccountProbe interface. The read-only adapter is safe in every
+// validator mode; write-capable local wallet transfer wiring remains solo-only.
+type accountStoreProbe struct {
+	store *chain.AccountStore
+}
+
+func (p accountStoreProbe) BalanceOf(address string) (float64, uint64, bool) {
+	if p.store == nil {
+		return 0, 0, false
+	}
+	acc, ok := p.store.Get(address)
+	if !ok || acc == nil {
+		return 0, 0, false
+	}
+	return acc.Balance, acc.Nonce, true
+}
+
+func (p accountStoreProbe) Credit(address string, amount float64) {
+	if p.store == nil {
+		return
+	}
+	p.store.Credit(address, amount)
+}
+
+func (p accountStoreProbe) ApplyTransfer(txID, sender, recipient string, amount, fee float64, envelopeNonce uint64) error {
+	if p.store == nil {
+		return fmt.Errorf("local wallet transfer ledger is not configured")
+	}
+	if envelopeNonce == 0 {
+		return fmt.Errorf("local wallet transfer ledger requires v0.4.1 nonce envelopes")
+	}
+	err := p.store.ApplyTx(&mempool.Tx{
+		ID:        txID,
+		Sender:    sender,
+		Recipient: recipient,
+		Amount:    amount,
+		Fee:       fee,
+		Nonce:     envelopeNonce - 1,
+	})
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "insufficient balance") || strings.Contains(msg, "not found"):
+		return storage.ErrInsufficientBalance
+	case strings.Contains(msg, "nonce mismatch"):
+		return storage.ErrNonceConflict
+	default:
+		return err
+	}
+}
+
+func accountProbeFromStore(store *chain.AccountStore) accountStoreProbe {
+	return accountStoreProbe{store: store}
+}
+
+// emissionStoreProbe adapts a *chain.BlockProducer + the
+// canonical chain.DefaultEmissionSchedule to
+// api.MiningEmissionProbe. Lives in cmd/CELLS because the
+// schedule choice is operator policy, not consensus — peer
+// nodes pick their own at boot from the same defaults.
+type emissionStoreProbe struct {
+	producer *chain.BlockProducer
+	schedule chain.EmissionSchedule
+}
+
+func (p emissionStoreProbe) Snapshot() api.MiningEmissionSnapshot {
+	var tip uint64
+	if p.producer != nil && p.producer.HasTip() {
+		tip = p.producer.TipHeight()
+	}
+	rewardDust := p.schedule.BlockRewardDust(tip + 1)
+	return api.MiningEmissionSnapshot{
+		ChainTip:               tip,
+		MiningCapDust:          p.schedule.MiningCapDust,
+		BlocksPerEpoch:         p.schedule.BlocksPerEpoch,
+		TargetBlockTimeSeconds: p.schedule.TargetBlockTimeSeconds,
+		CurrentEpoch:           p.schedule.EpochForHeight(tip),
+		BlockRewardDust:        rewardDust,
+		BlockRewardCell:        p.schedule.BlockRewardCell(tip + 1),
+		EmittedDust:            p.schedule.CumulativeEmittedDust(tip),
+		EmittedCell:            formatDustAsCellLocal(p.schedule.CumulativeEmittedDust(tip)),
+		RemainingDust:          p.schedule.RemainingSupplyDust(tip),
+		NextHalvingHeight:      p.schedule.NextHalvingHeight(tip),
+		NextHalvingETASeconds:  p.schedule.NextHalvingETA(tip),
+	}
+}
+
+func emissionProbeFromProducer(p *chain.BlockProducer) api.MiningEmissionProbe {
+	return emissionStoreProbe{
+		producer: p,
+		schedule: chain.DefaultEmissionSchedule(),
+	}
+}
+
+// blocksProbeFromProducer adapts a *chain.BlockProducer to
+// api.MiningBlocksProbe so the public chain dashboard can list
+// the last N block headers.
+//
+// Each call copies only the requested range under bp.mu
+// (BlockRange, RelayBlocks: an index computation on the
+// contiguous chain) and projects it after the lock is released.
+// Full blocks come from RelayBlocks, which reads back from the
+// journal the producer signatures the startup load dropped.
+//
+// HL1 (c): the probe is clamped to the durable tip. Tip reports it (0 while
+// unset), and no range reaches above it (W5).
+type blocksStoreProbe struct {
+	producer *chain.BlockProducer
+	durable  *hl1DurableTip
+}
+
+func (p blocksStoreProbe) Tip() uint64 {
+	if p.producer == nil {
+		return 0
+	}
+	tip, _ := p.durable.Load()
+	return tip
+}
+
+func (p blocksStoreProbe) HeadersInRange(from, to uint64) []api.MiningBlockHeader {
+	if p.producer == nil {
+		return nil
+	}
+	from, to, ok := hl1ClampRange(p.durable, from, to)
+	if !ok {
+		return nil
+	}
+	blocks := p.producer.BlockRange(from, to)
+	out := make([]api.MiningBlockHeader, 0, len(blocks))
+	for _, b := range blocks {
+		hdr := b.Header()
+		out = append(out, api.MiningBlockHeader{
+			Height:     hdr.Height,
+			Hash:       hdr.Hash,
+			PrevHash:   hdr.PrevHash,
+			StateRoot:  hdr.StateRoot,
+			TxRoot:     hdr.TxRoot,
+			TxCount:    hdr.TxCount,
+			Timestamp:  hdr.Timestamp.UTC().Format(time.RFC3339),
+			ProducerID: b.ProducerID,
+		})
+	}
+	return out
+}
+
+func (p blocksStoreProbe) BlocksInRange(from, to uint64) []json.RawMessage {
+	if p.producer == nil {
+		return nil
+	}
+	from, to, ok := hl1ClampRange(p.durable, from, to)
+	if !ok {
+		return nil
+	}
+	blocks, err := p.producer.RelayBlocks(from, to, 0)
+	if err != nil {
+		// Never a wrong block: the blocks before the one that could not be
+		// read back are served, and the operator sees why.
+		hl1Logger().Error("chain blocks: block not served", "from", from, "to", to, "served", len(blocks), "error_str", err.Error())
+	}
+	out := make([]json.RawMessage, 0, len(blocks))
+	for _, b := range blocks {
+		raw, err := json.Marshal(b)
+		if err != nil {
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
+func blocksProbeFromProducer(p *chain.BlockProducer, durable *hl1DurableTip) blocksStoreProbe {
+	return blocksStoreProbe{producer: p, durable: durable}
+}
+
+// receiptStoreProbe adapts a *chain.ReceiptStore to
+// api.MiningReceiptProbe so the public /api/v1/receipts/{tx_id}
+// endpoint can serve per-tx outcomes from the live store. The
+// projection trims fields the wire view doesn't expose (none
+// today; future-proofing for an internal-only field).
+type receiptStoreProbe struct {
+	store *chain.ReceiptStore
+}
+
+func (p receiptStoreProbe) GetReceipt(txID string) (api.TxReceiptView, bool) {
+	if p.store == nil {
+		return api.TxReceiptView{}, false
+	}
+	r, ok := p.store.Get(txID)
+	if !ok || r == nil {
+		return api.TxReceiptView{}, false
+	}
+	logs := make([]api.TxReceiptLogView, 0, len(r.Logs))
+	for _, l := range r.Logs {
+		logs = append(logs, api.TxReceiptLogView{
+			Topic: l.Topic,
+			Data:  l.Data,
+			Index: l.Index,
+		})
+	}
+	return api.TxReceiptView{
+		TxID:         r.TxID,
+		BlockHeight:  r.BlockHeight,
+		BlockHash:    r.BlockHash,
+		Status:       uint8(r.Status),
+		GasUsed:      r.GasUsed,
+		Fee:          r.Fee,
+		Logs:         logs,
+		Error:        r.Error,
+		Timestamp:    r.Timestamp.UTC().Format(time.RFC3339Nano),
+		ContractID:   r.ContractID,
+		IndexInBlock: r.IndexInBlock,
+	}, true
+}
+
+func receiptProbeFromStore(rs *chain.ReceiptStore) api.MiningReceiptProbe {
+	return receiptStoreProbe{store: rs}
+}
+
+// receiptsListProbe adapts (*chain.ReceiptStore, *chain.BlockProducer)
+// to api.MiningReceiptsListProbe. The store provides the
+// height-range walk; the producer provides the live tip the
+// handler uses as a default `to` when the caller omits it.
+//
+// Both collaborators are read concurrently — RLock on the
+// store, atomic read on the durable tip — so this probe
+// has no internal lock of its own.
+//
+// HL1 (c): Tip is the durable tip (0 while unset), and no receipt above it
+// is listed (W5).
+type receiptsListProbe struct {
+	store    *chain.ReceiptStore
+	producer *chain.BlockProducer
+	durable  *hl1DurableTip
+}
+
+func (p receiptsListProbe) Tip() uint64 {
+	if p.producer == nil {
+		return 0
+	}
+	tip, _ := p.durable.Load()
+	return tip
+}
+
+func (p receiptsListProbe) ListByHeightRange(from, to uint64, limit int) []api.TxReceiptView {
+	if p.store == nil {
+		return nil
+	}
+	from, to, ok := hl1ClampRange(p.durable, from, to)
+	if !ok {
+		return nil
+	}
+	recs := p.store.ListByHeightRange(from, to, limit)
+	if len(recs) == 0 {
+		return nil
+	}
+	out := make([]api.TxReceiptView, 0, len(recs))
+	for _, r := range recs {
+		if r == nil {
+			continue
+		}
+		logs := make([]api.TxReceiptLogView, 0, len(r.Logs))
+		for _, l := range r.Logs {
+			logs = append(logs, api.TxReceiptLogView{
+				Topic: l.Topic,
+				Data:  l.Data,
+				Index: l.Index,
+			})
+		}
+		out = append(out, api.TxReceiptView{
+			TxID:         r.TxID,
+			BlockHeight:  r.BlockHeight,
+			BlockHash:    r.BlockHash,
+			Status:       uint8(r.Status),
+			GasUsed:      r.GasUsed,
+			Fee:          r.Fee,
+			Logs:         logs,
+			Error:        r.Error,
+			Timestamp:    r.Timestamp.UTC().Format(time.RFC3339Nano),
+			ContractID:   r.ContractID,
+			IndexInBlock: r.IndexInBlock,
+		})
+	}
+	return out
+}
+
+func receiptsListProbeFromStore(rs *chain.ReceiptStore, p *chain.BlockProducer, durable *hl1DurableTip) api.MiningReceiptsListProbe {
+	return receiptsListProbe{store: rs, producer: p, durable: durable}
+}
+
+// formatDustAsCellLocal mirrors the helper in
+// pkg/api/handlers_status.go (dust → "X.YYYYYYYY" CELL).
+// Duplicated here to avoid an import cycle since the helper
+// there is unexported.
+func formatDustAsCellLocal(dust uint64) string {
+	whole := dust / chain.DustPerCell
+	frac := dust % chain.DustPerCell
+	return fmt.Sprintf("%d.%0*d", whole, chain.CellDecimals, frac)
+}
+
+// challengeKeyLen is the on-disk size of the validator's
+// challenge-issuer HMAC key. 32 bytes matches HMAC-SHA256's
+// natural key size and exceeds the 16-byte minimum the
+// challenge package enforces (see pkg/mining/challenge/hmac_signer.go).
+const challengeKeyLen = 32
+
+// loadOrCreateChallengeKey reads the per-validator challenge
+// HMAC key from path. On first boot (file does not exist) it
+// generates a fresh 32-byte key from crypto/rand, writes it
+// with 0o600 perms (owner read/write only) and returns it.
+//
+// Returned values:
+//
+//	signerID — opaque-but-stable identifier for this key,
+//	           rendered as the lowercase hex of the first 8
+//	           key bytes prefixed with "validator-". This is
+//	           the value miners see in
+//	           Challenge.SignerID and the value the
+//	           HMACSignerVerifier registers under. Knowing the
+//	           signer_id leaks NOTHING about the secret —
+//	           HMAC-SHA256 with a 32-byte key is preimage-
+//	           resistant — so deriving it from the key is
+//	           safe and saves a separate id-management step.
+//	key      — 32 raw bytes. Never logged.
+//	err      — read / write / generate failure. Boot fails;
+//	           the caller log.Fatalfs.
+//
+// The "auto-generate on first boot" posture is deliberately
+// permissive for a solo validator. Multi-validator setups
+// will replace this with an explicit genesis-time key
+// distribution step (each operator hand-edits their key
+// file and shares the corresponding public hex SignerID
+// over a side channel so peers can Register one another).
+func loadOrCreateChallengeKey(path string) (signerID string, key []byte, err error) {
+	if path == "" {
+		return "", nil, errors.New("empty challenge key path")
+	}
+	if existing, readErr := os.ReadFile(path); readErr == nil { // #nosec G304 -- startup-only operator-configured challenge key path.
+		if len(existing) != challengeKeyLen {
+			return "", nil, fmt.Errorf(
+				"challenge key at %s has length %d, expected %d (delete the file to regenerate)",
+				path, len(existing), challengeKeyLen)
+		}
+		return deriveChallengeSignerID(existing), existing, nil
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return "", nil, fmt.Errorf("read challenge key %s: %w", path, readErr)
+	}
+	fresh := make([]byte, challengeKeyLen)
+	if _, randErr := cryptorand.Read(fresh); randErr != nil {
+		return "", nil, fmt.Errorf("generate challenge key: %w", randErr)
+	}
+	if writeErr := os.WriteFile(path, fresh, 0o600); writeErr != nil {
+		return "", nil, fmt.Errorf("persist challenge key %s: %w", path, writeErr)
+	}
+	return deriveChallengeSignerID(fresh), fresh, nil
+}
+
+// deriveChallengeSignerID returns the deterministic
+// SignerID-from-key derivation the challenge issuer uses.
+// Format: "validator-" || lowercase-hex(key[:8]). 8 bytes is
+// 64 bits of entropy — beyond practical collision range for
+// the validator population we'll ever ship. Stable across
+// restarts because the key file is stable.
+func deriveChallengeSignerID(key []byte) string {
+	if len(key) < 8 {
+		return "validator-shortkey"
+	}
+	return fmt.Sprintf("validator-%x", key[:8])
+}
+
+// The cells below are 16-byte synthetic IDs derived from a
+// fixed lexicographic prefix; the content hashes are the
+// SHA-256-style 32-byte arrays with deterministic byte
+// patterns. Nothing here is consensus-critical beyond
+// "miner and validator must agree" — once a per-epoch
+// derivation lands (Phase 4.6), this helper is deleted and
+// the WorkSet comes from chain state.
+func bringUpWorkSet() mining.WorkSet {
+	mkCell := func(prefix, idx byte) mining.ParentCellRef {
+		id := []byte{
+			0xC0, 0xFF, 0xEE, 0x01,
+			prefix, idx,
+			0xDE, 0xAD, 0xBE, 0xEF,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		}
+		var ch [32]byte
+		ch[0] = prefix
+		ch[1] = idx
+		ch[2] = 0xA5
+		return mining.ParentCellRef{ID: id, ContentHash: ch}
+	}
+	ws := mining.WorkSet{Batches: []mining.Batch{
+		{Cells: []mining.ParentCellRef{mkCell('a', 0), mkCell('a', 1), mkCell('a', 2)}},
+		{Cells: []mining.ParentCellRef{mkCell('b', 0), mkCell('b', 1), mkCell('b', 2)}},
+		{Cells: []mining.ParentCellRef{mkCell('c', 0), mkCell('c', 1), mkCell('c', 2)}},
+	}}
+	ws.Canonicalize()
+	return ws
+}
+
+// -----------------------------------------------------------------------------
+// HL1 wiring helpers (design rev 4 §2 cmd/CELLS (a), (d), (g))
+// -----------------------------------------------------------------------------
+
+// errHL1ExternalAppendDisabled is returned for every external block in the
+// producer role (§2 (d)): the single producer never appends a block it did
+// not seal, so the §4.3 fingerprint sees only its own writes.
+var errHL1ExternalAppendDisabled = errors.New("hl1: external block append is disabled in the producer role")
+
+// hl1ExternalAppend gates an external-append site (block gossip, BFT commit).
+func hl1ExternalAppend(producerRole bool, appendFn func(*chain.Block) error) func(*chain.Block) error {
+	if !producerRole {
+		return appendFn
+	}
+	return func(*chain.Block) error { return errHL1ExternalAppendDisabled }
+}
+
+// hl1ShouldStartChainSync reports whether HTTP chain sync may start. The
+// producer role never starts it; configured URLs only produce a WARN (canary
+// mode already refused them at S2).
+func hl1ShouldStartChainSync(producerRole bool, syncURLs []string) bool {
+	if len(syncURLs) == 0 {
+		return false
+	}
+	if producerRole {
+		hl1Logger().Warn("hl1: HTTP chain sync not started: external block append is disabled in the producer role",
+			"env_var", "CELLS_CHAIN_SYNC_URLS",
+			"sources", len(syncURLs))
+		return false
+	}
+	return true
+}
+
+// hl1CanaryParts is the canary machinery (§5 S7). Every field is nil in
+// Stage A, in the follower role, and when the legacy-mining directory is
+// refused; the mining service is then read-only and the driver seals
+// heartbeats only.
+type hl1CanaryParts struct {
+	store  *legacymining.SQLiteStore
+	guard  *legacymining.CanaryGuard
+	ledger *legacymining.PayoutLedger
+	reason string            // why the canary is not enabled
+	mode   legacymining.Mode // canary or public when enabled
+
+	// HL2 WP-C, version 2 configs only (nil with a v1 config).
+	view *hl2EnrollmentView
+	keys *legacymining.OperatorKeys
+}
+
+func (c *hl1CanaryParts) enabled() bool {
+	return c != nil && c.store != nil && c.guard != nil && c.ledger != nil
+}
+
+func (c *hl1CanaryParts) status() string {
+	if c.enabled() {
+		if c.mode == legacymining.ModePublic {
+			return "public"
+		}
+		return "canary"
+	}
+	if c == nil || c.reason == "" {
+		return "off"
+	}
+	return c.reason
+}
+
+// hl1NewCanary builds the Guard, Store and Ledger in canary mode, or (HL2
+// WP-D) in public mode, with local block production. The Store is not
+// opened here: Reconcile opens it after S5 (S7).
+//
+// With a version 2 config (HL2 WP-C) it also passes the mode, an
+// EnrollmentView over the consensus enrollment state, the config's
+// SlotPolicy (legacymining.ConfigSlotPolicy: FullyBondedSlotPolicy, or the
+// deferred-bond tier when deferred_slot_weight_permille is set) and, when
+// require_operator_sig is set, the
+// operator_sig OwnerAuth over an operator-key index that
+// hl2HydrateOperatorKeys fills after S14; and it uses a version 2 Store
+// (NewSQLiteStoreV2), which migrates an HL1 DB at S7. A version 1 config
+// gets exactly the HL1 Guard and Store, and its DB is never migrated.
+func hl1NewCanary(boot hl1BootConfig, producerRole bool, accounts *chain.AccountStore, enroll *enrollment.InMemoryState) *hl1CanaryParts {
+	c := &hl1CanaryParts{}
+	switch {
+	case !boot.Canary():
+		c.reason = "off (Stage A): read-only, heartbeats only"
+		return c
+	case !producerRole:
+		c.reason = "canary configured without local block production: read-only"
+		hl1Logger().Warn("hl1: " + c.reason)
+		return c
+	}
+	store := legacymining.NewSQLiteStore()
+	opts := legacymining.GuardOptions{
+		Dir:              boot.Env.LegacyDir(),
+		Config:           boot.Config,
+		ConfigHash:       boot.Env.ConfigSHA256,
+		Release:          buildinfo.Version,
+		Store:            store,
+		FailStop:         failStop,
+		EnrollmentActive: hl1EnrollmentActive(enroll),
+		Logf: func(format string, args ...any) {
+			hl1Logger().Warn(fmt.Sprintf(format, args...))
+		},
+	}
+	var view *hl2EnrollmentView
+	var keys *legacymining.OperatorKeys
+	if boot.Config.Version == legacymining.ConfigVersion2 {
+		store = legacymining.NewSQLiteStoreV2()
+		view = newHL2EnrollmentView(enroll)
+		keys = legacymining.NewOperatorKeys()
+		opts.Store = store
+		opts.Mode = boot.Env.Mode
+		opts.Enrollments = view
+		opts.SlotPolicy = legacymining.ConfigSlotPolicy(boot.Config)
+		if boot.Config.RequireOperatorSig {
+			opts.OwnerAuth = legacymining.OperatorSigAuth(keys)
+		}
+	}
+	guard, err := legacymining.NewGuard(opts)
+	if err != nil {
+		c.reason = "legacy-mining directory refused; mining closed: " + err.Error()
+		hl1Logger().Error("hl1: "+c.reason, "dir", boot.Env.LegacyDir())
+		return c
+	}
+	ledger, err := legacymining.NewLedger(legacymining.LedgerConfig{Store: store, Guard: guard, Accounts: accounts})
+	if err != nil {
+		c.reason = "legacy-mining ledger refused; mining closed: " + err.Error()
+		hl1Logger().Error("hl1: " + c.reason)
+		return c
+	}
+	c.store, c.guard, c.ledger = store, guard, ledger
+	c.view, c.keys = view, keys
+	c.mode = boot.Env.Mode
+	return c
+}
+
+// hl1EnrollmentActive is the S16 enrollment check: nodeID is an active
+// enrollment owned by owner.
+func hl1EnrollmentActive(state *enrollment.InMemoryState) func(nodeID, owner string) bool {
+	return func(nodeID, owner string) bool {
+		if state == nil {
+			return false
+		}
+		rec, err := state.Lookup(nodeID)
+		return err == nil && rec != nil && rec.Owner == owner && rec.Active()
+	}
+}
+
+// hl1ReconcileCanary runs S7-S14 in canary mode. Outside canary mode it
+// returns an empty (not clean, store closed) report.
+func hl1ReconcileCanary(c *hl1CanaryParts, boot hl1BootConfig, blocks []*chain.Block, accounts *chain.AccountStore) legacymining.ReconcileReport {
+	if !c.enabled() {
+		return legacymining.ReconcileReport{}
+	}
+	rep, err := legacymining.Reconcile(legacymining.ReconcileConfig{
+		Store:    c.store,
+		DBPath:   boot.Env.DBPath,
+		Guard:    c.guard,
+		Ledger:   c.ledger,
+		Accounts: accounts,
+		Blocks:   blocks,
+		Release:  buildinfo.Version,
+	})
+	if err != nil {
+		hl1Logger().Error("hl1: legacy-mining reconciliation not clean; FREEZE tripped, admission stays closed",
+			"step", rep.Step, "anomalies", rep.AnomalyCount, "error_str", err.Error())
+	} else {
+		hl1Logger().Info("hl1: legacy-mining reconciliation clean",
+			"tip", rep.Tip, "created", rep.Created, "h0", rep.Meta.H0, "paid", rep.Paid,
+			"pending", rep.Pending, "proofs_total", rep.Totals.Proofs, "emitted_cell", rep.Totals.Emitted)
+		if c.guard.Config().Version == legacymining.ConfigVersion2 {
+			hl1Logger().Info("hl2: per-owner reconciliation",
+				"owner_epoch", rep.OwnerEpoch, "owners_with_rows", len(rep.Owners),
+				"owners_paid_in_epoch", len(rep.OwnerEmitted))
+		}
+	}
+	return rep
+}
+
+// hl1MiningServiceConfig finishes the mining service config (§2 (a)). The
+// chain view is durable (W5) and RewardSink is never set. The service is
+// writable only with the canary machinery and an open Store; otherwise it is
+// read-only. A writable service gets the config's difficulty
+// (legacymining.ConfigDifficulty, HL2 WP-E).
+func hl1MiningServiceConfig(base miningsvc.Config, view legacymining.ChainView, c *hl1CanaryParts, storeOpen bool) miningsvc.Config {
+	cfg := base
+	cfg.Producer = view
+	cfg.RewardSink = nil
+	cfg.ReadOnly = true
+	cfg.Store, cfg.Guard, cfg.Sink = nil, nil, nil
+	if c.enabled() && storeOpen {
+		cfg.ReadOnly = false
+		cfg.Store = hl1CrashpointStore(c.store)
+		cfg.Guard = c.guard
+		cfg.Sink = c.ledger
+		// HL2 WP-E: the served and verified difficulty comes from the
+		// config: 2^16 (mining.DefaultMinDifficulty) for v1, exactly as
+		// in HL1, and 2^difficulty_bits for v2.
+		cfg.Difficulty = legacymining.ConfigDifficulty(c.guard.Config())
+	}
+	return cfg
+}
+
+// hl1LegacyMiningHealth maps the canary state to the legacy_mining health
+// component (§2 (g)). It does not affect /api/v1/health/ready.
+func hl1LegacyMiningHealth(c *hl1CanaryParts) (monitoring.HealthStatus, string) {
+	if !c.enabled() {
+		if c != nil && strings.HasPrefix(c.reason, "legacy-mining") {
+			return monitoring.HealthStatusUnhealthy, c.reason
+		}
+		return monitoring.HealthStatusHealthy, "legacy mining " + c.status()
+	}
+	switch st := c.guard.State(); st {
+	case legacymining.StateOpen:
+		if c.guard.AdmissionOpen() {
+			return monitoring.HealthStatusHealthy, "canary OPEN: admission open"
+		}
+		return monitoring.HealthStatusHealthy, "canary OPEN: admission closed (quiet period, enrollment or reconciliation)"
+	case legacymining.StateAdmissionStopped:
+		return monitoring.HealthStatusDegraded, "canary ADMISSION_STOPPED: payouts continue"
+	default:
+		return monitoring.HealthStatusUnhealthy, "canary " + st.String() + ": heartbeats only"
+	}
+}
+
+// hl1LegacyMiningHealthLoop refreshes the legacy_mining component every
+// 10 s until ctx ends.
+func hl1LegacyMiningHealthLoop(ctx context.Context, hc *monitoring.HealthChecker, c *hl1CanaryParts) {
+	update := func() {
+		st, msg := hl1LegacyMiningHealth(c)
+		hc.UpdateComponentHealth("legacy_mining", st, msg)
+	}
+	update()
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			update()
+		}
+	}
+}

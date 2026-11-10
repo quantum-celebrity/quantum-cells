@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  CELLS:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: CELLS-node
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./CELLS.db:/app/CELLS.db
+      - ./CELLS.log:/app/CELLS.log
+      - ./config:/app/config
+    environment:
+      - USE_SCYLLA=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-t", "1", "-O", "/dev/null", "http://localhost:8080/api/v1/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+

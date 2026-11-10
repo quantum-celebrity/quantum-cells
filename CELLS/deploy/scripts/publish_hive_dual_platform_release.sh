@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: $0 <stage-dir> <hive-version> [webroot]" >&2
+  exit 64
+fi
+
+stage_dir="$(cd "$1" && pwd)"
+hive_version="$2"
+webroot="${3:-/var/www/CELLS}"
+# Hive 1.4.21+ trusts only the v2 release key and reads its release from the
+# self-contained hive-v2 channel. The v1 files directly under /downloads are
+# left untouched for Hive <= 1.4.20.
+release_channel="hive-v2"
+release_key_id="4081bf2c4755f4c5c1565b4fac75e14a7e0b52042ac3d34bf8a7f525866c64a9"
+downloads="$webroot/downloads/$release_channel"
+public_downloads="https://CELLS.tech/downloads/$release_channel"
+
+# Signed envelopes and manifests are written by PowerShell ConvertTo-Json,
+# which may put more than one space after a colon. Match a JSON string field
+# exactly, whatever the whitespace. Reads the JSON text from stdin.
+json_field_is() {
+  local field="$1"
+  local escaped
+  escaped="$(printf '%s' "$2" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+  grep -Eq "\"${field}\":[[:space:]]*\"${escaped}\""
+}
+wallet_extension_version="${CELLS_HIVE_WALLET_EXTENSION_VERSION:-0.5.1}"
+
+if [[ ! "$hive_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "invalid Hive version: $hive_version" >&2
+  exit 64
+fi
+
+windows_installer="CELLS-hive-${hive_version}-win-x64.exe"
+linux_appimage="CELLS-hive-${hive_version}-linux-x86_64.AppImage"
+linux_archive="CELLS-hive-${hive_version}-linux-x64.tar.gz"
+linux_checksums="CELLS-hive-${hive_version}-linux-SHA256SUMS.txt"
+wallet_extension="CELLS-hive-wallet-extension-${wallet_extension_version}.zip"
+wallet_extension_crx="CELLS-hive-wallet-extension-${wallet_extension_version}.crx"
+wallet_extension_chromium="CELLS-hive-wallet-extension-${wallet_extension_version}-chromium.zip"
+wallet_extension_chrome="CELLS-hive-wallet-extension-${wallet_extension_version}-chrome.zip"
+wallet_extension_edge="CELLS-hive-wallet-extension-${wallet_extension_version}-edge.zip"
+wallet_extension_brave="CELLS-hive-wallet-extension-${wallet_extension_version}-brave.zip"
+wallet_extension_firefox="CELLS-hive-wallet-extension-${wallet_extension_version}-firefox.zip"
+wallet_extension_checksums="CELLS-hive-wallet-extension-${wallet_extension_version}-SHA256SUMS.txt"
+
+immutable_downloads=(
+  "$windows_installer"
+  "${windows_installer}.blockmap"
+  "CELLS-hive-${hive_version}-release-provenance.json"
+  "CELLS-hive-${hive_version}-windows-metadata-evidence.json"
+  "CELLS-hive-${hive_version}-windows-nsis-evidence.json"
+  "$linux_appimage"
+  "$linux_archive"
+  "$linux_checksums"
+  "$wallet_extension"
+  "$wallet_extension_chromium"
+  "$wallet_extension_chrome"
+  "$wallet_extension_edge"
+  "$wallet_extension_brave"
+  "$wallet_extension_firefox"
+  "$wallet_extension_checksums"
+)
+for optional_linux_evidence in \
+  "CELLS-hive-${hive_version}-linux-release-provenance.json" \
+  "CELLS-hive-${hive_version}-linux-payload-evidence.json"; do
+  if [[ -f "$stage_dir/downloads/$optional_linux_evidence" ]]; then
+    immutable_downloads+=("$optional_linux_evidence")
+  fi
+done
+if [[ -f "$stage_dir/downloads/$wallet_extension_crx" ]]; then
+  immutable_downloads+=("$wallet_extension_crx")
+fi
+pointer_downloads=(
+  "SHA256SUMS-win.txt"
+  "latest.yml"
+  "latest-linux.yml"
+  "CELLS-hive-release-windows-v2.json"
+  "CELLS-hive-release-linux-v2.json"
+)
+
+for file in "${immutable_downloads[@]}" "${pointer_downloads[@]}"; do
+  test -f "$stage_dir/downloads/$file"
+done
+test -f "$stage_dir/download.html"
+
+(
+  cd "$stage_dir/downloads"
+  sha256sum -c SHA256SUMS-win.txt
+  sha256sum -c "$linux_checksums"
+  sha256sum -c "$wallet_extension_checksums"
+)
+grep -qx "version: ${hive_version}" "$stage_dir/downloads/latest.yml"
+grep -qx "version: ${hive_version}" "$stage_dir/downloads/latest-linux.yml"
+grep -q "url: ${windows_installer}" "$stage_dir/downloads/latest.yml"
+grep -q "url: ${linux_appimage}" "$stage_dir/downloads/latest-linux.yml"
+grep -q "Version ${hive_version}" "$stage_dir/download.html"
+
+for platform in windows linux; do
+  envelope="$stage_dir/downloads/CELLS-hive-release-${platform}-v2.json"
+  grep -Eq '"schema":[[:space:]]*"CELLS\.signed-release\.v1"' "$envelope"
+  json_field_is key_id "$release_key_id" \
+    <"$envelope"
+  payload="$(sed -n 's/.*"manifest_base64":[[:space:]]*"\([^"]*\)".*/\1/p' "$envelope")"
+  test -n "$payload"
+  manifest_json="$(printf '%s' "$payload" | base64 --decode)"
+  json_field_is version "${hive_version}" <<<"$manifest_json"
+  if [[ "$platform" == "windows" ]]; then
+    json_field_is name "${wallet_extension}" <<<"$manifest_json"
+    if [[ -f "$stage_dir/downloads/$wallet_extension_crx" ]]; then
+      json_field_is name "${wallet_extension_crx}" <<<"$manifest_json"
+    fi
+    json_field_is name "${wallet_extension_chromium}" <<<"$manifest_json"
+    json_field_is name "${wallet_extension_chrome}" <<<"$manifest_json"
+    json_field_is name "${wallet_extension_edge}" <<<"$manifest_json"
+    json_field_is name "${wallet_extension_brave}" <<<"$manifest_json"
+    json_field_is name "${wallet_extension_firefox}" <<<"$manifest_json"
+    json_field_is name "${wallet_extension_checksums}" <<<"$manifest_json"
+  fi
+done
+
+install -d -o caddy -g caddy -m 0755 "$webroot" "$webroot/downloads" "$downloads"
+
+atomic_install_immutable() {
+  local source="$1"
+  local destination="$2"
+  local temporary="${destination}.new.$$"
+
+  if [[ -e "$destination" ]]; then
+    cmp --silent "$source" "$destination" || {
+      echo "refusing to replace immutable release artifact: $destination" >&2
+      exit 1
+    }
+    return
+  fi
+
+  install -o caddy -g caddy -m 0644 "$source" "$temporary"
+  mv "$temporary" "$destination"
+}
+
+install_pointer() {
+  local source="$1"
+  local destination="$2"
+  local temporary="${destination}.new.$$"
+  install -o caddy -g caddy -m 0644 "$source" "$temporary"
+  mv -f "$temporary" "$destination"
+}
+
+# Publish every immutable byte before either platform's exact-version pointer.
+for file in "${immutable_downloads[@]}"; do
+  atomic_install_immutable "$stage_dir/downloads/$file" "$downloads/$file"
+done
+
+for file in "$windows_installer" "$linux_appimage" "$linux_archive" \
+  "$wallet_extension" "$wallet_extension_chromium" \
+  "$wallet_extension_chrome" "$wallet_extension_edge" \
+  "$wallet_extension_brave" \
+  "$wallet_extension_firefox" "$wallet_extension_checksums"; do
+  curl --fail --silent --show-error --head --max-time 30 \
+    "$public_downloads/$file" >/dev/null
+done
+if [[ -f "$stage_dir/downloads/$wallet_extension_crx" ]]; then
+  curl --fail --silent --show-error --head --max-time 30 \
+    "$public_downloads/$wallet_extension_crx" >/dev/null
+fi
+
+install_pointer "$stage_dir/download.html" "$webroot/download.html"
+for file in "${pointer_downloads[@]}"; do
+  install_pointer "$stage_dir/downloads/$file" "$downloads/$file"
+done
+
+public_latest_windows="$(curl --fail --silent --show-error --max-time 30 \
+  "$public_downloads/latest.yml")"
+grep -qx "version: ${hive_version}" <<<"$public_latest_windows"
+public_latest_linux="$(curl --fail --silent --show-error --max-time 30 \
+  "$public_downloads/latest-linux.yml")"
+grep -qx "version: ${hive_version}" <<<"$public_latest_linux"
+for platform in windows linux; do
+  public_envelope="$(curl --fail --silent --show-error --max-time 30 \
+    "$public_downloads/CELLS-hive-release-${platform}-v2.json")"
+  grep -Eq '"schema":[[:space:]]*"CELLS\.signed-release\.v1"' <<<"$public_envelope"
+done
+public_download_page="$(curl --fail --silent --show-error --max-time 30 \
+  "https://CELLS.tech/download.html")"
+grep -q "Version ${hive_version}" <<<"$public_download_page"
+
+echo "Published CELLS Hive ${hive_version} for Windows and Linux atomically."

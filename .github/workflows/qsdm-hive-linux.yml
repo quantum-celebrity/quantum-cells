@@ -1,0 +1,162 @@
+name: QSDM Hive Linux
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "hive-v*"
+  pull_request:
+    paths:
+      - "apps/qsdm-hive/qsdm-hive-main/**"
+      - "apps/qsdm-hive-wallet-extension/**"
+      - "apps/qsdm-edge-agent/**"
+      - "QSDM/source/cmd/qsdmcli/**"
+      - "QSDM/source/cmd/qsdm-hive-wallet-host/**"
+      - "QSDM/source/cmd/qsdm-edge-agent/**"
+      - "QSDM/source/cmd/qsdmminer-console/**"
+      - "QSDM/source/pkg/edgepool/**"
+      - "QSDM/source/pkg/mining/**"
+      - "QSDM/deploy/scripts/build_hive_linux.sh"
+      - ".github/workflows/qsdm-hive-linux.yml"
+
+concurrency:
+  group: qsdm-hive-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-linux:
+    # ubuntu-24.04, not ubuntu-latest: nvcc below is Ubuntu 24.04's CUDA 12.0, which needs g++-12 as its host
+    # compiler, and the newer ubuntu-latest image has no g++-12 ("g++-12: No such file or directory", 2026-11-02).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+          cache-dependency-path: QSDM/source/go.sum
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: |
+            apps/qsdm-hive/qsdm-hive-main/package-lock.json
+            apps/qsdm-hive/qsdm-hive-main/release/app/package-lock.json
+
+      - name: Verify release tag matches Hive version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            hive_version="$(node -p "require('./apps/qsdm-hive/qsdm-hive-main/release/app/package.json').version")"
+            test "$GITHUB_REF_NAME" = "hive-v${hive_version}"
+          fi
+
+      - name: Build native QSDM tools
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64
+          go build -trimpath -ldflags "-s -w" -o ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdmcli ./cmd/qsdmcli
+          go build -trimpath -ldflags "-s -w" -o ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-hive-wallet-host ./cmd/qsdm-hive-wallet-host
+          EDGE_AGENT_VERSION="$(tr -d '[:space:]' < ../../apps/qsdm-edge-agent/VERSION)"
+          go build -trimpath -ldflags "-s -w -X main.version=${EDGE_AGENT_VERSION}" -o ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-edge-agent ./cmd/qsdm-edge-agent
+          go build -trimpath -ldflags "-s -w -X main.version=${EDGE_AGENT_VERSION}" -o ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-edge-control ./cmd/qsdm-edge-control
+          HIVE_VERSION="$(node -p "require('../../apps/qsdm-hive/qsdm-hive-main/release/app/package.json').version")"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          GIT_SHA="$(git rev-parse --short HEAD)"
+          go build -trimpath -ldflags "-s -w -X github.com/blackbeardONE/QSDM/pkg/buildinfo.Version=hive-v${HIVE_VERSION} -X github.com/blackbeardONE/QSDM/pkg/buildinfo.GitSHA=${GIT_SHA} -X github.com/blackbeardONE/QSDM/pkg/buildinfo.BuildDate=${BUILD_DATE}" -o ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdmminer-console ./cmd/qsdmminer-console
+          chmod 0755 ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdmcli
+          chmod 0755 ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-hive-wallet-host
+          chmod 0755 ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-edge-agent
+          chmod 0755 ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-edge-control
+          chmod 0755 ../../apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdmminer-console
+
+      - name: Install CUDA compiler and build Linux GPU helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nvidia-cuda-toolkit xvfb
+          nvcc -O3 -std=c++17 -arch=sm_75 -ccbin g++-12 \
+            QSDM/source/cmd/qsdm-edge-gpu-helper/main.cu \
+            -o apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-edge-gpu-helper
+          nvcc -O3 -std=c++17 -ccbin g++-12 \
+            -gencode arch=compute_75,code=sm_75 \
+            -gencode arch=compute_86,code=sm_86 \
+            -gencode arch=compute_89,code=sm_89 \
+            -gencode arch=compute_90,code=sm_90 \
+            QSDM/source/cmd/qsdm-miner-cuda-solver/main.cu \
+            -o apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-miner-cuda-solver
+          chmod 0755 apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-edge-gpu-helper
+          chmod 0755 apps/qsdm-hive/qsdm-hive-main/native/linux/x64/qsdm-miner-cuda-solver
+
+      - name: Install Hive dependencies
+        working-directory: apps/qsdm-hive/qsdm-hive-main
+        run: |
+          npm ci --ignore-scripts
+          npm --prefix release/app ci --ignore-scripts
+          npm exec electron-builder -- install-app-deps
+
+      # The whole jest suite, not a hand-picked list: a spec that is not listed
+      # here can no longer break unnoticed.
+      - name: Test Hive (type check and full jest suite)
+        working-directory: apps/qsdm-hive/qsdm-hive-main
+        run: |
+          npx tsc --noEmit
+          npm test -- --runInBand
+
+      - name: Build Hive
+        working-directory: apps/qsdm-hive/qsdm-hive-main
+        run: npm run build
+
+      - name: Package AppImage and tarball
+        working-directory: apps/qsdm-hive/qsdm-hive-main
+        run: npx electron-builder build --linux AppImage tar.gz --x64 --publish never --config.directories.output=release/build-linux
+
+      - name: Smoke test packaged Hive renderer
+        working-directory: apps/qsdm-hive/qsdm-hive-main
+        run: |
+          set -euo pipefail
+          smoke_root="$RUNNER_TEMP/qsdm-hive-renderer-smoke"
+          mkdir -p "$smoke_root"
+          export QSDM_HIVE_APPDATA_ROOT="$smoke_root"
+          export QSDM_HIVE_SMOKE_TEST=1
+          unset ELECTRON_RUN_AS_NODE
+          sandbox_helper="release/build-linux/linux-unpacked/chrome-sandbox"
+          sudo chown root:root "$sandbox_helper"
+          sudo chmod 4755 "$sandbox_helper"
+          test "$(stat -c '%U:%G %a' "$sandbox_helper")" = "root:root 4755"
+          timeout --preserve-status 45s xvfb-run -a release/build-linux/linux-unpacked/qsdm-hive
+          result="$smoke_root/qsdm-hive/logs/smoke-result.json"
+          test -f "$result"
+          node -e "const fs=require('fs');const r=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const ok=r.status==='ok'&&r.renderer?.hasRoot&&r.renderer.rootChildren>0&&r.renderer.hasMainBridge&&r.renderer.hasCoreStatusApi&&r.renderer.hasBrandingFolderPathApi;if(!ok)throw new Error(JSON.stringify(r));console.log(JSON.stringify(r,null,2));" "$result"
+
+      - name: Verify native executables
+        working-directory: apps/qsdm-hive/qsdm-hive-main
+        run: |
+          test -x release/build-linux/linux-unpacked/resources/native/qsdmcli
+          test -x release/build-linux/linux-unpacked/resources/native/qsdm-hive-wallet-host
+          test -x release/build-linux/linux-unpacked/resources/edge/qsdm-edge-agent
+          test -x release/build-linux/linux-unpacked/resources/edge/qsdm-edge-control
+          test -x release/build-linux/linux-unpacked/resources/edge/qsdm-edge-gpu-helper
+          test -x release/build-linux/linux-unpacked/resources/miner/qsdmminer-console
+          test -x release/build-linux/linux-unpacked/resources/miner/qsdm-miner-cuda-solver
+          tar -tvf release/build-linux/qsdm-hive-*-linux-x64.tar.gz | grep -E -- '-rwxr-xr-x.*resources/(native/qsdmcli|native/qsdm-hive-wallet-host|edge/qsdm-edge-agent|edge/qsdm-edge-control|edge/qsdm-edge-gpu-helper|miner/qsdmminer-console|miner/qsdm-miner-cuda-solver)$'
+          release/build-linux/linux-unpacked/resources/edge/qsdm-edge-agent version
+          release/build-linux/linux-unpacked/resources/edge/qsdm-edge-control version
+          release/build-linux/linux-unpacked/resources/miner/qsdmminer-console --version
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qsdm-hive-linux-${{ github.sha }}
+          path: |
+            apps/qsdm-hive/qsdm-hive-main/release/build-linux/*.AppImage
+            apps/qsdm-hive/qsdm-hive-main/release/build-linux/*.tar.gz
+            apps/qsdm-hive/qsdm-hive-main/release/build-linux/*.yml
+          if-no-files-found: error
+          retention-days: 14

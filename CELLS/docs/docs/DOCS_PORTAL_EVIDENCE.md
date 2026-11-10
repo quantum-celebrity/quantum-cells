@@ -1,0 +1,150 @@
+# Docs Portal Evidence — 2026-07-09
+
+> Ship log for the **CELLS.tech landing + `/docs/` knowledge-base portal**.
+> Companion to the `RELEASE_EVIDENCE_*` files; this is the static-site
+> equivalent — no new binary or container, just a Caddy webroot delta
+> and a curated SPA.
+>
+> Reproduce by curling the URLs in §"Live probes" from any host.
+
+## What shipped
+
+| Surface                                                                                                                                                                                                                     | Status              |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| Landing page (`CELLS.tech/`) — CELLS product portfolio, including CELLS Network, Hive/CELL, edge compute, and the CELLS VPN product at `CELLS.online` | LIVE (after deploy) |
+| CELLS Network (`CELLS.tech/network.html`) — live network status, explorer/API/trust entry points, local-signing workflow, and explicit non-custodial boundary | LIVE (after deploy) |
+| CELLS VPN (`CELLS.online`) — Android private access, assigned profiles, device-aware activation, quota visibility, and operator dashboard | LIVE |
+| Docs portal (`CELLS.tech/docs/`) — SPA with sidebar, hash routing, client-side markdown render, live fetch from main; adds home gateway, task registry, tray monitor, missing runbooks; referral path fixed                  | LIVE (after deploy) |
+| `sitemap.xml`, `robots.txt`, `humans.txt`                                                                                                                                                                                   | LIVE (after deploy) |
+| Caddyfile CSP — `connect-src` includes `https://raw.githubusercontent.com` for live docs and same-origin CELLS Network status; `img-src` includes `raw.githubusercontent.com`                                                   | LIVE (after deploy) |
+
+No backend changes required for docs content updates that only touch
+Markdown under `CELLS/docs/docs/` (fetched live from `main`). Shell
+files under `CELLS/deploy/landing/` require a landing deploy.
+
+## Docs portal at a glance
+
+- ~95 curated entries across 9 sections (Get started · Hive +
+  Integrations · Wallet · Mining · Validators & operators · Protocol &
+  design · Performance · Reference · Runbooks · Project).
+- Navigation comes from the curated `SECTIONS` manifest in
+  `CELLS/deploy/landing/docs/docs.js`. Each entry has `{ slug, title,
+repoPath, badge? }` (some Hive/edge pages also ship `inlineMarkdown`).
+- Markdown is fetched at runtime from `raw.githubusercontent.com/
+blackbeardONE/CELLS/main/<repoPath>`. **No mirror, no rebuild
+  needed** — pushing to `main` updates docs on the next page load.
+- `markdown-it@14.1.0` is vendored at `/docs/lib/markdown-it.min.js`
+  (123 618 B) with SRI
+  `sha384-wLhprpjsmjc/XYIcF+LpMxd8yS1gss6jhevOp6F6zhiIoFK6AmHtm4bGKtehTani`.
+  No CDN in `script-src`.
+- The version pill defaults to **v0.4.7-rc.9** and auto-refreshes from
+  CELLS Network at `/api/v1/status`. Its link resolves to the exact deployed
+  Git revision when the status response includes `git_sha`.
+- Filenames with literal spaces (one entry — `Feature Summary.md`)
+  are handled by an `encRepoPath()` helper that splits on `/` and
+  `encodeURIComponent`-s each segment, preserving slashes.
+
+## Live probes
+
+```text
+$ curl -s -o /dev/null -w '%{http_code}\n' https://CELLS.tech/
+200
+$ curl -s -o /dev/null -w '%{http_code}\n' https://CELLS.tech/docs/
+200
+$ curl -s -o /dev/null -w '%{http_code}\n' https://CELLS.tech/docs/docs.css
+200
+$ curl -s -o /dev/null -w '%{http_code}\n' https://CELLS.tech/docs/docs.js
+200
+$ curl -s -o /dev/null -w '%{http_code}\n' https://CELLS.tech/docs/lib/markdown-it.min.js
+200
+$ curl -s -o /dev/null -w '%{http_code}\n' https://CELLS.tech/sitemap.xml
+200
+$ curl -s -o /dev/null -w '%{http_code}\n' https://CELLS.tech/robots.txt
+200
+$ curl -sI https://CELLS.tech/docs/ | grep -i content-security-policy
+content-security-policy: default-src 'self'; img-src 'self' data: https://raw.githubusercontent.com; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https://api.CELLS.tech https://dashboard.CELLS.tech https://raw.githubusercontent.com; frame-ancestors 'none'; upgrade-insecure-requests
+$ curl -s https://CELLS.tech/ | grep -oE 'href="[^"]+"' | head
+(expect Download, Wallet, Capabilities, Mining, Docs, Explorer, Audit, Trust)
+$ curl -sI -H 'Origin: https://CELLS.tech' \
+    https://raw.githubusercontent.com/blackbeardONE/CELLS/main/CELLS/docs/docs/QUICK_START.md \
+  | grep -iE 'access-control-allow-origin|content-type'
+content-type: text/plain; charset=utf-8
+access-control-allow-origin: *
+```
+
+## Manifest integrity
+
+All 78 `repoPath` entries declared in `docs.js` were HEAD-tested
+against `raw.githubusercontent.com/.../main/<repoPath>`:
+
+```
+TOC entries: 78
+ok=78  fail=0
+```
+
+(`Feature Summary.md` fails when curled with a literal space; it
+passes when URL-encoded — which is exactly what `encRepoPath()`
+emits at runtime.)
+
+## Regression sweep
+
+Existing pages still render with their pre-ship byte counts:
+
+```
+200  26133  /wallet.html
+200  37062  /wallet.js
+200  3884131  /wallet.wasm       (3.88 MB — v0.4.0 build, unchanged)
+200  13155  /validators.html
+200  10777  /trust.html
+200  24171  /download.html
+200  23106  /chain.html
+200          /api/v1/health      (Caddy → 127.0.0.1:8443, proxy regression-free)
+```
+
+`/wallet.html`'s SRI on `wallet.js` and `wallet.wasm` was not touched
+— the v0.4.0 hashes from RELEASE_EVIDENCE_v0.4.0.md still apply.
+
+## File inventory
+
+```
+CELLS/deploy/landing/
+├── index.html                       (rewritten — 919 → 365 lines)
+├── sitemap.xml                      (new)
+├── robots.txt                       (new)
+├── _install_docs_site.sh            (new — deploy automation)
+└── docs/                            (new directory)
+    ├── index.html                   ( 3 914 B  — SPA shell)
+    ├── docs.css                     (11 161 B  — sidebar + content theme)
+    ├── docs.js                      (27 075 B  — TOC + router + render)
+    └── lib/
+        └── markdown-it.min.js       (123 618 B  — vendored, SRI-pinned)
+
+CELLS/deploy/Caddyfile                (CSP `connect-src` + `img-src` +
+                                      `try_files` chain; ran caddy fmt)
+```
+
+## What's _not_ in scope
+
+- No new backend or WASM artefacts — the v0.4.0 binary, container,
+  and `wallet.wasm` are unchanged. The release pipeline did not run.
+- No new cosign signatures. Static-site evidence lives in this
+  document only.
+- The docs portal exposes existing markdown — no content was rewritten,
+  reorganised, or deleted in the repo. The curated `SECTIONS`
+  manifest is the only "new" editorial layer.
+
+## Future polish (deferred)
+
+- Right-pane "On this page" outline (`#`-anchor TOC scraped from
+  rendered headings).
+- Local lunr.js full-text search across all 65 entries.
+- Service-worker cache so the SPA + recently-viewed docs work offline.
+- A subagent that re-validates the 78 TOC entries on every push to
+  `main` and opens a PR if any 404.
+
+## 2026-08-27 capability snapshot addendum
+
+- Added `CAPABILITY_SNAPSHOT.md` to the docs source and exposed it as `#/capability-snapshot` in the docs portal.
+- Updated the docs welcome cards so readers can reach the readiness percentages without digging through old phase-completion reports.
+- The curated table of contents is now 79 entries. Hash-fragment docs routes remain intentionally omitted from `sitemap.xml`; crawlers index `/docs/`, while humans deep-link through the SPA sidebar.
+- The tracked performance report now carries a current capability note and no longer uses benchmark results as a whole-project production-readiness claim.

@@ -1,0 +1,544 @@
+name: QSDM Go
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qsdm-go-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "QSDM/source/**"
+      - "QSDM/scripts/**"
+      - "QSDM/Dockerfile"
+      - "QSDM/config/**"
+      - "QSDM/deploy/**"
+      # pkg/api's TestOpenAPIMatchesRegisteredRoutes reads the API description.
+      - "QSDM/docs/docs/openapi.yaml"
+      - ".github/**"
+  pull_request:
+    paths:
+      - "QSDM/source/**"
+      - "QSDM/scripts/**"
+      - "QSDM/Dockerfile"
+      - "QSDM/config/**"
+      - "QSDM/deploy/**"
+      # pkg/api's TestOpenAPIMatchesRegisteredRoutes reads the API description.
+      - "QSDM/docs/docs/openapi.yaml"
+      - ".github/**"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      # Both rebrand-guardrail scripts below (check-no-new-legacy-metrics.sh
+      # and check-no-collapsed-env-preferred.sh) use ripgrep for the
+      # filtered file walk. ubuntu-latest doesn't ship rg by default, so
+      # without this install both scripts exit 2 with
+      # "ripgrep (rg) is required" -- which is the root cause of the
+      # build-test failures observed on sessions 72/73/74 (run ids
+      # 25625305998 / 25626376835 / 25640513232). Install once, reuse.
+      - name: Install ripgrep (required by rebrand guardrail scripts)
+        run: sudo apt-get update -y && sudo apt-get install -y ripgrep
+
+      # Guardrail for the qsdm_* -> qsdm_* Prometheus metric prefix
+      # migration. Runs before build so it fails fast on regressions
+      # without burning compute on a build that we're about to reject.
+      - name: Check for new legacy qsdm_* metric names
+        run: bash QSDM/scripts/check-no-new-legacy-metrics.sh
+
+      # Sibling guardrail for the same rebrand window: catches
+      # `_env_preferred("X", "X")` calls in the Python sidecar /
+      # installer scripts, where a search-and-replace previously
+      # collapsed the (preferred, legacy) pair into a single name and
+      # silently killed the legacy fallback. Cheap grep-only check.
+      - name: Check for collapsed _env_preferred(X, X) calls
+        run: bash QSDM/scripts/check-no-collapsed-env-preferred.sh
+
+      # Scripts live in QSDM/scripts; run from repo root so paths stay stable.
+      - name: Build (no CGO)
+        run: bash QSDM/scripts/go-build-no-cgo.sh /tmp/qsdm
+
+      - name: Smoke-check validator version command
+        run: |
+          set -euo pipefail
+          out="$(/tmp/qsdm --version)"
+          echo "$out"
+          echo "$out" | grep -q '^qsdm dev '
+
+      - name: Parse validator package operator scripts
+        run: |
+          set -euo pipefail
+          bash -n .github/scripts/resolve-release-tag.sh
+          bash -n QSDM/deploy/landing/_install_docs_site.sh
+          bash QSDM/deploy/landing/test_install_docs_site_public_api_override.sh
+          bash QSDM/deploy/scripts/test_install_edge_relay_caddy_site.sh
+          python3 QSDM/deploy/test_deploy_host.py
+          python3 -m py_compile QSDM/deploy/install_ngc_sidecar_vps.py QSDM/deploy/install_ngc_sidecar_oci.py
+          bash -n QSDM/deploy/scripts/publish_edge_release.sh
+          bash -n QSDM/deploy/validator-package/install-or-update.sh
+          bash -n QSDM/deploy/validator-package/rollback.sh
+          bash -n QSDM/scripts/smoke_edge_agent_linux.sh
+          pwsh -NoProfile -Command '
+            $errors = @()
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path "QSDM/deploy/validator-package/install-or-update.ps1"),
+              [ref]$null,
+              [ref]$errors
+            ) | Out-Null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path "QSDM/deploy/validator-package/rollback.ps1"),
+              [ref]$null,
+              [ref]$errors
+            ) | Out-Null
+            foreach ($script in @(
+              "QSDM/scripts/start_local_validator.ps1",
+              "QSDM/scripts/start_treasury_signer.ps1",
+              "QSDM/scripts/watch_local_stack.ps1",
+              "QSDM/scripts/update_local_validator.ps1",
+              "QSDM/scripts/test_local_validator_updater.ps1",
+              "QSDM/scripts/test_local_validator_bootstrap_profile.ps1",
+              "QSDM/scripts/test_local_validator_update_role_persistence.ps1",
+              "QSDM/scripts/test_local_validator_updater_transaction.ps1",
+              "QSDM/scripts/test_local_validator_updater_transaction_supervised.ps1",
+              "QSDM/scripts/test_qsdm_endpoint_reference_hosts.ps1",
+              "QSDM/scripts/test_treasury_signer_process_identity.ps1"
+            )) {
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                (Resolve-Path $script),
+                [ref]$null,
+                [ref]$errors
+              ) | Out-Null
+            }
+            if ($errors.Count) { throw ($errors | Out-String) }
+          '
+
+      # Short tests cover API, monitoring (NVIDIA-lock/HMAC), dashboard, etc. (no GPU required).
+      - name: Test (short, no CGO)
+        run: bash QSDM/scripts/go-test-short-no-cgo.sh
+
+  windows-validator-cgo-build:
+    name: Windows validator (CGO + SQLite)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - name: Install Windows CGO toolchain
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build and smoke-check native validator
+        shell: pwsh
+        working-directory: QSDM/source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msys2Root = '${{ steps.msys2.outputs.msys2-location }}'
+          $mingw = Join-Path $msys2Root 'ucrt64\bin'
+          $gcc = Join-Path $mingw 'gcc.exe'
+          if (-not (Test-Path -LiteralPath $gcc -PathType Leaf)) {
+            throw "MSYS2 UCRT64 gcc is unavailable at $gcc."
+          }
+          $env:PATH = "$mingw;$env:PATH"
+          $env:CC = $gcc
+          $env:CGO_ENABLED = '1'
+          $compiler = ((& $gcc --version 2>&1) | Select-Object -First 1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $compiler) {
+            throw 'MSYS2 UCRT64 gcc could not execute in PowerShell.'
+          }
+          Write-Host "Using $compiler"
+          $output = Join-Path $env:RUNNER_TEMP 'qsdm-validator.exe'
+          $ldflags = '-s -w -extldflags=-Wl,--stack,33554432'
+          & go build -trimpath -tags 'validator_only,dilithium_circl' -ldflags $ldflags -o $output .\cmd\qsdm
+          if ($LASTEXITCODE -ne 0) { throw "go build failed with exit code $LASTEXITCODE" }
+          $version = ((& $output --version 2>&1) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'qsdm-validator.exe --version failed' }
+          Write-Host $version
+          if ($version -notmatch '^qsdm dev ') {
+            throw "unexpected validator version output: $version"
+          }
+
+      - name: Test bounded local validator updater
+        shell: pwsh
+        run: |
+          $result = & .\QSDM\scripts\test_local_validator_updater.ps1 |
+            ConvertFrom-Json
+          if (-not $result.success) {
+            throw "Local validator updater harness did not pass."
+          }
+
+      - name: Test persisted bootstrap and reference-host safety
+        shell: pwsh
+        run: |
+          $bootstrapProfile = & .\QSDM\scripts\test_local_validator_bootstrap_profile.ps1 |
+            ConvertFrom-Json
+          if (-not $bootstrapProfile.success -or -not $bootstrapProfile.default_bootstrap_persisted) {
+            throw "Local validator bootstrap profile test did not pass."
+          }
+          $referenceHosts = & .\QSDM\scripts\test_qsdm_endpoint_reference_hosts.ps1 |
+            ConvertFrom-Json
+          if (-not $referenceHosts.success -or -not $referenceHosts.reference_sources_derived) {
+            throw "Endpoint reference host test did not pass."
+          }
+
+      - name: Test validator update role persistence
+        shell: pwsh
+        run: |
+          $result = & .\QSDM\scripts\test_local_validator_update_role_persistence.ps1 |
+            ConvertFrom-Json
+          if (-not $result.success -or -not $result.producer_argument_forwarded) {
+            throw "Validator update role persistence test did not pass."
+          }
+
+      - name: Test treasury signer stale PID protection
+        shell: pwsh
+        run: .\QSDM\scripts\test_treasury_signer_process_identity.ps1
+
+      - name: Test transactional local validator update and rollback
+        shell: pwsh
+        run: |
+          $output = & .\QSDM\scripts\test_local_validator_updater_transaction_supervised.ps1
+          $result = (($output -join "`n") -split "`r?`n") |
+            Where-Object { $_ -like '{*' } |
+            Select-Object -Last 1 |
+            ConvertFrom-Json
+          if (-not $result.success -or -not $result.rollback_succeeded) {
+            throw "Local validator updater transaction rehearsal did not pass."
+          }
+          $result | ConvertTo-Json -Compress
+
+  # Rust wasm_module + wazero validate_raw preflight (no CGO).
+  wasm-preflight-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build wasm_module
+        run: bash QSDM/scripts/build-wasm-module.sh
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - name: Test generated release-cache maintenance guardrails
+        shell: pwsh
+        run: pwsh -NoProfile -File QSDM/scripts/test_generated_cache_maintenance.ps1
+
+      - name: Go test (wasm preflight integration)
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "0"
+          QSDM_METRICS_REGISTER_STRICT: "1"
+          QSDM_WASM_PREFLIGHT_MODULE: ${{ github.workspace }}/QSDM/source/wasm_module/target/wasm32-unknown-unknown/release/wasm_module.wasm
+        run: |
+          unset CGO_CFLAGS CGO_LDFLAGS || true
+          go test ./pkg/wasm/... -count=1 -timeout 10m -run TestTryPreflightP2PTransactionJSON_rustWasmModule
+
+  wasm-preflight-smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build wasm_module
+        shell: bash
+        run: bash QSDM/scripts/build-wasm-module.sh
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - name: Go test (wasm preflight integration)
+        shell: bash
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "0"
+          QSDM_METRICS_REGISTER_STRICT: "1"
+          QSDM_WASM_PREFLIGHT_MODULE: ${{ github.workspace }}/QSDM/source/wasm_module/target/wasm32-unknown-unknown/release/wasm_module.wasm
+        run: |
+          unset CGO_CFLAGS CGO_LDFLAGS || true
+          go test ./pkg/wasm/... -count=1 -timeout 10m -run TestTryPreflightP2PTransactionJSON_rustWasmModule
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      # govulncheck does dataflow analysis on the ENTIRE module, which
+      # means it has to compile every package including the CGO-gated
+      # `pkg/crypto/dilithium.go` (imports `<oqs/oqs.h>`). Without
+      # liboqs on the build path the job dies before govulncheck gets
+      # a chance to report anything real:
+      #
+      #     pkg/crypto/dilithium.go:6:10: fatal error: oqs/oqs.h: No such file or directory
+      #
+      # Mirror the exact setup test-cgo-transaction uses below (shared
+      # cache key so we only build liboqs once per change to
+      # rebuild_liboqs.sh across the whole workflow).
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git libssl-dev
+
+      - name: Cache liboqs install
+        id: liboqs-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: QSDM/liboqs_install
+          key: liboqs-install-${{ runner.os }}-${{ hashFiles('QSDM/scripts/rebuild_liboqs.sh') }}
+
+      - name: Build liboqs
+        if: steps.liboqs-cache.outputs.cache-hit != 'true'
+        working-directory: QSDM
+        run: chmod +x scripts/rebuild_liboqs.sh && ./scripts/rebuild_liboqs.sh
+
+      - name: Run govulncheck (with allowlist filter)
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "1"
+          QSDM_METRICS_REGISTER_STRICT: "1"
+        # Delegates to QSDM/scripts/govulncheck-filter.sh, which:
+        #   - runs `govulncheck -json ./...`
+        #   - fails ONLY when a finding is NOT on the explicit
+        #     unfixable-upstream allowlist (today: GO-2024-3218 in
+        #     go-libp2p-kad-dht, which has Fixed in: N/A)
+        #   - surfaces any NEW OSV id loudly so drift breaks CI
+        # See the script header for the exact allowlist and rationale.
+        run: |
+          LIBOQS="${GITHUB_WORKSPACE}/QSDM/liboqs_install"
+          if [ -d "$LIBOQS/lib64" ]; then L="$LIBOQS/lib64"; else L="$LIBOQS/lib"; fi
+          export CGO_CFLAGS="-I${LIBOQS}/include"
+          export CGO_LDFLAGS="-L${L} -loqs"
+          export LD_LIBRARY_PATH="${L}:${LD_LIBRARY_PATH:-}"
+          bash "${GITHUB_WORKSPACE}/QSDM/scripts/govulncheck-filter.sh"
+
+  trivy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Trivy (filesystem — Go dependencies)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          scan-type: fs
+          scan-ref: QSDM/source
+          severity: CRITICAL
+          exit-code: "1"
+          vuln-type: os,library
+
+      - name: Trivy (filesystem — HIGH, non-blocking)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          scan-type: fs
+          scan-ref: QSDM/source
+          severity: HIGH
+          exit-code: "0"
+          vuln-type: os,library
+
+      - name: Trivy (misconfig — Dockerfile)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          scan-type: config
+          scan-ref: QSDM
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+          hide-progress: true
+
+  # PoE / Dilithium: build liboqs (cached) and run transaction package tests with real signatures.
+  test-cgo-transaction:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: QSDM
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git libssl-dev
+
+      - name: Cache liboqs install
+        id: liboqs-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: QSDM/liboqs_install
+          key: liboqs-install-${{ runner.os }}-${{ hashFiles('QSDM/scripts/rebuild_liboqs.sh') }}
+
+      - name: Build liboqs
+        if: steps.liboqs-cache.outputs.cache-hit != 'true'
+        run: chmod +x scripts/rebuild_liboqs.sh && ./scripts/rebuild_liboqs.sh
+
+      - name: Test CGO packages (liboqs)
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "1"
+          QSDM_METRICS_REGISTER_STRICT: "1"
+        run: |
+          LIBOQS="${GITHUB_WORKSPACE}/QSDM/liboqs_install"
+          if [ -d "$LIBOQS/lib64" ]; then L="$LIBOQS/lib64"; else L="$LIBOQS/lib"; fi
+          export CGO_CFLAGS="-I${LIBOQS}/include"
+          export CGO_LDFLAGS="-L${L} -loqs"
+          export LD_LIBRARY_PATH="${L}:${LD_LIBRARY_PATH:-}"
+          go test ./cmd/qsdm/transaction/... ./pkg/consensus/... ./pkg/crypto/... ./pkg/mesh3d/... ./cmd/migrate/... -count=1 -short -timeout 15m
+
+      - name: Test API mesh companion (CGO + wallet)
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "1"
+          QSDM_METRICS_REGISTER_STRICT: "1"
+          QSDM_PUBLISH_MESH_COMPANION: "1"
+        run: |
+          LIBOQS="${GITHUB_WORKSPACE}/QSDM/liboqs_install"
+          if [ -d "$LIBOQS/lib64" ]; then L="$LIBOQS/lib64"; else L="$LIBOQS/lib"; fi
+          export CGO_CFLAGS="-I${LIBOQS}/include"
+          export CGO_LDFLAGS="-L${L} -loqs"
+          export LD_LIBRARY_PATH="${L}:${LD_LIBRARY_PATH:-}"
+          go test ./pkg/api/... -count=1 -short -timeout 10m -run TestSendTransaction_meshCompanionSecondBroadcast
+
+  # Full pure-Go test suite.
+  #
+  # Before this job existed, CI ran exactly four narrow `go test`
+  # invocations, and an exhaustive grep for "go test" across
+  # .github/workflows found ZERO covering pkg/storage, pkg/networking,
+  # pkg/monitoring, pkg/chain, pkg/mining or internal/**. That left the
+  # large majority of the repo's ~92k LOC of tests non-gating: 82
+  # networking tests, both SQLite suites, the mTLS suite, the API
+  # versioning suite and the rate-limit suites could all go red without
+  # failing a single check, and pkg/api ran under a single -run filter.
+  #
+  # Uses the pure-Go ML-DSA-87 backend (-tags dilithium_circl) so the job
+  # needs no liboqs build and stays fast enough to gate every push. The
+  # CGO/liboqs job above still covers the cgo backend.
+  go-test-all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - name: Test all packages (pure-Go ML-DSA backend)
+        working-directory: QSDM/source
+        env:
+          CGO_ENABLED: "1"
+          QSDM_METRICS_REGISTER_STRICT: "1"
+        run: |
+          set -euo pipefail
+          go test -tags dilithium_circl ./... -count=1 -timeout 40m
+
+      # The Go SDK is a separate module (so `go get` can resolve it), which
+      # puts it outside the ./... above. Test it explicitly or it silently
+      # stops being covered.
+      - name: Test Go SDK module
+        working-directory: QSDM/source/sdk/go
+        run: |
+          set -euo pipefail
+          go test ./... -count=1 -timeout 10m
+
+      # The JavaScript SDK has no dependencies, so the runner's Node.js runs
+      # its node:test suite as is. Before this step it ran only when a
+      # release was published. It checks the QSDM-20 signing digests against
+      # the same vectors as the Go SDK (sdk/go/testdata).
+      - name: Test JavaScript SDK
+        working-directory: QSDM/source/sdk/javascript
+        run: |
+          set -euo pipefail
+          node --version
+          npm test
+
+  # Data race detector on hot pure-Go packages (slower than default job). Run via Actions → workflow_dispatch.
+  race-hot-packages:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: QSDM/source/go.mod
+
+      - name: Install C toolchain (race detector needs CGO)
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Race tests (short, CGO)
+        run: bash QSDM/scripts/race-hot-packages.sh
+
+  # Full image: liboqs + CGO qsdm (matches production Dockerfile). Local builds need a running Docker engine.
+  # Pushes to GHCR on default-branch push and on workflow_dispatch (not on pull_request).
+  docker-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # Fixed image name (avoids invalid OCI chars in repo names, e.g. '+').
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/qsdm
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push when allowed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: QSDM
+          file: QSDM/Dockerfile
+          push: ${{ github.event_name != 'pull_request' && (github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,440 @@
+# ============================================================
+# .gitignore for the CELLS workspace (public-repo-safe profile)
+#
+# This file is designed with publishing to a PUBLIC GitHub repo
+# in mind. The rule of thumb: if a file is internal development
+# breadcrumb, local operator tooling, or belongs to a different
+# project, it stays out of git — even though it still lives on
+# the operator's disk for their own use.
+#
+# Categories:
+#   1. Secrets & credentials — catastrophic if leaked
+#   2. Internal dev documents — fix memos, status notes, planning
+#   3. Local operator scripts (Windows PowerShell helpers)
+#   4. Projects unrelated to CELLS
+#   5. Build artifacts & runtime state
+#   6. Language / IDE / OS caches
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1) Secrets & credentials
+# ------------------------------------------------------------
+# VPS IP + root password. Primary SSH is ed25519; this file is a
+# break-glass fallback for the DO web console.
+vps.txt
+
+# Scratch commit-message buffer used for HEREDOC-free git commits
+# on Windows/PowerShell shells. The actual commit body lives in
+# git history; the buffer is throwaway. The patterns cover the
+# three conventions in active use across the project's tooling:
+#   _commit_msg.txt          underscore-prefix (legacy)
+#   _tmp_commit_msg.txt      underscore-prefix tmp variant
+#   .commit_msg*             dot-prefix family (e.g. ops automation
+#                            uses .commit_msg_docs.txt for scoped
+#                            commit drafts; observed leaking to
+#                            git status on 2026-05-18)
+#   .git_commit_msg.tmp      dot-prefix .tmp variant (assistant's)
+#   *_commit_msg.tmp         arbitrary-prefix .tmp variant
+_commit_msg.txt
+_tmp_commit_msg.txt
+.commit_msg*
+.git_commit_msg.tmp
+*_commit_msg.tmp
+
+# Local session evidence files emitted by ad-hoc verification runs
+# (govulncheck, syft, soak harnesses). Useful operator breadcrumbs
+# but never appropriate for the public tree.
+_session*_*.log
+_session*_*.json
+_session*_*.spdx.json
+
+# Runtime side effects of the `CELLS` server when the operator runs
+# a binary smoke-check (e.g. `CELLS.exe --version`) directly from the
+# repo root. Storage / governance / staking JSON, append-only NDJSON
+# logs, and the auto-generated challenge HMAC are local node state,
+# not source.
+CELLS_accounts.json
+CELLS_bridge_state.json
+CELLS_chain.ndjson
+CELLS_challenge_hmac.key
+CELLS_enrollment.json
+CELLS_governance.json
+CELLS_receipts.ndjson
+CELLS_staking.json
+
+# Root-level state emitted by the local validator/bridge when launched from the
+# workspace. Preserve these files for recovery and diagnostics, but never treat
+# them as source or release inputs.
+/CELLS.db
+/CELLS.db-journal
+/CELLS.db-wal
+/CELLS.db-shm
+/CELLS-validator.state.lock
+/CELLS_bridge_state.json.last-good
+/.CELLS_bridge_state.json.last-good.*.tmp
+
+# Legacy NVIDIA token file (pre-NGC-bundle era).
+Nvidia Token
+
+# NGC sidecar runtime envs (contain CELLS_NGC_INGEST_SECRET).
+**/ngc.env
+**/ngc.local.env
+
+# Generic .env files, except the committed *.env.example templates.
+*.env
+!*.env.example
+
+# Treasury runtime configuration contains signer bearer tokens. Keystores and
+# passphrase files must also remain outside source control.
+**/CELLS-treasury.json
+**/treasury/*.json
+**/treasury/*.passphrase
+**/treasury/*.token
+
+# TLS material used during early local testing. Production edge
+# certs live on the VPS, not here.
+CELLS/api_server.crt
+CELLS/api_server.key
+
+# Generic private-key / keystore extensions as a defensive net.
+*.pem
+*.p12
+*.pfx
+*.jks
+
+# Wallets, signer credentials, SSH keys, and encrypted custody archives. Public
+# wallet registries and funding plans use explicit names outside these patterns.
+*.key
+*.ppk
+*.token
+*.passphrase
+*.passphrase.*
+*.keystore
+*.keystore.json
+*.seed
+*.aes256
+**/wallet.json
+**/wallet-*.json
+**/signer.token
+**/*.signed.json
+**/*.unsigned.json
+**/ecosystem-wallets.private*.json
+**/credentials.json
+**/.npmrc
+**/.netrc
+**/.ssh/
+**/.aws/
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+
+# ------------------------------------------------------------
+# 2) Internal development documents
+#
+# These are engineering breadcrumbs (what we did, what broke, what
+# we fixed) that are useful locally but pollute a public repo.
+# User-facing docs (README, CHANGELOG, LICENSE, MIGRATION_GUIDE,
+# QUICK_START, and everything under CELLS/docs/) are kept.
+# ------------------------------------------------------------
+# Fix memos of the form *_FIX.md — every entry in the tracked tree
+# so far is a one-off post-mortem, not a user-facing doc.
+*_FIX.md
+**/*_FIX.md
+
+# Status / planning / handover notes.
+NEXT_STEPS.md
+**/NEXT_STEPS.md
+BUILD_STATUS.md
+PROJECT_STATUS.md
+STATUS.md
+SUCCESS.md
+READY_TO_START.md
+RESTART_INSTRUCTIONS.md
+PROJECT_STRUCTURE.md
+
+# Local-only build guides. The canonical build docs live in
+# CELLS/README.md and CELLS/docs/.
+BUILD_WINDOWS.md
+QUICK_BUILD.md
+
+# Superseded architecture draft from the pre-Major-Update era where
+# NVIDIA-lock was (incorrectly) framed as a consensus rule. The
+# current, correct architecture lives in
+# CELLS/docs/docs/NVIDIA_LOCK_CONSENSUS_SCOPE.md and the README.
+nvidia_locked_CELLS_blockchain_architecture.md
+
+# Token-system description that still uses stale "CELLS" branding
+# and whose main example is the external Greed Island game (a
+# separate project — see §4 below).
+CELLS/TOKEN_SYSTEM.md
+
+# Internal-only archive directory — 40+ fix/crash/phase-complete
+# memos from the pre-Major-Update era. Kept locally as a project
+# history, excluded from the public repo as "development documents".
+CELLS/docs/docs/archive/
+
+# Other dev-breadcrumb docs that slipped into CELLS/docs/docs/ itself:
+# anything ending in *_COMPLETE.md / *_FIXES_SUMMARY.md, and the
+# PHASE{N}_IMPLEMENTATION.md notes. User-facing docs (USER_GUIDE,
+# QUICK_START, API_REFERENCE, MINING_PROTOCOL, NODE_ROLES,
+# VALIDATOR_QUICKSTART, MINER_QUICKSTART, ROADMAP, etc.) stay.
+**/*_COMPLETE.md
+**/SECURITY_FIXES_SUMMARY.md
+**/PHASE[0-9]*_IMPLEMENTATION.md
+
+
+# ------------------------------------------------------------
+# 3) Local operator scripts (per-workstation helpers)
+#
+# These are Windows PowerShell one-shots for spinning a local dev
+# instance up/down. They are not part of the project's deploy
+# pipeline (CELLS/deploy/ and CELLS/scripts/ are), and they hard-code
+# paths that only make sense on one machine.
+# ------------------------------------------------------------
+OneClick-PlayAndTrain.ps1
+start-CELLS-local.ps1
+stop-CELLS-local.ps1
+/CELLS/restart.ps1
+/CELLS/setup.ps1
+
+# Private operator helpers belong in these directories or use a `.local.*` /
+# `.private.*` filename. The tracked secret scanner also rejects force-adding
+# these paths, so a local credential-bearing helper cannot silently become a
+# release input.
+/scripts/local/
+/scripts/private/
+/CELLS/scripts/local/
+/CELLS/scripts/private/
+/scripts/**/*.local.*
+/scripts/**/*.private.*
+/CELLS/scripts/**/*.local.*
+/CELLS/scripts/**/*.private.*
+
+
+# ------------------------------------------------------------
+# 4) Projects unrelated to the CELLS ledger
+#
+# The CELLS node exposes HTTP APIs that external apps (games, wallets,
+# front-ends) can call from their own repos. Those integration
+# scaffolds belong in those repos, not here.
+# ------------------------------------------------------------
+apps/game-integration/
+
+# Separate private repositories and local historical copies. These directories
+# may contain their own Git metadata, deployment credentials, or old secrets.
+/external/
+/Archived/
+/CELLS-source-office-copy-*/
+/CELLS-source-office-copy-*.zip
+
+
+# ------------------------------------------------------------
+# Agent-specific rules / tooling (not part of CELLS)
+# ------------------------------------------------------------
+# Cursor agent rule files live at .cursor/rules/*.mdc and configure
+# developer-side AI behaviour, not the ledger. Keep them local.
+.cursor/
+
+
+# ------------------------------------------------------------
+# Scratch files from interactive agent sessions
+# ------------------------------------------------------------
+_tmp_*
+**/_tmp_*
+
+
+# ------------------------------------------------------------
+# 5) Build artifacts
+# ------------------------------------------------------------
+# Go — Windows build output from local `go build`.
+*.exe
+*.exe~
+
+# Go — Linux/macOS binaries emitted into source dirs. Scoped by
+# path so we don't accidentally mask unrelated files of the same
+# name elsewhere in the tree.
+/CELLS/CELLS
+/CELLS/CELLSminer
+/CELLS/CELLSnode
+/CELLS/source/CELLS
+/CELLS/source/CELLS_local
+/CELLS/source/CELLSminer
+/CELLS/source/CELLSnode
+/CELLS/source/trustcheck
+
+# Go — test binaries / coverage dumps.
+*.test
+coverage.out
+*.cov
+*.coverprofile
+
+# Go — local tool/cache directories and editor/atomic-write leftovers
+# produced under the CELLS source tree during local verification.
+CELLS/source/.cache/
+CELLS/source/**/*.go.[0-9]*
+/CELLS/source/cmd/CELLS-edge-control/rsrc_windows_amd64.syso
+
+# Test runs write signed wallet transaction blobs here. They are generated
+# evidence, not fixtures, and can contain public keys and signatures.
+/CELLS/source/tests/test_data/
+/CELLS/source/tests/test_e2e_data/
+/CELLS/source/tests/test_node1_data/
+/CELLS/source/tests/test_node2_data/
+/CELLS/source/tests/test_stress_data/
+
+# CUDA kernel build artefacts produced by CELLS/scripts/build_kernels.ps1
+# (nvcc + gendef + dlltool). The only checked-in file is the .cu source;
+# every derived product below is regenerated from it per-host.
+CELLS/source/pkg/mesh3d/kernels/mesh3d_kernels.dll
+CELLS/source/pkg/mesh3d/kernels/mesh3d_kernels.lib
+CELLS/source/pkg/mesh3d/kernels/mesh3d_kernels.exp
+CELLS/source/pkg/mesh3d/kernels/mesh3d_kernels.def
+CELLS/source/pkg/mesh3d/kernels/libmesh3d_kernels.dll.a
+CELLS/source/pkg/mesh3d/kernels/libmesh3d_kernels.so
+CELLS/source/mesh3d_kernels.dll
+CELLS/source/libmesh3d_kernels.so
+
+# Rust (wasm_module/) — everything under Cargo's target/ is
+# regeneratable and is where the local tree's large .pdb/.rlib
+# accumulate.
+**/target/
+
+
+# ------------------------------------------------------------
+# Runtime state
+# ------------------------------------------------------------
+*.log
+
+# SQLite databases + WAL/journal sidecars produced by local runs.
+# The timestamped *.sql dumps under CELLS/databases/ are runtime
+# artefacts as well (see CELLS/databases/README.txt for context).
+CELLS/databases/*.db
+CELLS/databases/*.db-journal
+CELLS/databases/*.db-wal
+CELLS/databases/*.db-shm
+CELLS/databases/*_[0-9]*.sql
+CELLS/source/pkg/storage/*.db
+CELLS/source/pkg/storage/*.db-journal
+CELLS/source/pkg/storage/*.db-wal
+CELLS/source/pkg/storage/*.db-shm
+
+# Per-transaction storage blobs written by the local node.
+CELLS/storage/tx_*.dat
+
+
+# ------------------------------------------------------------
+# 6) Language / IDE / OS caches
+# ------------------------------------------------------------
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / JS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ------------------------------------------------------------
+# Ad-hoc deploy tarballs
+# ------------------------------------------------------------
+# remote_apply_paramiko.py packs the tree into a one-shot snapshot
+# it uploads and deletes. Interrupted runs can leave one behind.
+/CELLS-snapshot-*.tar.gz
+
+# ------------------------------------------------------------
+# Build artifacts (never check the binaries in)
+# ------------------------------------------------------------
+# Cross-compiled validator + reference miner. Both are
+# regeneratable from source via `go build ./cmd/CELLS` /
+# `go build ./cmd/CELLSminer` — checking them in would just
+# bloat the repo and risk an out-of-date binary shadowing the
+# source.
+/CELLS/source/CELLS-linux-amd64
+/CELLS/source/CELLS.linux-amd64
+/CELLS/source/CELLSminer.exe
+/CELLS/source/CELLS.exe
+/CELLS/source/CELLSminer-console.exe
+/CELLS/source/CELLSminer-linux-amd64
+/CELLS/source/CELLSminer-console-linux-amd64
+
+# Workspace-level cross-build output directory. Holds the
+# Linux + Windows artifacts produced by `go build -o bin/...`
+# during local deploys (e.g. before scp'ing to BLR1). Plus
+# whatever per-operator deploy templates the bring-up dance
+# produces (systemd drop-ins with HMAC keys, live-keyed
+# TOML allowlists, throwaway awk scripts, etc.). Anything
+# operationally interesting that should ship to other
+# operators belongs in CELLS/source/{cmd,docs,pkg,internal}
+# instead — `/bin/` is a build cache, not a publishable
+# location.
+/bin/
+
+# Local one-shot release-style staging directory.
+/dist/
+
+# A copied Electron runtime manifest can appear at the workspace root during
+# unpacking. The real Hive manifests live under apps/CELLS-hive/.
+/package.json
+
+# Cross-platform consumer release artifacts produced by
+# CELLS/scripts/build_release.ps1. Contains the per-platform
+# CELLSminer / CELLScli / CELLS-attester binaries plus
+# SHA256SUMS.txt and MANIFEST.json. Published manually to
+# https://CELLS.tech/releases/<tag>/ — checking the tarball
+# into git would bloat the repo (~150 MiB per release) and
+# create the same "stale binary shadows fresh source" risk
+# the per-target rules above guard against.
+/release/
+
+# Website and desktop packaging output. Release artifacts are published through
+# the release pipeline and must not be committed to source control.
+/CELLS/deploy/landing/downloads/
+/apps/CELLS-hive/CELLS-hive-main/native/
+/apps/CELLS-hive/CELLS-hive-main/release/build-*/
+/apps/CELLS-edge-agent/*
+!/apps/CELLS-edge-agent/README.md
+!/apps/CELLS-edge-agent/VERSION
+
+# Stderr captures from local repro runs.
+*.err
+
+# ------------------------------------------------------------
+# Local one-shot deploy/operator scripts
+# ------------------------------------------------------------
+# .deploy_stagev.sh is the atomic-swap helper used during
+# Phase 2c-v bring-up; it embeds a small operator workflow
+# (backup → swap → restart → watchdog → rollback) that's
+# specific to BLR1's filesystem layout. Kept out of the
+# public repo because it would mislead operators of other
+# CELLS nodes who have a different /opt layout.
+/.deploy_stagev.sh
+
+# Throwaway PowerShell helpers used during local repro / debug.
+# These accrete and are usually superseded within hours.
+/.cache/
+
+# session 87 (2026-05-12): local cross-compile output for ad-hoc deploys
+_build/
+# session 100 (2026-05-14): local cross-compile output for v0.4.x BLR1 deploys
+/.deploy/

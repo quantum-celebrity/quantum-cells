@@ -1,0 +1,79 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: CELLS-service
+  namespace: CELLS
+  labels:
+    app: CELLS
+spec:
+  type: ClusterIP
+  ports:
+  - name: network
+    port: 4001
+    targetPort: network
+    protocol: TCP
+  - name: api
+    port: 8080
+    targetPort: api
+    protocol: TCP
+  - name: dashboard
+    port: 8081
+    targetPort: dashboard
+    protocol: TCP
+  - name: logviewer
+    port: 9000
+    targetPort: logviewer
+    protocol: TCP
+  selector:
+    app: CELLS
+    component: node
+  clusterIP: None  # Headless service for StatefulSet
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: CELLS-dashboard
+  namespace: CELLS
+  labels:
+    app: CELLS
+    component: dashboard
+spec:
+  # ClusterIP, not LoadBalancer. On most cloud providers LoadBalancer
+  # provisions a public IP routing straight to the dashboard. That was
+  # only ever non-public if the cluster's CNI enforces the default-deny
+  # NetworkPolicy in networkpolicy.yaml -- and that file's own header warns
+  # the vanilla kindnet CNI does not enforce it, so the manifest validates
+  # but does nothing at runtime. Reaching the dashboard from outside the
+  # cluster should be an explicit choice: kubectl port-forward, an Ingress
+  # with authentication, or changing this back deliberately.
+  type: ClusterIP
+  ports:
+  - name: dashboard
+    port: 8081
+    targetPort: dashboard
+    protocol: TCP
+  selector:
+    app: CELLS
+    component: node
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: CELLS-api
+  namespace: CELLS
+  labels:
+    app: CELLS
+    component: api
+spec:
+  type: LoadBalancer
+  ports:
+  - name: api
+    port: 8080
+    targetPort: api
+    protocol: TCP
+  selector:
+    app: CELLS
+    component: node
+

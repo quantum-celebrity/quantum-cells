@@ -1,0 +1,302 @@
+package chain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// EvidenceType categorizes consensus faults.
+type EvidenceType string
+
+const (
+	EvidenceEquivocation EvidenceType = "equivocation"
+	EvidenceInvalidVote  EvidenceType = "invalid_vote"
+	// EvidenceForkWitness records conflicting full blocks at the same height (no validator slash).
+	EvidenceForkWitness EvidenceType = "fork_witness"
+)
+
+// ConsensusEvidence represents slashing evidence for a validator.
+type ConsensusEvidence struct {
+	Type        EvidenceType `json:"type"`
+	Validator   string       `json:"validator"`
+	Height      uint64       `json:"height"`
+	Round       uint32       `json:"round"`
+	BlockHashes []string     `json:"block_hashes,omitempty"`
+	Details     string       `json:"details,omitempty"`
+	Timestamp   time.Time    `json:"timestamp"`
+
+	// Proof, when present, cryptographically establishes equivocation by
+	// exhibiting two conflicting authenticated votes from the accused.
+	// Without it, equivocation evidence is only an assertion: the fields
+	// above name a validator and two hashes but bind neither to that
+	// validator's key. See evidence_proof.go.
+	Proof *EquivocationProof `json:"proof,omitempty"`
+}
+
+// EvidenceRecord stores processed evidence and outcome.
+type EvidenceRecord struct {
+	ID         string             `json:"id"`
+	Evidence   ConsensusEvidence  `json:"evidence"`
+	Processed  bool               `json:"processed"`
+	SlashEvent *SlashEvent        `json:"slash_event,omitempty"`
+	Error      string             `json:"error,omitempty"`
+	ProcessedAt time.Time         `json:"processed_at,omitempty"`
+}
+
+// EvidenceManager handles evidence deduplication, persistence-in-memory, and slashing.
+type EvidenceManager struct {
+	mu      sync.RWMutex
+	vs      *ValidatorSet
+	staking *StakingLedger
+	records map[string]*EvidenceRecord
+	order   []string
+}
+
+// SubmitEvidenceBestEffort runs Process and ignores duplicate-evidence errors (for gossip-driven paths).
+func (em *EvidenceManager) SubmitEvidenceBestEffort(ev ConsensusEvidence) {
+	if em == nil {
+		return
+	}
+	_, err := em.Process(ev)
+	if err == nil {
+		return
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "duplicate evidence") {
+		return
+	}
+}
+
+// NewEvidenceManager creates evidence handler bound to validator set.
+func NewEvidenceManager(vs *ValidatorSet) *EvidenceManager {
+	return &EvidenceManager{
+		vs:      vs,
+		records: make(map[string]*EvidenceRecord),
+	}
+}
+
+// SetStakingLedger optionally ties delegated stake to consensus slashing.
+func (em *EvidenceManager) SetStakingLedger(sl *StakingLedger) {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	em.staking = sl
+}
+
+// Process validates and applies evidence, including automatic slashing.
+func (em *EvidenceManager) Process(ev ConsensusEvidence) (*EvidenceRecord, error) {
+	if ev.Timestamp.IsZero() {
+		ev.Timestamp = time.Now()
+	}
+	id := evidenceID(ev)
+
+	em.mu.Lock()
+	if existing, ok := em.records[id]; ok {
+		em.mu.Unlock()
+		return existing, fmt.Errorf("duplicate evidence: %s", id)
+	}
+	rec := &EvidenceRecord{ID: id, Evidence: ev}
+	em.records[id] = rec
+	em.order = append(em.order, id)
+	em.mu.Unlock()
+
+	if err := validateEvidence(ev); err != nil {
+		em.mu.Lock()
+		rec.Error = err.Error()
+		rec.ProcessedAt = time.Now()
+		em.mu.Unlock()
+		return rec, err
+	}
+
+	if ev.Type == EvidenceForkWitness {
+		em.mu.Lock()
+		rec.Processed = true
+		rec.ProcessedAt = time.Now()
+		em.mu.Unlock()
+		return rec, nil
+	}
+
+	reason := SlashInvalidBlock
+	if ev.Type == EvidenceEquivocation {
+		reason = SlashDoubleSign
+	}
+	slashEvent, err := em.vs.Slash(ev.Validator, reason)
+
+	em.mu.RLock()
+	sl := em.staking
+	em.mu.RUnlock()
+	if err == nil && sl != nil {
+		cfg := DefaultValidatorSetConfig()
+		frac := cfg.SlashFraction
+		if reason == SlashDowntime {
+			frac = cfg.DowntimeSlash
+		}
+		sl.SlashDelegated(ev.Validator, frac)
+	}
+
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	rec.Processed = err == nil
+	rec.ProcessedAt = time.Now()
+	if err != nil {
+		rec.Error = err.Error()
+		return rec, err
+	}
+	rec.SlashEvent = slashEvent
+	return rec, nil
+}
+
+// Get returns processed evidence record by ID.
+func (em *EvidenceManager) Get(id string) (*EvidenceRecord, bool) {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	r, ok := em.records[id]
+	return r, ok
+}
+
+// List returns all evidence records in insertion order.
+func (em *EvidenceManager) List() []EvidenceRecord {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	out := make([]EvidenceRecord, 0, len(em.order))
+	for _, id := range em.order {
+		if r, ok := em.records[id]; ok {
+			out = append(out, *r)
+		}
+	}
+	return out
+}
+
+// Stats returns summary counts.
+func (em *EvidenceManager) Stats() map[string]int {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	stats := map[string]int{"total": len(em.records), "processed": 0, "failed": 0}
+	for _, r := range em.records {
+		if r.Processed {
+			stats["processed"]++
+		} else if r.Error != "" {
+			stats["failed"]++
+		}
+	}
+	return stats
+}
+
+func validateEvidence(ev ConsensusEvidence) error {
+	if ev.Type != EvidenceForkWitness && ev.Validator == "" {
+		return fmt.Errorf("validator is required")
+	}
+	switch ev.Type {
+	case EvidenceEquivocation:
+		if len(ev.BlockHashes) < 2 {
+			return fmt.Errorf("equivocation evidence requires at least 2 block hashes")
+		}
+		seen := map[string]bool{}
+		for _, h := range ev.BlockHashes {
+			seen[h] = true
+		}
+		if len(seen) < 2 {
+			return fmt.Errorf("equivocation requires conflicting block hashes")
+		}
+		// A supplied proof is ALWAYS verified — the only reason to attach
+		// one is to be checked, so an invalid proof is a hard rejection
+		// regardless of whether proofs are mandatory.
+		if ev.Proof != nil {
+			if err := ev.Proof.Verify(ev.Validator); err != nil {
+				return err
+			}
+			// Verify shows the exhibits are a genuine equivocation; it says
+			// nothing about the envelope wrapped around them. Without this
+			// one proof replays under arbitrary height/round/hashes.
+			if err := ev.Proof.VerifyBinding(ev); err != nil {
+				return err
+			}
+		} else if evidenceProofRequiredAt(ev.Height) {
+			return ErrEvidenceProofMissing
+		}
+	case EvidenceInvalidVote:
+		// Rejected outright. This is not a hardening of the previous check;
+		// the accusation is unprovable as specified, so there is nothing to
+		// harden.
+		//
+		// What it used to do: the entire validation was `Details != ""`. A
+		// non-empty string then reached Process, which calls
+		// vs.Slash(ev.Validator, SlashInvalidBlock) -- taking SlashFraction
+		// (5%) of the accused's stake, jailing them -- and
+		// sl.SlashDelegated(ev.Validator, frac), destroying 5% of their
+		// delegators' stake too. Evidence arrives over gossip
+		// (EvidenceGossipIngress.HandlePeerMessage), which checks peer bans,
+		// dedupe and a per-peer rate limit but performs NO signature
+		// verification. So any peer could destroy any validator's stake by
+		// sending {"type":"invalid_vote","validator":"<victim>","details":"x"}.
+		//
+		// It was also repeatable without bound: evidenceID hashes Details, so
+		// changing one character yields a fresh ID that defeats dedupe, and
+		// Slash refuses only ValidatorExited -- so a jailed validator can be
+		// slashed again. N messages leave stake * 0.95^N.
+		//
+		// Why rejection rather than requiring a proof. ConsensusEvidence.Proof
+		// is an *EquivocationProof, and its Verify establishes equivocation
+		// specifically: two conflicting signed votes at one height and round.
+		// It cannot express "this validator cast an invalid vote", so
+		// demanding it here would require proving a different offence.
+		//
+		// Nor is the type in use: EvidenceInvalidVote has no producer anywhere
+		// in non-test code. The only submitter is bft_executor.go, which
+		// reports EvidenceEquivocation with real conflicting hashes. So
+		// rejecting removes no capability -- it removes an attack.
+		//
+		// An invalid vote IS provable in principle, by exhibiting the accused's
+		// own signed message alongside the rule it violates (a precommit
+		// against a held lock, say). That needs a new exhibit type and its own
+		// verifier, mirroring EquivocationProof. Until someone builds it,
+		// accepting the bare accusation is strictly worse than accepting
+		// nothing.
+		return ErrEvidenceInvalidVoteUnprovable
+	case EvidenceForkWitness:
+		if ev.Details == "" {
+			return fmt.Errorf("fork_witness requires details")
+		}
+		if len(ev.BlockHashes) < 2 {
+			return fmt.Errorf("fork_witness requires two block hashes")
+		}
+		seen := map[string]bool{}
+		for _, h := range ev.BlockHashes {
+			seen[h] = true
+		}
+		if len(seen) < 2 {
+			return fmt.Errorf("fork_witness requires two distinct block hashes")
+		}
+	default:
+		return fmt.Errorf("unsupported evidence type: %s", ev.Type)
+	}
+	return nil
+}
+
+// StableEvidenceID returns the canonical deduplication ID for evidence (wire + gossip).
+func StableEvidenceID(ev ConsensusEvidence) string {
+	return evidenceID(ev)
+}
+
+func evidenceID(ev ConsensusEvidence) string {
+	hashes := append([]string(nil), ev.BlockHashes...)
+	sort.Strings(hashes)
+	// Proof-carrying evidence is identified by the OFFENCE, not by the
+	// envelope around it. VerifyBinding already forces Height, Round and
+	// BlockHashes to match the signed votes, but Details is free-form and
+	// unbindable -- there is nothing in a signature that could commit to a
+	// human-readable note. Including it would let one genuine proof mint
+	// unlimited distinct IDs by varying a comment, defeating dedupe at both
+	// the gossip and manager layers and slashing the accused once per variant.
+	if ev.Proof != nil {
+		data := fmt.Sprintf("%s|%s|%s", ev.Type, ev.Validator, ev.Proof.fingerprint())
+		sum := sha256.Sum256([]byte(data))
+		return hex.EncodeToString(sum[:])
+	}
+	data := fmt.Sprintf("%s|%s|%d|%d|%v|%s", ev.Type, ev.Validator, ev.Height, ev.Round, hashes, ev.Details)
+	sum := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(sum[:])
+}

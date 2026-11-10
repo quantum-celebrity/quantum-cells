@@ -1,0 +1,550 @@
+# CELLS Operator Guide — end-to-end wiki
+
+> **Audience.** You want to run something on the CELLS network — a
+> validator, a miner, or both — and you want one page that stitches
+> together all of the existing reference docs in the order you'll
+> actually meet them.
+>
+> **Scope.** Public pilot network (pre-mainnet) today, with one block
+> producer run by the project. Mainnet only after the gates in
+> [`TREASURY_POLICY.md` §9](./TREASURY_POLICY.md#9-mainnet-release-gates)
+> close, including a published security review (today an open
+> [community review with a bug bounty](./COMMUNITY_REVIEW.md); no
+> independent audit has been completed). This
+> guide never promises mainnet earnings; both difficulty and the block
+> reward are moving targets documented in
+> [`CELL_TOKENOMICS.md`](./CELL_TOKENOMICS.md). For the live state of the
+> network, see [Network status](NETWORK_STATUS.md).
+
+---
+
+## 0. The 60-second map
+
+Before picking hardware, make sure you understand the shape of the
+network. The single biggest source of confusion from new operators is
+the assumption that "connecting to CELLS" means "connecting to our
+reference server." It doesn't.
+
+### 0.1 CELLS is a peer-to-peer mesh
+
+CELLS runs on **libp2p + GossipSub**. Every validator is a full peer;
+there is no central server that holds the chain. The ledger is
+replicated byte-for-byte across every validator that has finished its
+initial sync.
+
+> **Today (pilot network):** the design above is the target. Right now the
+> chain is produced by one block producer run by the project, with a
+> backup node following it, and `GET /api/v1/status` may report `peers: 0`.
+> Independent validators are on the roadmap; running one is how you help
+> get there.
+
+```
+                 ┌─────────────────────────────────────────────┐
+                 │     The CELLS validator mesh (libp2p)        │
+                 │                                             │
+  [Your new     ───►  [Seed validator]       ◄──►  [Peer B]     │
+   validator]        (bootstrap only — NOT                      │
+                      a central server)                         │
+                          ▲        ▲                            │
+                          │        │                            │
+                        [Peer C] [Peer D]                       │
+                 │                                             │
+                 └─────────────────────────────────────────────┘
+                                  ▲
+                                  │  HTTPS /api/v1/mining/work
+                  ┌───────────────┼───────────────┐
+                  │               │               │
+             [Your miner]   [Another miner]  [Pool op.]
+             (home rig, GPU — talks to ONE validator over HTTPS)
+```
+
+### 0.2 What about `api.CELLS.tech`?
+
+`https://api.CELLS.tech/` is the reference deployment we operate. Right now:
+
+1. **A public P2P peer since 2 November 2026.** The producer's libp2p
+   port (`4001`) accepts connections from the internet:
+   `/ip4/194.233.65.156/tcp/4001/p2p/12D3KooWHT2APYkMStuaiLZvto7ZmrPmUag4TStT7MryGn69feum`.
+   It limits connections and streams and answers block requests within a
+   budget (one per peer every 2 s, 2 per second in total), so catch up over
+   HTTPS (`CELLS_CHAIN_SYNC_URLS`, see [Run a full node](RUN_A_FULL_NODE.md))
+   rather than by P2P block requests alone. It is the only public peer.
+   Anyone can run a full node that verifies every block and follows the
+   chain over HTTPS ([Run a full node](RUN_A_FULL_NODE.md), since
+   19 October 2026). Block production by miners is the next step on the
+   [`ROADMAP.md`](./ROADMAP.md); [`NODE_ROLES.md` §3.2](./NODE_ROLES.md)
+   describes the multi-validator design.
+2. **Public REST endpoint.** Miners, wallets, and Hive call
+   `/api/v1/*` on this hostname. Anyone can stand up their own
+   validator, publish a competing REST hostname, and point traffic at
+   it — the protocol has no preference.
+
+If `api.CELLS.tech` went offline tomorrow, the outcome depends on the
+individual node:
+
+- A validator that already has live peer sessions can continue processing the
+  blocks it receives from those peers.
+- A follower whose only chain-sync URL is the reference server will lose
+  catch-up and may have zero peers. It does not automatically become a block
+  producer.
+- Hive, miners, and websites configured only with the reference server endpoint will not
+  automatically discover a replacement API. They need an alternate trusted
+  endpoint configured in advance.
+
+Therefore the current deployment is a peer-to-peer network with a single
+reference server, not automatic high availability. A reference-server outage does not erase
+local state, but it can make a follower stale and can stop clients that have no
+alternate endpoint.
+
+To operate independently of the reference server, prepare at least one additional validator that
+is outside the reference server's failure domain. Give this machine both of the following in
+its persisted network profile:
+
+1. An independent libp2p multiaddr in `bootstrap_peers`.
+2. An independent HTTPS API in `CELLS_CHAIN_SYNC_URLS`.
+
+Keep the machine in `network-follower` mode until it has caught up and reports
+at least one live peer. Public P2P also requires an inbound TCP `4001` path
+through the router, firewall, or a trusted relay. A private address such as
+`192.168.x.x` is not an internet address, and carrier-grade NAT may make
+inbound forwarding impossible.
+
+When CGNAT is outside your control, use the home-gateway fallback instead of
+continuing router retries. On Windows, `scripts/enable_cgnat_fallback.ps1`
+records `connectivityMode: relay-fallback`, starts the read-only outbound
+gateway, and lets the verifier report fallback readiness separately from full
+independence from the reference server. This is a public service fallback, not a producer failover
+mechanism.
+
+Promotion is a separate, manual incident procedure. Stop and fence the
+current producer first, verify this node's chain tip and signer configuration,
+then promote exactly one network producer. Do not enable solo mode and do not
+promote two nodes at once: this codebase does not yet provide quorum-based
+leader election or automatic split-brain prevention.
+### 0.3 Where miners fit
+
+Miners do **not** join the libp2p mesh. They speak plain HTTPS to one
+validator's `/api/v1/mining/work` endpoint
+([`MINING_PROTOCOL.md`](./MINING_PROTOCOL.md)). Choose a validator the
+same way you'd choose an upstream in any mining pool:
+
+- Pick a validator with a reliable API endpoint (`/api/v1/status`
+  returns `200` and `chain_tip` is advancing).
+- Pick a validator whose operator you trust not to withhold your
+  ACCEPTED proofs or front-run them.
+- Geographic proximity helps with the 6-block grace window
+  ([`MINING_PROTOCOL.md §9`](./MINING_PROTOCOL.md)).
+
+---
+
+## 1. Pick your role
+
+CELLS has exactly two node roles. They never overlap in a single
+process — see [`NODE_ROLES.md`](./NODE_ROLES.md) for the full
+rationale.
+
+| You want to… | Run this | Hardware | Reward |
+|---|---|---|---|
+| Secure the chain (not yet open on the pilot network) | **Validator** | CPU-only VPS | Transaction fees once independent validators produce blocks; fees are burned today |
+| Mint new Cell supply | **Miner** | NVIDIA GPU (see §3) | Newly-issued Cell per block |
+| Do both | **Two separate machines** running two separate binaries | 1 × CPU VPS + 1 × GPU rig | Both |
+
+There is no "full node" that does both in one process. Config
+validation and a startup guard reject the combination — this is
+intentional, see [`NODE_ROLES.md §2`](./NODE_ROLES.md).
+
+---
+
+## 2. Validator path — CPU-only
+
+### 2.1 Hardware
+
+- **4–8 vCPU**, 8–16 GB RAM, 200 GB NVMe, 1 Gbps symmetric.
+- Ubuntu 24.04 LTS is the reference OS. Windows 10+ works; macOS is in
+  development.
+- **No GPU.** Validator builds (`ghcr.io/blackbeardone/CELLS-validator:<version>`, or `-tags
+  validator_only` from source) do not link CUDA — a validator binary
+  literally cannot run the mining path.
+- Any mainstream VPS provider works (DigitalOcean, Hetzner, OVH, AWS
+  Lightsail, etc.). Budget: roughly US$20–40/month.
+
+### 2.2 Install & bootstrap
+
+Follow [`VALIDATOR_QUICKSTART.md`](./VALIDATOR_QUICKSTART.md)
+end-to-end. The critical bits:
+
+1. Drop a `config.toml` with your desired `node.address`,
+   `api.port = 8080`, `network.port = 4001`.
+2. `bootstrap_peers`: since 2 November 2026 the producer behind
+   `api.CELLS.tech` is a public peer:
+   `/ip4/194.233.65.156/tcp/4001/p2p/12D3KooWHT2APYkMStuaiLZvto7ZmrPmUag4TStT7MryGn69feum`.
+   It answers block requests within a budget (one per peer every 2 s), so
+   keep `CELLS_CHAIN_SYNC_URLS` for catching up. It is the only public
+   peer; full nodes follow the chain over HTTPS
+   ([Run a full node](RUN_A_FULL_NODE.md)), and block production by miners
+   is the next step (see [`ROADMAP.md`](./ROADMAP.md)).
+   You can add nodes you operate yourself (see §2.3).
+3. Start `CELLS-validator` under systemd, expose `:4001/tcp` to the
+   internet, put Caddy in front of `:8080` for TLS.
+4. Watch `/api/v1/status`. `connected_peers > 0` appears once your node
+   connects to another node: the producer, or one you run.
+
+### 2.3 Running a second validator yourself
+
+If you already operate one validator and want to add a second one for
+redundancy or for running against a sovereign fork, use the helper
+script:
+
+```bash
+sudo bash CELLS/deploy/bring-up-validator.sh \
+  --bootstrap /ip4/<your-first-node-ip>/tcp/4001/p2p/<your-first-node-peer-id>
+```
+
+This is the same systemd shape as
+`VALIDATOR_QUICKSTART.md` but skips manual config editing.
+
+### 2.4 Optional: NGC attestation transparency badge
+
+You do not need a GPU to run a validator. You also do not need
+NVIDIA NGC attestation to run a validator. If, however, you want the
+"Attested" badge on the public [trust page](https://CELLS.tech/trust.html)
+as a transparency signal, run the attestation sidecar — see §4.
+
+---
+
+## 3. Miner path — GPU-accelerated
+
+### 3.1 Do I *need* an NVIDIA GPU?
+
+Yes. The live network accepts only v2 proofs with NVIDIA attestation, so
+CPU-only miners cannot earn rewards.
+
+### 3.2 Performance tiers
+
+The numbers below are **qualitative tiers**, not benchmark commits.
+Actual hashrate depends on the GPU model, driver version, and
+power/thermal budget. They are not an earnings estimate.
+
+| Tier | Hardware | Relative hashrate | Practical use | NGC attestation eligible? |
+|---|---|---|---|---|
+| **Reference CPU** | Any x86-64 with Go 1.25+, no GPU | Not accepted on the live network | Protocol conformance and self-test only | No (no GPU to attest) |
+| **Entry NVIDIA (RTX 3050 / 3060)** | CUDA 11+, NVIDIA Container Toolkit | Entry | Home miner | **Yes (free NGC tier)** |
+| **Mid-range NVIDIA (RTX 3080 / 4070)** | CUDA 11+ | Higher | Dedicated home miner | **Yes (free NGC tier)** |
+| **High-end NVIDIA (RTX 4090 / H100-class)** | CUDA 12+ | Highest | Rack-grade | **Yes (free NGC tier)** |
+
+Mining requires an NVIDIA GPU (Turing or newer); see [Mining today](MINING_TODAY.md).
+
+### 3.3 NVIDIA attestation
+
+- **Mining proofs require NVIDIA attestation.** The live network
+  reports the accepted attestation types in
+  `mining.attestation_types_required` on `GET /api/v1/status`.
+- **Attestation is free on NVIDIA hardware.** NGC CLI API keys are
+  free at [ngc.nvidia.com/setup](https://ngc.nvidia.com/setup) — you
+  do **not** need NVIDIA AI Enterprise or any paid plan. See §4.
+- **Trust-page badge visibility.** Attested miners show up in the
+  public [trust summary](https://CELLS.tech/trust.html) as a
+  cryptographic transparency signal tied to their specific silicon.
+
+### 3.4 Install & run
+
+**Recommended:** install CELLS Hive 1.4.22 and run the Miner task; see
+[Mining today](MINING_TODAY.md) and
+[Downloads and verification](DOWNLOADS_AND_VERIFICATION.md). Hive 1.4.22
+signs miner operator actions automatically.
+
+The command-line miners below are operator and conformance tools that
+are being retired in favour of Hive. For them, follow
+[`MINER_QUICKSTART.md`](./MINER_QUICKSTART.md) end-to-end. Two
+command-line miner binaries ship in-tree — pick one:
+
+- **`CELLSminer-console`** — for command-line operators. Interactive
+  first-run wizard asks for your reward address and validator URL,
+  persists the answer to `~/.CELLS/miner.toml` (Windows:
+  `%USERPROFILE%\.CELLS\miner.toml`), then opens a live console panel
+  showing hashrate, accepted/rejected proofs, current epoch, and
+  uptime. Auto-falls back to one-line-per-event logs under
+  `systemd` / `journalctl` / CI (`--plain` forces log mode on a TTY).
+  See [`MINER_QUICKSTART.md §2.5`](./MINER_QUICKSTART.md#25-friendly-console-miner-recommended-for-home-operators).
+- **`CELLSminer`** — the minimal single-file reference miner. Use
+  this if you are conformance-testing against `MINING_PROTOCOL.md` or
+  embedding the miner in your own tooling; the binary is intentionally
+  flag-driven with no TUI so it remains readable top-to-bottom against
+  the spec.
+
+Either way:
+
+1. `git clone https://github.com/blackbeardONE/CELLS.git && cd
+   CELLS/source`.
+2. `go build -o CELLSminer-console ./cmd/CELLSminer-console` (or swap
+   in `./cmd/CELLSminer` for the reference binary).
+3. `./CELLSminer-console --self-test` (or `./CELLSminer --self-test`) —
+   passes in <10 s on any laptop. This is the Phase 4.5 acceptance
+   gate; if it fails, stop and open an issue. CI runs both self-tests
+   on every push, so a green build means your binary is protocol-
+   conformant if rebuilt from the same tag.
+4. Point at a validator:
+
+   ```bash
+   # Console front-end (zero flags — wizard prompts you):
+   ./CELLSminer-console
+
+   # Reference binary (explicit flags — recommended under systemd):
+   ./CELLSminer \
+     --validator=https://api.CELLS.tech \
+     --address=CELLS1<your-reward-address> \
+     --batch-count=1
+   ```
+
+   For production, run under systemd using the unit file in
+   [`MINER_QUICKSTART.md §3.3`](./MINER_QUICKSTART.md).
+
+Pre-built, signed binaries for both miners ship on every tagged
+release as `CELLSminer-<os>-<arch>[.exe]` and
+`CELLSminer-console-<os>-<arch>[.exe]` on the GitHub Releases page, with
+a consolidated `SHA256SUMS` file. If you do not want to install a Go
+toolchain, grab the matching asset, verify the hash, and run the
+binary directly.
+
+> ⚠️ Mining requires an NVIDIA GPU (Turing or newer); see
+> [Mining today](MINING_TODAY.md). The `v2` protocol is active on the
+> live pilot network, so proofs from CPU-only miners are not accepted.
+> The previous "one-command install" scripts
+> (`install-CELLSminer-console.sh`, `install-CELLSminer-console.ps1`) and
+> the `ghcr.io/<owner>/CELLS-miner-console` Docker image have been
+> withdrawn.
+
+Every release artefact accepts `--version` and prints a single line
+identifying itself, e.g.:
+
+```text
+CELLSminer-console v0.1.0 (abc1234, 2026-04-22T10:00:00Z, go1.25.9, linux/amd64)
+```
+
+Include this line in any bug report. Binaries built locally from source
+show `dev` / `unknown` for tag, SHA, and build date — that is the
+expected signal that the binary did not come from the release pipeline.
+
+### 3.5 Monitoring
+
+The miner exposes `CELLS_miner_*` Prometheus metrics (with
+`CELLS_miner_*` dual-emitted during the deprecation window per
+[`REBRAND_NOTES.md`](./REBRAND_NOTES.md)). Validator-side you'll see
+your accepted proofs in `/api/v1/mining/recent-proofs` and — if
+you turn on NGC attestation — in `/api/v1/trust/attestations/recent`.
+
+---
+
+## 4. NGC attestation — free NVIDIA tier
+
+> **TL;DR.** If you have any NVIDIA GPU and a free NGC account, you
+> can publish signed proofs that tie your node to specific silicon.
+> It is a transparency badge, not a consensus requirement.
+
+### 4.1 What it buys you
+
+- An entry in `/api/v1/trust/attestations/recent` with your node-id,
+  coarse region, GPU arch, and a freshness timestamp.
+- An "Attested" count on the public [trust widget](https://CELLS.tech/trust.html).
+- Optional strictness: with `nvidia_lock_gate_p2p=true` set on your
+  **own** validator, you can refuse libp2p transactions from
+  non-attested peers on your own node's ingress. This is a local
+  policy, not a network rule — see
+  [`NVIDIA_LOCK_CONSENSUS_SCOPE.md`](./NVIDIA_LOCK_CONSENSUS_SCOPE.md).
+
+### 4.2 What it does **not** buy you
+
+- Consensus votes.
+- Fee priority.
+- Mining priority.
+- Block rewards.
+
+The protocol never rejects a block or a transaction for a missing NGC
+bundle. Mining proofs are different: on the live network, v2 mining
+proofs must carry NVIDIA attestation (see
+`mining.attestation_types_required` on `GET /api/v1/status`). See
+[`NVIDIA_LOCK_CONSENSUS_SCOPE.md`](./NVIDIA_LOCK_CONSENSUS_SCOPE.md)
+for the enforcement table.
+
+### 4.3 Free NGC tier is enough
+
+- Sign up at [ngc.nvidia.com/setup](https://ngc.nvidia.com/setup) —
+  free account, free API key.
+- The sidecar image `nvcr.io/nvidia/pytorch:*-py3` is on the public
+  NGC catalog — free to pull.
+- NVIDIA Container Toolkit (driver-side host install) — free.
+
+You never need a paid NVIDIA AI Enterprise subscription to
+participate in attestation transparency.
+
+### 4.4 Run it
+
+Follow [`../apps/CELLS-nvidia-ngc/QUICKSTART.md`](../../../apps/CELLS-nvidia-ngc/QUICKSTART.md).
+Five steps, ~10 minutes on a live node:
+
+1. Generate a shared ingest secret (`openssl rand -hex 32`).
+2. Turn ingest ON on your validator (`CELLS_NGC_INGEST_SECRET=…`
+   in the systemd drop-in, then `systemctl restart`).
+3. Fill `ngc.env` with your NGC CLI API key + the same secret.
+4. `docker compose up -d` — the sidecar posts bundles every
+   ~60 s.
+5. `curl https://<your-validator>/api/v1/trust/attestations/recent`
+   should show your node-id within two cycles.
+
+On the CPU profile (`docker compose --profile cpu up -d`), bundles
+are posted without a GPU, which exercises the full ingest path but
+reports `gpu_fingerprint.available=false` and doesn't satisfy
+`nvidia_lock=true`. On the GPU profile, bundles carry the real
+CUDA device properties.
+
+---
+
+## 5. End-to-end: validator + miner + attestation
+
+This is the topology a serious operator ends up with.
+
+```
+  ┌──────────────────────────────────────────────┐
+  │  VALIDATOR (server)                          │
+  │  ─ Ubuntu 24.04, 4 vCPU, 8 GB RAM            │
+  │  ─ CELLS-validator image (no CUDA)            │
+  │  ─ bootstrap_peers = [api.CELLS.tech/…]      │
+  │  ─ :4001 tcp libp2p + :8080 http → Caddy     │
+  │  ─ CELLS_NGC_INGEST_SECRET=****           │
+  └───────▲─────────────────────────┬────────────┘
+          │                         │
+ libp2p   │                         │ HTTPS (your-node.example)
+ gossip   │                         │
+          │                         ▼
+  ┌───────┴────────────┐   ┌────────────────────────────┐
+  │  The mesh          │   │  NGC SIDECAR (GPU host)    │
+  │  (api.CELLS.tech,   │   │  ─ apps/CELLS-nvidia-ngc │
+  │   other peers)     │   │  ─ posts proofs every ~60s │
+  └────────────────────┘   └────────────────────────────┘
+                                    ▲
+                                    │ CUDA device probe
+                                    │
+                           ┌────────┴────────┐
+                           │  MINER (GPU rig)│
+                           │  ─ CELLSminer    │
+                           │  ─ --validator= │
+                           │    https://your-│
+                           │    node.example │
+                           │  ─ RTX 3050+    │
+                           └─────────────────┘
+```
+
+A few practical notes:
+
+- **The sidecar and the miner do not have to share a host.** The
+  sidecar only needs a GPU to produce attestable bundles; the miner
+  needs an NVIDIA GPU to mine. If you have one GPU rig, run both.
+  If you have two, run one per box.
+- **Your validator does not need a GPU.** The sidecar posts bundles
+  over HTTPS — the validator only verifies HMAC and ingests.
+- **Your miner does not need to trust `api.CELLS.tech`.** Point it at
+  `https://your-validator.example/` so proofs land on a node you
+  control.
+- **All three talk over regular internet.** Standard firewalling
+  rules: expose `:4001` on the validator to the world, expose
+  `:8080` behind TLS only to your trusted miners + the public, keep
+  the sidecar outbound-only.
+
+---
+
+## 6. Checklists
+
+### 6.1 Validator launch checklist
+
+- [ ] VPS provisioned, Ubuntu 24.04, 4+ vCPU, 8+ GB RAM, public IP.
+- [ ] `bootstrap_peers` set to a current mesh multiaddr.
+- [ ] `:4001/tcp` open inbound; `:8080` behind Caddy TLS.
+- [ ] Systemd unit file from
+      [`VALIDATOR_QUICKSTART.md §5`](./VALIDATOR_QUICKSTART.md) enabled.
+- [ ] `/api/v1/status` returns `connected_peers > 0` and `sync_lag`
+      decreasing.
+- [ ] `/api/v1/health` is `200`.
+- [ ] Prometheus scrape on `/api/metrics/prometheus` reports
+      `CELLS_chain_tip_height` advancing.
+- [ ] (v2 mining) Prometheus alert rules from
+      [`CELLS/deploy/prometheus/alerts_CELLS.example.yml`](../../deploy/prometheus/alerts_CELLS.example.yml)
+      loaded — specifically the four `CELLS-v2-mining-*` groups
+      (slashing, enrollment, liveness). Alertmanager routing keyed on
+      the `subsystem: v2-mining` label. CI smoke test
+      (`promtool check rules`) runs on every push that touches
+      `CELLS/deploy/prometheus/**` via `.github/workflows/validate-deploy.yml`.
+- [ ] (Optional) NGC sidecar running, `attestations/recent` shows
+      your node.
+
+### 6.2 Miner launch checklist
+
+- [ ] `CELLSminer --self-test` passes in <10 s.
+- [ ] Target validator's `/api/v1/status` returns `node_role =
+      validator` and `chain_tip` advancing.
+- [ ] Target validator's `/api/v1/mining/work` returns `200`.
+- [ ] `--address` is a CELLS address you control (derived from a
+      wallet seed you have backed up — lost seed = lost rewards).
+- [ ] Systemd unit running under a non-root user (`CELLS:CELLS`).
+- [ ] Logs show `proof ACCEPTED` within your expected window (or
+      known `wrong-epoch` / `header-mismatch` noise during clock
+      drift — see
+      [`MINER_QUICKSTART.md §3.2`](./MINER_QUICKSTART.md)).
+
+### 6.3 NGC sidecar launch checklist
+
+- [ ] Ingest secret set on the node
+      (`CELLS_NGC_INGEST_SECRET`), 256-bit random, never reused
+      across validators you do not own.
+- [ ] `ngc.env` filled, `NGC_CLI_API_KEY` from the free tier,
+      ingest secret matches the node's.
+- [ ] `docker compose up -d` (CPU or GPU profile).
+- [ ] `/api/v1/trust/attestations/recent` shows your node-id within
+      two cycles (~2 min).
+- [ ] Trust summary at
+      [`CELLS.tech/trust.html`](https://CELLS.tech/trust.html) reflects
+      your attested count.
+
+---
+
+## 7. Troubleshooting cheat-sheet
+
+| Symptom | Likely cause | First thing to check |
+|---|---|---|
+| Validator starts but `connected_peers = 0` forever | Stale `bootstrap_peers` multiaddr | Re-fetch the peer-id from `https://api.CELLS.tech/api/v1/status` (`node_id`); peer-ids rotate with the libp2p key |
+| Validator refuses to start, logs `roleguard` error | `mining_enabled=true` in a validator binary | See [`NODE_ROLES.md §2`](./NODE_ROLES.md); validator builds cannot enable mining |
+| Miner `--self-test` fails | Build mismatch / corrupt tree | Rebuild from a clean `git clone`, open an issue with the exit code |
+| Miner runs but no `proof ACCEPTED` | Easy: wrong validator / clock drift / too slow; hard: you ARE submitting but `too-late` | Inspect stderr rejection reasons per [`MINER_QUICKSTART.md §3.2`](./MINER_QUICKSTART.md) |
+| NGC sidecar logs `401` on POST | Ingest secret mismatch between node and sidecar | Verify both sides — secrets must be byte-identical, no trailing whitespace |
+| NGC sidecar logs `429 Retry-After` | Node is rate-limiting challenge fetches (many-validators case) | Set `CELLS_NGC_CHALLENGE_JITTER_MAX_SEC=8` per [`ngc.env.example`](../../../apps/CELLS-nvidia-ngc/ngc.env.example) |
+| Trust page shows `— of —` permanently | TrustAggregator warm-up or upstream peer unreachable | Wait 30 s after a redeploy; then check `/api/v1/trust/attestations/summary` directly |
+
+---
+
+## 8. Further reading
+
+- [`NODE_ROLES.md`](./NODE_ROLES.md) — official role definitions
+  rationale.
+- [`VALIDATOR_QUICKSTART.md`](./VALIDATOR_QUICKSTART.md) — validator
+  install reference.
+- [`MINER_QUICKSTART.md`](./MINER_QUICKSTART.md) — miner install
+  reference.
+- [`MINING_PROTOCOL.md`](./MINING_PROTOCOL.md) — proof format,
+  epochs, difficulty, acceptance window.
+- [`CELL_TOKENOMICS.md`](./CELL_TOKENOMICS.md) — emission schedule,
+  halving, supply cap.
+- [`NVIDIA_LOCK_CONSENSUS_SCOPE.md`](./NVIDIA_LOCK_CONSENSUS_SCOPE.md)
+  — why NVIDIA-lock is a transparency signal, not a consensus rule.
+- [`../../../apps/CELLS-nvidia-ngc/QUICKSTART.md`](../../../apps/CELLS-nvidia-ngc/QUICKSTART.md)
+  — NGC sidecar runbook.
+- [`runbooks/REJECTION_FLOOD.md`](./runbooks/REJECTION_FLOOD.md) —
+  incident runbook for the §4.6 attestation-rejection ring's two
+  flood-detection alerts (`CELLSAttestRejectionPersistCompactionsHigh`
+  and `CELLSAttestRejectionPersistHardCapDropping`). Covers triage,
+  mitigation policy, slashing escalation, and a worked example.
+- [`REBRAND_NOTES.md`](./REBRAND_NOTES.md) — CELLS+ → CELLS migration
+  table (env vars, metrics, headers).
+
+> **Corrections welcome.** If this guide contradicts any of the
+> documents above, the documents above are authoritative — open a
+> PR against this file. The goal of `OPERATOR_GUIDE.md` is to be the
+> single entry point, not the protocol specification.

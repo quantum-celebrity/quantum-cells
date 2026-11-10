@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://api.CELLS.tech; object-src 'none'; base-uri 'self'; form-action 'self'" />
+<title>CELLS Explorer · Cell (CELL)</title>
+<meta name="description" content="CELLS block explorer: search blocks, transactions and CELL addresses, see live chain stats, latest blocks and transactions, mining nodes and block-time statistics." />
+<meta name="theme-color" content="#061116" />
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/assets/brand/favicon-16.png" />
+<link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+<link rel="manifest" href="/site.webmanifest" />
+<meta property="og:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="CELLS logo: Quantum-Secure Dynamic Mesh ledger and the CELL coin" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="/assets/site.css" />
+<link rel="stylesheet" href="/assets/site-shell.css" />
+<link rel="stylesheet" href="/assets/explorer.css" />
+</head>
+<body data-page="explorer">
+<a class="skip-link" href="#main">Skip to content</a>
+<header id="site-header"></header>
+
+<main id="main" class="xp">
+  <section class="xp-hero">
+    <div class="xp-hero-top">
+      <h1><span class="live-dot" aria-hidden="true"></span>CELLS <span class="accent">Explorer</span></h1>
+      <span class="xp-live" id="xp-live" aria-live="polite"></span>
+    </div>
+    <form class="xp-search" id="xp-search" role="search">
+      <label class="sr-only" for="xp-q">Search by block height, transaction id or address</label>
+      <input id="xp-q" name="q" autocomplete="off" spellcheck="false" inputmode="search"
+        placeholder="Block height, transaction id or address" />
+      <button type="submit">Search</button>
+    </form>
+    <p class="xp-hint">Press <kbd>/</kbd> to search. Numbers open a block; ids like <code>solo-reward-…</code> open a transaction; 64 hex characters are checked as a transaction, then as an address.</p>
+    <nav class="xp-tabs" aria-label="Explorer sections">
+      <a href="/explorer.html" data-tab="home">Overview</a>
+      <a href="/explorer.html#/blocks" data-tab="blocks">Blocks</a>
+      <a href="/explorer.html#/txs" data-tab="txs">Transactions</a>
+      <a href="/explorer.html#/miners" data-tab="miners">Miners</a>
+      <a href="/explorer.html#/stats" data-tab="stats">Stats</a>
+      <a href="/api.html" class="xp-tabs-api">API docs</a>
+    </nav>
+  </section>
+
+  <div id="xp-view" class="xp-view">
+    <noscript>
+      <section class="card">
+        <h2>JavaScript is required</h2>
+        <p>The explorer reads live data from the public CELLS API in your browser. You can also query it directly, for example
+          <a href="https://api.CELLS.tech/api/v1/status">https://api.CELLS.tech/api/v1/status</a>.</p>
+      </section>
+    </noscript>
+  </div>
+
+  <p class="xp-foot muted">
+    Live, read-only data from the public <code>/api/v1</code> endpoints. There is no indexer yet:
+    address activity, transaction lists and statistics are bounded scans of recent blocks done in your browser.
+  </p>
+</main>
+
+<footer id="site-footer"></footer>
+
+<script src="/assets/site-shell.js" defer></script>
+<script src="/assets/explorer/core.js" defer></script>
+<script src="/assets/explorer/charts.js" defer></script>
+<script src="/assets/explorer/app.js" defer></script>
+<script src="/assets/explorer/shell-fallback.js" defer></script>
+</body>
+</html>

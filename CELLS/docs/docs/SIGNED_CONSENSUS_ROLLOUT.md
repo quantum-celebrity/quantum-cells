@@ -1,0 +1,291 @@
+# Signed consensus rollout
+
+> **Status: live on the public pilot network.** Signed consensus has been
+> enforced since **block 827,000** (12 October 2026, 18:11 UTC). Every BFT vote
+> and consensus message must carry a valid ML-DSA signature, and unsigned
+> consensus traffic is refused. `GET /api/v1/status` reports
+> `consensus_auth.require_signed_votes: true`,
+> `signed_message_activation_height: 827000`,
+> `signed_consensus_active: true` and
+> `unsigned_consensus_traffic_accepted: false`.
+>
+> The network still has a single block producer and no independent
+> validators, so this rollout removes forged consensus messages on that path
+> but does not add new validators (see [Current boundary](#current-boundary)).
+> The rest of this page is the rollout design and runbook, kept for operators
+> who bring up additional validators. All rules in force are listed in
+> [Consensus rules](CONSENSUS_RULES.md).
+
+CELLS validators authenticate BFT votes, block producer messages, prevote-lock
+proofs, round certificates, and equivocation evidence with ML-DSA-87. Signature
+enforcement is height-gated so validators can be upgraded before the network
+switches policy at one shared block height.
+
+This is a validator-set operation. Never enable it on only one validator.
+
+## Validator identity
+
+Each node loads or creates a consensus-only hot key. By default it is stored
+next to the SQLite state as `CELLS_consensus_signer.json`. It is not a CELL
+wallet and must never receive user or treasury funds.
+
+The file is mode `0600` and contains private signing material. Back it up with
+the validator state. Losing or replacing it changes the node's validator
+address. Never copy one validator's key to another validator.
+
+To create the key before the first start, for example to know the validator
+address in advance, run `CELLS-valkey generate --out <file>` (from
+`CELLS/source`: `go run -tags dilithium_circl ./cmd/CELLS-valkey generate --out
+<file>`). It writes the same file the node would create, refuses to overwrite
+an existing path, and prints only the validator address and a public-key
+fingerprint. `CELLS-valkey show --in <file>` checks a key file the way the node
+loads it and prints its address.
+
+An explicit path is optional:
+
+```toml
+[consensus]
+signer_key_path = "CELLS_consensus_signer.json"
+require_signed_votes = false
+signed_message_activation_height = 0
+```
+
+Environment equivalents are `CELLS_CONSENSUS_SIGNER_KEY_PATH`,
+`CELLS_REQUIRE_SIGNED_VOTES`, and
+`CELLS_SIGNED_MESSAGE_ACTIVATION_HEIGHT`. Strict deployments also use
+`CELLS_STRICT_SECRETS=true` and a comma-separated
+`CELLS_AUTHORIZED_BLOCK_PRODUCERS` list.
+
+The production deploy scripts require an explicit paired posture. If
+`CELLS_REQUIRE_SIGNED_VOTES=true`, `CELLS_SIGNED_MESSAGE_ACTIVATION_HEIGHT`
+must be one shared future height. If enforcement is off, the activation height
+must remain `0`. A half-configured rollout is refused before a config file is
+written.
+
+Strict production mode also refuses a validator config with an empty
+`authorized_block_producers` list. Development nodes may still use the
+compatibility default, but production validators must pin the known block
+producer IDs that are allowed to publish onto the `CELLS-blocks` gossip topic.
+
+Both Linux installers render the list from
+`CELLS_AUTHORIZED_BLOCK_PRODUCERS`, for example:
+
+```bash
+CELLS_STRICT_SECRETS=true \
+CELLS_AUTHORIZED_BLOCK_PRODUCERS="<producer-id-1>,<producer-id-2>" \
+./deploy/install-ubuntu-vps.sh
+```
+
+For additional validators, use `--strict-secrets` and one repeatable
+`--authorized-block-producer <producer-id>` argument for each producer. Copy
+IDs from reviewed block metadata or the approved network manifest; a bootstrap
+multiaddr is not automatically a producer authorization. Do not turn on strict
+mode with a guessed or stale ID, because that safely stops the node from
+following that producer.
+
+## Phase 1: upgrade and observe
+
+1. Back up every validator's state directory.
+2. Upgrade every validator to the same signing-capable release.
+3. Keep enforcement off with activation height `0`, or omit both rollout
+   variables so the deploy script writes that compatibility posture
+   deliberately.
+4. Restart each validator twice and confirm the same address appears in the
+   `Validator consensus signer ready` log entry after both starts.
+5. Confirm each node emits signed BFT traffic and remains synchronized.
+
+Present but invalid signatures are rejected even during this compatibility
+phase. Only missing signatures remain accepted.
+
+### Public status check
+
+`GET /api/v1/status` includes `consensus_auth` so operators can confirm the
+live posture without reading local config files. During Phase 1 the expected
+compatibility posture is:
+
+```json
+{
+  "signed_consensus_supported": true,
+  "require_signed_votes": false,
+  "signed_message_activation_height": 0,
+  "signed_consensus_active": false,
+  "unsigned_consensus_traffic_accepted": true
+}
+```
+
+On 2026-08-29, `node.CELLS.tech` was verified on commit `238a0e9` with this
+compatibility posture, while task-action signatures and transaction-content
+roots were already active from height `625000`. Mining enrollment/slashing
+state-root commitment is staged for the same height in current deployment
+scripts.
+
+## Phase 2: choose one height
+
+After every validator is upgraded, operators approve one future activation
+height with enough time to update and restart every node. Configure the exact
+same values everywhere:
+
+```toml
+[consensus]
+require_signed_votes = true
+signed_message_activation_height = 600000
+```
+
+For scripted deployments, pass the same posture explicitly:
+
+```bash
+CELLS_STRICT_SECRETS=true \
+CELLS_AUTHORIZED_BLOCK_PRODUCERS="<producer-id-1>,<producer-id-2>" \
+CELLS_REQUIRE_SIGNED_VOTES=true \
+CELLS_SIGNED_MESSAGE_ACTIVATION_HEIGHT=600000 \
+CELLS_TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT=600000 \
+CELLS_TX_CONTENT_ROOT_ACTIVATION_HEIGHT=600000 \
+CELLS_ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT=600000 \
+./deploy/install-ubuntu-vps.sh
+
+./deploy/bring-up-validator.sh \
+  --strict-secrets \
+  --authorized-block-producer <producer-id-1> \
+  --authorized-block-producer <producer-id-2> \
+  --require-signed-votes \
+  --signed-message-activation-height 600000 \
+  --task-action-signature-activation-height 600000 \
+  --tx-content-root-activation-height 600000 \
+  --enrollment-state-root-activation-height 600000
+```
+
+The node refuses to start when only one of these settings is active. Blocks and
+other consensus artifacts below the activation height remain readable for
+historical replay. At and above the height, unsigned artifacts are rejected.
+
+## Phase 3: verify activation
+
+Before the chosen height, verify every node logs the same activation height.
+At the boundary, monitor chain height, peer count, BFT commits, follower
+append errors, POL conflicts, and signature rejection metrics. Do not
+unilaterally disable enforcement after activation; a validator with different
+settings can diverge from the network.
+
+After activation, every validator should report the same values at the same
+chain height:
+
+```json
+{
+  "require_signed_votes": true,
+  "signed_consensus_active": true,
+  "unsigned_consensus_traffic_accepted": false
+}
+```
+
+Treat activation as complete only when all validators agree on both the config
+values and the chain height at which enforcement turned on.
+
+## Task-action signatures
+
+Separate from the signed-vote rollout above, and separately gated.
+
+`/api/v1/tasks/actions/submit-signed` has always verified the ML-DSA envelope
+at admission. Until recently the mempool transaction dropped the signature
+afterwards, so consensus replay re-checked nothing and a proposer could inject
+task actions against any account. The proof is now carried and re-verified at
+apply time (`chain.VerifyTaskActionSignature`).
+
+Two behaviours, only one of which is on by default:
+
+- **Always on.** A signature that is PRESENT is verified at every height, and a
+  bad one is refused. This carries no replay risk: a historical unsigned action
+  has nothing to verify and is unaffected.
+- **Off by default.** Whether a signature is REQUIRED is governed by
+  `[consensus] task_action_signature_activation_height` (env:
+  `CELLS_TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT`). Zero, the default, requires
+  nothing -- an unsigned task action is accepted at any height. The node logs a
+  WARNING at startup while this is the case.
+
+### Before enabling it
+
+Setting the height rejects any unsigned task action at or above it. If your
+chain already contains one above the value you choose, replay diverges and the
+node cannot follow.
+
+So pick a height ABOVE your current tip, and confirm your history first. There
+is a command for this:
+
+```
+go build -tags dilithium_circl -o CELLS-taskaction-scan ./cmd/CELLS-taskaction-scan
+./CELLS-taskaction-scan --chain /opt/CELLS/CELLS_chain.ndjson
+```
+
+It is read-only. It reports the tip, how many `CELLS/tasks/v1` transactions the
+chain carries, how many of those are unsigned, the greatest height carrying an
+unsigned one, and a suggested activation height: the tip plus a headroom
+margin. The highest unsigned action is always at or below the tip, so the tip
+is the floor -- the report shows the unsigned height so you can confirm that
+for yourself rather than take it on trust.
+
+If it reports `REFUSING TO ADVISE: no blocks were read`, the path is wrong or
+the volume is not mounted. It exits non-zero rather than suggesting a height,
+because an unread chain and a clean chain otherwise look identical.
+
+Run it on EVERY node. They should agree; if they do not, that disagreement
+matters more than the number. Every validator must then be set to the same
+value, as with `signed_message_activation_height`.
+
+## Transaction-content root (coordinated fork)
+
+`computeTxRoot` merkleizes transaction IDs only, and the block hash signs over
+that root. So any field a transaction carries that the state root does not
+independently distinguish -- amount, recipient, contract, payload, the
+signature itself -- can be rewritten in flight with the block hash, the
+producer signature and the state root all still verifying.
+
+`[consensus] tx_content_root_activation_height` (env:
+`CELLS_TX_CONTENT_ROOT_ACTIVATION_HEIGHT`) sets the first height whose tx root
+commits contents instead. Zero, the default, keeps the legacy root; the node
+logs a WARNING at startup while that is so.
+
+### This one is different from every other gate here
+
+The other activation heights change what a node ACCEPTS. This changes what a
+node COMPUTES: block hashes differ from the activation height onward. A node
+with a different value derives different hashes for the same blocks and forks
+immediately.
+
+So: pick a height comfortably above the current tip, set the identical value on
+every node, and restart them all before the chain reaches it. Verify with
+`grep tx_content_root_activation_height` across your fleet, not from memory.
+A node that misses the change will reject every block from the activation
+height onward.
+
+Producer and validator derive the hash through one function
+(`computeBlockHash`); `recomputeHash` in the propagation path delegates to it
+rather than carrying its own copy, so there is no second derivation to keep in
+step. That was not true before commit `bee8da4`, and activating the gate
+against a build without it would halt propagation network-wide.
+
+## Enrollment state root (coordinated fork)
+
+Mining enrollment, operator binding, and slashing records live outside the
+transaction list. Before the coordinated gate, two nodes could replay the same
+blocks while disagreeing about that side state. That made later reward and
+slash decisions depend on local database history rather than the block stream.
+
+`[consensus] enrollment_state_root_activation_height` (env:
+`CELLS_ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT`) sets the first height whose
+state root also commits the mining enrollment/slashing snapshot. Zero keeps
+legacy state-root derivation; current deployment scripts default it to
+`625000` alongside the task-action and transaction-content gates.
+
+This is another COMPUTES gate. Every validator must use the exact same height
+before the chain reaches it. A node with a different value derives a different
+state root for the same block and stops following at the activation height.
+
+## Current boundary
+
+The current runtime uses one configured block producer with append-only
+followers. The signed-message rollout removes identity forgery on that path,
+but it does not by itself create a dynamically managed multi-validator
+membership protocol. Signed POL artifacts are therefore limited to singleton
+certificates from the active producer; multi-validator certificates remain
+disabled until they carry an authenticated vote from each validator.
+Automatic proposer-equivocation reports that lack two signed vote exhibits
+fail closed after activation and do not slash anyone.

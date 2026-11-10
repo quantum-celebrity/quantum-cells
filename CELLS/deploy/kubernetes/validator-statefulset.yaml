@@ -1,0 +1,182 @@
+# CELLS validator StatefulSet
+# ---------------------------
+# Deploys the validator-only CELLS image (built from CELLS/Dockerfile.validator
+# with -tags validator_only). Validators run the BFT + PoE consensus and MUST
+# be scheduled on CPU-only hardware.
+#
+# Important guarantees encoded in this manifest:
+#
+#   - `nodeSelector` pins validators to CPU-only nodes. The canonical label is
+#     `CELLS.tech/node-class=cpu`; cluster operators should apply this label to
+#     their validator node pool and MUST NOT apply it to any GPU node.
+#   - A negative-tolerations stance: we do NOT tolerate the GPU taint so the
+#     scheduler refuses to place a validator pod on a GPU node even if a
+#     cluster administrator mislabels one.
+#   - CELLS_NODE_ROLE / CELLS_MINING_ENABLED are hard-coded for defence-in-depth
+#     against accidental config-map overrides.
+#
+# See CELLS/docs/docs/NODE_ROLES.md for the operator runbook.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: CELLS-validator
+  namespace: CELLS
+  labels:
+    app: CELLS
+    component: validator
+    CELLS.tech/role: validator
+spec:
+  serviceName: CELLS-validator
+  replicas: 3
+  selector:
+    matchLabels:
+      app: CELLS
+      component: validator
+  template:
+    metadata:
+      labels:
+        app: CELLS
+        component: validator
+        CELLS.tech/role: validator
+    spec:
+      nodeSelector:
+        CELLS.tech/node-class: cpu
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: CELLS.tech/node-class
+                operator: In
+                values: ["cpu"]
+              # Explicit negative constraint: never schedule a validator on a
+              # node that advertises an NVIDIA GPU product label.
+              - key: nvidia.com/gpu.product
+                operator: DoesNotExist
+      containers:
+      - name: CELLS-validator
+        # CI publishes ghcr.io/<owner>/CELLS-validator (hyphen), not the
+        # Docker Hub-style CELLS/validator path this used to reference —
+        # that name does not exist and produced ImagePullBackOff on every
+        # apply.
+        image: ghcr.io/blackbeardone/CELLS-validator:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: network
+          containerPort: 4001
+          protocol: TCP
+        - name: api
+          containerPort: 8080
+          protocol: TCP
+        - name: dashboard
+          containerPort: 8081
+          protocol: TCP
+        - name: logviewer
+          containerPort: 9000
+          protocol: TCP
+        env:
+        # Bind the dashboard to all interfaces INSIDE the pod. The process
+        # default is 127.0.0.1, correct on bare metal but unreachable here:
+        # the Service and kube-proxy route to the pod's non-loopback
+        # interface, not into its loopback namespace.
+        - name: CELLS_DASHBOARD_BIND_ADDRESS
+          value: "0.0.0.0"
+        # WebSocket origin allowlist; see configmap.yaml for how to pick the
+        # value. Without it CheckOrigin stays permissive.
+        - name: CELLS_WS_ALLOWED_ORIGINS
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: ws_allowed_origins
+        - name: CELLS_NODE_ROLE
+          value: "validator"
+        - name: CELLS_MINING_ENABLED
+          value: "false"
+        - name: NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: BOOTSTRAP_PEERS
+          value: "CELLS-validator-0.CELLS-validator.CELLS.svc.cluster.local:4001"
+        envFrom:
+        - configMapRef:
+            name: CELLS-config
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+        - name: logs
+          mountPath: /app/logs
+        # Writable scratch for processes that need /tmp under a
+        # read-only root filesystem (Go's os.TempDir, libp2p
+        # ephemeral state, container runtime helpers).
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health/live
+            port: api
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/v1/health/ready
+            port: api
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        securityContext:
+          # runtime-01: container runs as a non-root UID. The
+          #             validator image (Dockerfile.validator) sets
+          #             USER 65532 at build time.
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          # runtime-02: read-only root filesystem. Writable paths
+          #             are mounted explicitly: /app/data (PVC),
+          #             /app/logs (emptyDir), /tmp (emptyDir).
+          readOnlyRootFilesystem: true
+          # runtime-03: drop ALL Linux capabilities; the validator
+          #             needs no privileged operations.
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          # runtime-04: enforce RuntimeDefault seccomp profile so
+          #             the container is restricted to the syscall
+          #             allowlist that ships with containerd /
+          #             cri-o / dockerd. (AppArmor profile is set
+          #             via pod-level annotation when the cluster
+          #             ships AppArmor; see networkpolicy.yaml
+          #             companion file.)
+          seccompProfile:
+            type: RuntimeDefault
+      volumes:
+      - name: logs
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 20Gi

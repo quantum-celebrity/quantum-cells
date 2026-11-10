@@ -1,0 +1,247 @@
+# CELLS Architecture: Mesh-Based Ledger (Not a Blockchain)
+
+**Last Updated:** December 2025
+
+> **Current status note (2026-10):** This is a historical document. CELLS today is a
+> public pilot network (pre-mainnet): Proof-of-Entanglement transfers, one block producer run by the project.
+> CELL wallet transactions are signed with ML-DSA-87 (NIST FIPS 204), and signed consensus
+> messages are enforced from block 827,000; independent validators and a published
+> security review (an open [community review](COMMUNITY_REVIEW.md); no independent
+> audit has been completed) are still on the roadmap. For what is safe to claim today, see [Capability Snapshot](CAPABILITY_SNAPSHOT.md)
+> and [Treasury Policy §9](TREASURY_POLICY.md#9-mainnet-release-gates).
+> The live pilot chain produces blocks with a ~10-second target, so the
+> "not a blockchain" and "no block delays" framing below describes the original design.
+> Proof-of-Entanglement today: each signed transfer's ML-DSA-87 signature is checked
+> under the sender's own key on every node. The parent rules (parents must be committed
+> transactions) are implemented behind an activation height that has not been set yet.
+> See [Proof-of-Entanglement](PROOF_OF_ENTANGLEMENT.md).
+
+---
+
+## Is CELLS a Blockchain?
+
+**No, CELLS is NOT a traditional blockchain.** It's a **mesh-based distributed ledger** that shares some characteristics with DAGs (Directed Acyclic Graphs) but uses a unique "Dynamic Mesh" architecture.
+
+---
+
+## Architecture Comparison
+
+### Traditional Blockchain (Bitcoin, Ethereum)
+
+```
+Block 1 → Block 2 → Block 3 → Block 4 → ...
+  ↓         ↓         ↓         ↓
+Tx1-10    Tx11-20   Tx21-30   Tx31-40
+```
+
+**Characteristics:**
+- **Linear chain** of blocks
+- **Single parent** (previous block)
+- **Sequential validation** (one block at a time)
+- **Block-based consensus** (PoW, PoS, etc.)
+
+### CELLS: Dynamic Mesh Ledger
+
+```
+     Cell A
+    /  |  \
+Cell B  Cell C  Cell D
+  | \    / |      |
+  |  \  /  |      |
+Cell E  Cell F  Cell G
+```
+
+**Characteristics:**
+- **2D/3D mesh structure** (not linear)
+- **Multiple parent cells** per transaction (2-5 parents)
+- **Parallel validation** (multiple transactions simultaneously)
+- **Proof-of-Entanglement (PoE)** consensus
+
+---
+
+## Key Differences
+
+| Feature | Blockchain | CELLS (Mesh) | DAG |
+|---------|-----------|-------------|-----|
+| **Data Structure** | Linear chain | 2D/3D Mesh | Directed Acyclic Graph |
+| **Parent References** | 1 parent (previous block) | 2-5 parent cells | 1-2 parent transactions |
+| **Validation** | Sequential (block-by-block) | Parallel (mesh validation) | Parallel (DAG traversal) |
+| **Consensus** | PoW/PoS (block-based) | Proof-of-Entanglement | Various (Tangle, Hashgraph) |
+| **Scalability** | Limited by block size/time | High (parallel processing) | High (parallel processing) |
+
+---
+
+## CELLS's Mesh Architecture
+
+### Phase 1: 2D Mesh
+
+```
+Transaction Structure:
+- ID: unique identifier
+- Parent Cells: [parent1, parent2]  (minimum 2 parents)
+- Data: transaction payload
+- Signature: ML-DSA-87 quantum-safe signature
+```
+
+**Validation:**
+- Validates against **2 parent cells**
+- Ensures **entanglement** (connection) with previous transactions
+- Parallel validation possible
+
+### Phase 3: 3D Mesh
+
+```
+Transaction Structure:
+- ID: unique identifier
+- Parent Cells: [parent1, parent2, parent3, parent4, parent5]  (3-5 parents)
+- Data: transaction payload
+- Signature: ML-DSA-87 quantum-safe signature
+```
+
+**Validation:**
+- Validates against **3-5 parent cells**
+- **3D mesh validation** with CUDA acceleration
+- Enhanced security through multiple parent verification
+
+---
+
+## Proof-of-Entanglement (PoE)
+
+**Not Proof-of-Work or Proof-of-Stake!**
+
+> **Status (2026-10):** step 2 runs on every node today. Steps 1 and 3 are
+> implemented and switch on at a configured activation height that has not
+> been set yet. The full rules, the activation and the client guide are in
+> [Proof-of-Entanglement](PROOF_OF_ENTANGLEMENT.md).
+
+PoE validates a signed transfer by:
+1. **Checking parent cells:** 2-10 distinct IDs of transactions committed in the last 8,640 blocks, or earlier in the same block
+2. **Verifying signatures:** ML-DSA-87 under the sender's own public key, with sender = `hex(sha256(public_key))`
+3. **Ensuring entanglement:** every parent points strictly backwards in the committed chain, so the parent graph has no cycles
+4. **Validating transaction data:** amounts, addresses, nonce, balance
+
+**Key Concept:** Transactions are "entangled" with multiple previous transactions, creating a mesh network rather than a linear chain.
+
+---
+
+## Why "Mesh" Instead of "Blockchain"?
+
+### Advantages of Mesh Architecture:
+
+1. **Parallel Processing**
+   - Multiple transactions can be validated simultaneously
+   - No waiting for block confirmation
+   - Higher throughput potential
+
+2. **No Block Size Limits**
+   - Transactions don't need to fit in blocks
+   - No block time delays
+   - More flexible transaction ordering
+
+3. **Better Scalability**
+   - Can process transactions in parallel
+   - No bottleneck from sequential block validation
+   - Dynamic submesh routing for load distribution
+
+4. **Quantum-Safe by Design**
+   - ML-DSA-87 wallet signatures (NIST category 5)
+   - Wallet signatures do not rely on classical elliptic-curve assumptions
+   - Designed to resist known quantum attacks on signatures
+
+---
+
+## Comparison with DAGs
+
+CELLS shares similarities with DAGs (like IOTA's Tangle):
+
+**Similarities:**
+- ✅ Multiple parent references
+- ✅ Parallel validation
+- ✅ No blocks
+- ✅ High throughput potential
+
+**Differences:**
+- 🔄 **CELLS:** 2D/3D mesh with "cells" and "submeshes"
+- 🔄 **DAG:** Directed graph with transactions as nodes
+- 🔄 **CELLS:** Proof-of-Entanglement consensus
+- 🔄 **DAG:** Various consensus (Tangle, Hashgraph, etc.)
+- 🔄 **CELLS:** Quantum-safe cryptography (ML-DSA-87)
+- 🔄 **DAG:** Typically classical cryptography
+
+---
+
+## Technical Implementation
+
+### Transaction Structure
+
+```go
+type Transaction struct {
+    ID          string
+    ParentCells []string  // 2-5 parent cell IDs
+    Sender      string
+    Recipient   string
+    Amount      float64
+    Fee         float64
+    Signature   []byte    // ML-DSA-87 signature
+    Timestamp   time.Time
+}
+```
+
+### Validation Process
+
+1. **Receive transaction** with parent cell references
+2. **Verify the signature** under the transaction's own public key (bound to the sender address)
+3. **Resolve parent cells** against the node's committed history (from the PoE activation height)
+4. **Verify entanglement**: parents are distinct, earlier and inside the reference window
+5. **Validate transaction** (amounts, addresses, nonce, balance)
+6. **Commit** it in the next block; every follower repeats steps 2-5 when it replays that block
+
+### Storage
+
+- **SQLite database** with compressed storage
+- **Indexed by:** transaction ID, parent cells, sender, recipient
+- **No block structure** - transactions stored individually
+
+---
+
+## Summary
+
+**CELLS is:**
+- ✅ A **mesh-based distributed ledger**
+- ✅ Similar to DAGs but with unique architecture
+- ✅ Uses **Proof-of-Entanglement** consensus
+- ✅ **Quantum-safe** with ML-DSA-87
+- ✅ **Parallel validation** capability
+
+**CELLS is NOT:**
+- ❌ A traditional blockchain (no linear chain)
+- ❌ Block-based (no blocks)
+- ❌ Sequential validation only
+- ❌ Classical cryptography only
+
+---
+
+## Why This Matters
+
+1. **Better Scalability:** Parallel processing vs sequential blocks
+2. **Post-Quantum Signatures:** designed to resist known quantum attacks
+3. **Flexible Architecture:** Dynamic submeshes and routing
+4. **No Block Delays:** Transactions validated immediately
+5. **Higher Throughput:** Potential for much higher TPS than blockchains
+
+---
+
+## References
+
+- **Blockchain:** Bitcoin, Ethereum (linear chain)
+- **DAG:** IOTA Tangle, Hedera Hashgraph (directed graph)
+- **CELLS:** Dynamic Mesh Ledger (2D/3D mesh with PoE)
+
+For more details, see:
+- `docs/COMPARATIVE_ANALYSIS.md` - Detailed comparison
+- `docs/FINAL_COMPARISON.md` - Performance comparison
+
+---
+
+*CELLS: Quantum-Safe Mesh Ledger, Not a Blockchain* 🚀
+

@@ -1,0 +1,746 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<!--
+  Strict CSP: scripts only from this origin (no inline script), plus
+  'wasm-unsafe-eval' so wallet.js can instantiate the SRI-checked
+  wallet.wasm. Network reads/writes only to this origin and api.CELLS.tech.
+  Inline styles stay allowed for style attributes and the Hive provider
+  panel's injected <style>. frame-ancestors cannot be set from a <meta>
+  tag; keep X-Frame-Options / frame-ancestors in the nginx headers.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://api.CELLS.tech; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'" />
+<meta name="referrer" content="strict-origin-when-cross-origin" />
+<title>CELLS Web wallet — Self-custody, post-quantum signatures (ML-DSA-87)</title>
+<meta name="description" content="Generate a self-custody CELLS wallet in your browser. ML-DSA-87 (FIPS 204) keypair generated entirely client-side; private key never leaves this tab. PBKDF2-SHA256 (600k iterations) + AES-256-GCM passphrase-encrypted keystore, byte-compatible with `CELLScli wallet new`. Plus a read-only public-address balance lookup that queries api.CELLS.tech." />
+<meta name="theme-color" content="#061116" />
+<meta property="og:title" content="CELLS Wallet — Self-Custody, Post-Quantum Signatures" />
+<meta property="og:description" content="Generate a CELLS (Cell / CELL) reward address in your browser. ML-DSA-87 keys, AES-256-GCM encrypted keystore, zero server-side custody." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/assets/brand/favicon-16.png" />
+<link rel="apple-touch-icon" href="/assets/brand/apple-touch-icon.png" />
+<link rel="manifest" href="/site.webmanifest" />
+<meta property="og:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="CELLS logo: Quantum-Secure Dynamic Mesh ledger and the CELL coin" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://CELLS.tech/assets/brand/og-image.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="/assets/site.css" />
+<link rel="stylesheet" href="/assets/site-shell.css" />
+<link rel="stylesheet" href="/assets/wallet-ui.css" />
+</head>
+<body data-page="wallet">
+<a class="skip-link" href="#main">Skip to content</a>
+<div id="CELLS-migration-notice" role="status" style="position:relative;z-index:1000;padding:12px 20px;background:#fff3cd;color:#513b08;text-align:center;font:14px/1.5 system-ui,sans-serif">Mining is open for enrolled CELLS Hive miners. Hive 1.4.21 is available — Hive 1.4.20 users must install it manually from the Download page before 19 December 2026. Paid resource work is still paused.</div>
+<header id="site-header"></header>
+
+<main class="container" id="main">
+  <section class="hero">
+    <span class="eyebrow"><span class="dot" style="width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 10px var(--success)"></span> Web wallet · Self-custody</span>
+    <h1>CELLS <span class="accent">Web wallet</span></h1>
+    <p class="lede">
+      Create or import a self-custody CELL wallet in this browser.
+      For the full desktop wallet, tasks, mining, and recovery, use
+      <a href="/download.html">CELLS Hive</a>
+      (<a href="/docs/#/wallet-recovery">recovery docs</a>).
+    </p>
+
+    <div class="wui-trust">
+      <p class="wui-trust-main">Your keys are generated, encrypted and used only inside this browser tab; CELLS.tech never receives your private key or passphrase.</p>
+      <p class="wui-caveat"><strong>Honest caveat:</strong> a web wallet is only as safe as the device it runs on.
+        Malware, browser extensions, clipboard hijackers and phishing copies of this page can still steal funds.
+        Use a clean, up-to-date device, check the address bar, and compare recipient addresses after pasting.
+        <button type="button" class="wui-linkbtn" id="wui-gate-reopen">Show the safety checklist</button></p>
+      <p class="wui-urlcheck" id="wui-urlcheck"></p>
+    </div>
+
+    <!-- Cross-reference to the public audit checklist. ML-DSA-87
+         keypair gen, JWT verification (for the wallet's calls into
+         /api/v1/*), HMAC fallback, secret entropy and mTLS are all
+         pinned by 5 rows in the cryptography category, all passing.
+         The badge image uses a same-origin path (/api/v1/audit/badge.svg);
+         on a phishing clone of this page served from a different
+         origin, the badge will 404: a visual canary that augments
+         the address-bar check. -->
+    <div class="audit-callout">
+      <a class="audit-callout-badge" href="/audit.html?category=cryptography"
+         title="Open the 5 cryptography audit rows on audit.html">
+        <img src="/api/v1/audit/badge.svg" alt="CELLS audit score (live)" />
+      </a>
+      <div class="audit-callout-text">
+        <strong>Wallet crypto is on the internal audit checklist.</strong>
+        Five <code>cryptography</code> checklist rows pin ML-DSA-87 keygen,
+        AES-GCM vault encryption, and JWT/mTLS posture. This is a self-maintained checklist, not an independent audit.
+        See <a href="/audit.html?category=cryptography">audit.html?category=cryptography</a>.
+      </div>
+    </div>
+  </section>
+
+  <!-- v0.4.3: persistent encrypted vault (MetaMask-style UX). -->
+  <!-- Backed by localStorage; encryption + canonical-payload     -->
+  <!-- semantics inherited from the existing wallet.js primitives -->
+  <!-- via window.CELLSWallet (see /assets/wallet-ui/vault.js).   -->
+  <!-- The 5-tab "Advanced" panel below                           -->
+  <!-- stays available for power flows (generate fresh from a     -->
+  <!-- new passphrase, sign arbitrary messages, open / inspect a  -->
+  <!-- third-party keystore file).                                -->
+  <section class="panel" id="vault-panel">
+    <div id="vault-state-empty" class="vault-state" hidden>
+      <h2 style="margin-top:0">Your CELLS Wallet</h2>
+      <p style="color: var(--text-2); margin: 8px 0 18px">
+        No wallet is installed in this browser yet. Pick one:
+      </p>
+      <div class="actions" style="margin-bottom: 14px">
+        <button class="btn btn-primary" id="vault-create-btn">Create a new wallet</button>
+        <button class="btn btn-ghost"   id="vault-import-btn">Import an existing keystore</button>
+      </div>
+      <p style="font-size: 13px; color: var(--muted); margin: 0">
+        The vault is stored <em>encrypted</em> in this browser's
+        <code>localStorage</code> (AES-256-GCM with a PBKDF2-SHA-256
+        600 000-iteration key derived from your passphrase). It
+        never leaves this tab. Clearing site data or switching
+        browsers wipes it &mdash; export a backup
+        <code>wallet.json</code> from the Advanced &rarr; Open tab
+        any time.
+      </p>
+    </div>
+
+    <div id="vault-state-locked" class="vault-state" hidden>
+      <h2 style="margin-top:0">Unlock Your Wallet</h2>
+      <p style="color: var(--text-2); margin: 8px 0 12px">
+        Address: <code id="vault-locked-addr" style="font-family: var(--mono); font-size: 12px"></code>
+        <button class="btn btn-ghost" id="vault-locked-copy" style="margin-left:8px; padding: 2px 8px; font-size: 12px">Copy</button>
+      </p>
+      <div class="field">
+        <label>Passphrase</label>
+        <input type="password" id="vault-unlock-pass" autocomplete="current-password" />
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="vault-unlock-btn">Unlock</button>
+        <button class="btn btn-ghost"   id="vault-forget-btn"
+                title="Wipe the encrypted vault from this browser (keystore.json export advised first)">Forget this wallet</button>
+      </div>
+      <div class="status-line" id="vault-unlock-status"></div>
+    </div>
+
+    <!-- Unlocked: compact app-style single column (wallet-ui.js drives the
+         header icons, segment switch, sheets, history and feature cards;
+         vault.js still owns unlock, balance, send, export and lock). -->
+    <div id="vault-state-unlocked" class="vault-state wapp" hidden>
+      <div class="wapp-head">
+        <div class="wapp-brand">
+          <img src="/assets/brand/CELLS-logo-small.svg" alt="" width="36" height="36" />
+          <h2>My Wallet</h2>
+        </div>
+        <div class="wapp-icons">
+          <div class="wapp-pop-wrap">
+            <button type="button" class="wapp-icon" id="wui-net-btn" aria-label="Network status" title="Network" aria-expanded="false" aria-controls="wui-net-pop">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.7 3.9 5.7 3.9 9s-1.3 6.3-3.9 9c-2.6-2.7-3.9-5.7-3.9-9S9.4 5.7 12 3z"/></svg>
+              <span class="wapp-icon-dot" id="wui-net-dot"></span>
+            </button>
+            <div class="wapp-pop" id="wui-net-pop" role="dialog" aria-label="Network status" hidden>
+              <div class="wapp-pop-title">CELLS network</div>
+              <dl class="wapp-kv">
+                <dt>API</dt><dd id="wui-net-api">checking…</dd>
+                <dt>Chain tip</dt><dd id="wui-net-tip" class="mono">—</dd>
+                <dt>Node</dt><dd id="wui-net-node" class="mono">—</dd>
+                <dt>Balance</dt><dd id="wui-net-bal">—</dd>
+              </dl>
+              <a class="wapp-pop-link" href="/explorer.html">Open explorer</a>
+            </div>
+          </div>
+          <button type="button" class="wapp-icon" id="wui-settings-btn" aria-label="Settings" title="Settings" aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+          </button>
+          <button type="button" class="wapp-icon wapp-icon-lock" id="vault-lock-btn" aria-label="Lock wallet" title="Lock wallet">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.2"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="wapp-seg" role="tablist" aria-label="Wallet source">
+        <button type="button" role="tab" class="wapp-seg-btn active" id="wui-seg-cell" aria-selected="true" aria-controls="wui-pane-cell">
+          <img class="wapp-seg-coin" src="/assets/brand/cell-coin-small.svg" alt="" width="18" height="18" />
+          CELL
+        </button>
+        <button type="button" role="tab" class="wapp-seg-btn" id="wui-seg-hive" aria-selected="false" aria-controls="wui-pane-hive" disabled title="Connect CELLS Hive">
+          <img src="/assets/CELLS-hive-icon.png" alt="" width="18" height="18" />
+          Hive
+        </button>
+      </div>
+
+      <div class="wapp-pane" id="wui-pane-cell" role="tabpanel" aria-labelledby="wui-seg-cell">
+        <section class="wcard wcard-balance" aria-label="Balance">
+          <div class="wcoin" aria-hidden="true">
+            <img src="/assets/brand/cell-coin.svg" alt="" width="52" height="52" />
+          </div>
+          <div class="wbal">
+            <span class="wbal-num" id="vault-balance-value">…</span>
+            <span class="wlive" id="wui-live" title="Waiting for the first balance refresh"></span>
+          </div>
+          <div class="wbal-ticker" id="vault-balance-label">CELL</div>
+          <div class="wbal-sub" id="vault-balance-source"></div>
+          <div class="wbtns">
+            <button type="button" class="btn btn-primary wbtn-big" id="wui-receive-btn" aria-expanded="false" aria-controls="wui-sheet-receive">Receive</button>
+            <button type="button" class="btn btn-ghost wbtn-big" id="wui-send-btn" aria-expanded="false" aria-controls="wui-sheet-send">Send</button>
+          </div>
+        </section>
+
+        <section class="wcard wsheet" id="wui-sheet-receive" aria-labelledby="wui-sheet-receive-title" hidden>
+          <div class="wsheet-head">
+            <h3 id="wui-sheet-receive-title">Receive CELL</h3>
+            <button type="button" class="wapp-x" data-wui-close="receive" aria-label="Close receive">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </div>
+          <p class="wsheet-lede">Share <strong>only</strong> this address. The passphrase and keystore never leave this tab.</p>
+          <div class="wui-receive">
+            <div class="wui-qr" id="wui-qr" aria-label="QR code of your address">&mdash;</div>
+            <div class="wui-receive-main">
+              <div class="wui-label">Your CELL address</div>
+              <div class="wui-addr" id="vault-receive-addr"></div>
+              <div class="actions">
+                <button type="button" class="btn btn-primary" id="vault-receive-copy">Copy address</button>
+                <a class="btn btn-ghost" id="wui-explorer-link" href="/explorer.html">View in Explorer</a>
+              </div>
+            </div>
+          </div>
+          <p class="wui-fine">The QR code is drawn in this tab; the address is not sent to any QR service.
+            After pasting an address anywhere, compare the first and last six characters: clipboard hijackers swap addresses.</p>
+          <div class="status-line" id="vault-receive-status"></div>
+        </section>
+
+        <section class="wcard wsheet" id="wui-sheet-send" aria-labelledby="wui-sheet-send-title" hidden>
+          <div class="wsheet-head">
+            <h3 id="wui-sheet-send-title">Send CELL</h3>
+            <button type="button" class="wapp-x" data-wui-close="send" aria-label="Close send">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </div>
+          <p class="wsheet-lede">Signed in this tab with ML-DSA-87 (wallet.wasm); only the signed envelope is sent. You will see a review before anything is signed.</p>
+          <div class="field">
+            <label for="vault-send-recipient">Recipient address <span class="hint">64 hex</span></label>
+            <input type="text" id="vault-send-recipient" autocomplete="off" spellcheck="false"
+                   placeholder="64-character hex address" />
+          </div>
+          <div class="wsheet-row">
+            <div class="field">
+              <label for="vault-send-amount">Amount <span class="hint">CELL</span></label>
+              <input type="text" id="vault-send-amount" autocomplete="off" inputmode="decimal" placeholder="1.0" />
+            </div>
+            <div class="field">
+              <label for="vault-send-fee">Fee <span class="hint">CELL (≥ 0)</span></label>
+              <input type="text" id="vault-send-fee" autocomplete="off" inputmode="decimal" placeholder="0.01" />
+            </div>
+            <div class="field wsheet-geo">
+              <label for="vault-send-geotag">Geotag</label>
+              <input type="text" id="vault-send-geotag" autocomplete="off" placeholder="US" maxlength="3" />
+            </div>
+          </div>
+          <button type="button" class="btn btn-primary wbtn-full" id="vault-send-btn">Review &amp; send</button>
+          <div class="status-line" id="vault-send-status">Fill the form &rarr; Review &amp; send. You will see a summary before anything is signed.</div>
+          <div id="vault-send-result" hidden></div>
+        </section>
+
+        <section class="wcard" aria-labelledby="wui-addr-title">
+          <div class="wcard-label-row">
+            <div class="wcard-label" id="wui-addr-title">CELL Address</div>
+            <button type="button" class="wbtn-sm" id="wui-qr-toggle" aria-expanded="false" aria-controls="wui-qr-mini" title="Show QR code">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2zM16 16h2v2h-2z"/></svg>
+              QR
+            </button>
+          </div>
+          <div class="winset mono" id="vault-unlocked-addr"></div>
+          <div class="wui-qr wui-qr-mini" id="wui-qr-mini" aria-label="QR code of your address" hidden></div>
+          <button type="button" class="btn btn-ghost wbtn-full" id="vault-unlocked-copy">Copy Address</button>
+        </section>
+
+        <section class="wcard" aria-labelledby="wui-hist-title">
+          <div class="wcard-title-row">
+            <h3 class="wcard-title" id="wui-hist-title">Transaction History</h3>
+            <a class="wcard-link" id="wui-onchain-explorer" href="/explorer.html">All in Explorer</a>
+          </div>
+          <div class="whist" id="wui-history"><p class="wui-fine">Scanning recent blocks…</p></div>
+          <p class="wui-fine" id="wui-onchain-note">Recent activity in the last 1,000 blocks, scanned in your browser from the public API, plus sends from this browser. Full history is coming with the indexer.</p>
+          <div class="whist-actions">
+            <button type="button" class="btn btn-ghost wbtn-sm-wide" id="wui-onchain-more" hidden>Scan 1,000 more blocks</button>
+            <button type="button" class="wui-linkbtn" id="vault-activity-clear">Clear local send log</button>
+          </div>
+          <div id="vault-activity-list" hidden></div>
+        </section>
+
+        <section class="wcard wfeature" aria-labelledby="wui-hivecard-title">
+          <h3 class="wcard-title" id="wui-hivecard-title">Connect CELLS Hive <span class="wbadge" id="wui-hive-badge">Desktop</span></h3>
+          <p class="wfeature-text" id="wui-hive-text">Sign CELL transfers with the CELLS Hive desktop app; your keys stay in Hive and this page only sees the address you approve.</p>
+          <p class="wfeature-note" id="wui-hive-note" hidden></p>
+          <button type="button" class="btn btn-primary wbtn-full" id="wui-hive-connect">Connect CELLS Hive</button>
+        </section>
+
+        <section class="wcard wfeature" aria-labelledby="wui-mine-title">
+          <h3 class="wcard-title" id="wui-mine-title">Mining rewards</h3>
+          <p class="wfeature-text" id="wui-mine-text">Enrolled nodes owned by this address and recent mining rewards paid to it.</p>
+          <div class="wmine" id="wui-mine"><p class="wui-fine">Loading enrollments…</p></div>
+          <a class="btn btn-ghost wbtn-full" id="wui-mine-explorer" href="/explorer.html">View in Explorer</a>
+        </section>
+      </div>
+
+      <div class="wapp-pane" id="wui-pane-hive" role="tabpanel" aria-labelledby="wui-seg-hive" hidden>
+        <!-- wallet-provider.js's Hive panel is moved here while the vault is unlocked. -->
+      </div>
+    </div>
+
+    <!-- Create flow (transient, swapped in by JS over the empty state) -->
+    <div id="vault-create-flow" class="vault-state" hidden>
+      <h2 style="margin-top:0">Create a new wallet</h2>
+      <p style="font-size: 13px; color: var(--text-2); margin: 6px 0 12px">
+        Pick a strong passphrase (12+ chars, mix of types). The
+        ML-DSA-87 keypair is generated by <code>wallet.wasm</code>
+        in this tab; the encrypted keystore is then stored in
+        <code>localStorage</code> &mdash; no server upload.
+      </p>
+      <div class="row">
+        <div class="field">
+          <label>Passphrase</label>
+          <input type="password" id="vault-create-pass1" autocomplete="new-password" />
+        </div>
+        <div class="field">
+          <label>Confirm passphrase</label>
+          <input type="password" id="vault-create-pass2" autocomplete="new-password" />
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="vault-create-go">Generate</button>
+        <button class="btn btn-ghost"   id="vault-create-cancel">Back</button>
+      </div>
+      <div class="status-line" id="vault-create-status">Waiting for WASM module…</div>
+    </div>
+
+    <!-- Import flow -->
+    <div id="vault-import-flow" class="vault-state" hidden>
+      <h2 style="margin-top:0">Import existing keystore</h2>
+      <p style="font-size: 13px; color: var(--text-2); margin: 6px 0 12px">
+        Pick a <code>wallet.json</code> file (produced here or by
+        <code>CELLScli wallet new</code>). The passphrase is verified
+        in-page; if it checks out, the keystore is copied into
+        <code>localStorage</code> for future unlocks.
+      </p>
+      <div class="field">
+        <label>Keystore file</label>
+        <input type="file" id="vault-import-file" accept="application/json,.json" />
+      </div>
+      <div class="field">
+        <label>Passphrase</label>
+        <input type="password" id="vault-import-pass" autocomplete="off" />
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="vault-import-go">Import</button>
+        <button class="btn btn-ghost"   id="vault-import-cancel">Back</button>
+      </div>
+      <div class="status-line" id="vault-import-status"></div>
+    </div>
+  </section>
+
+  <section class="panel warn">
+    <h2>Backups: there is no reset</h2>
+    <p style="color: var(--text)">
+      The keystore file and its passphrase are the <strong>only way to reach your
+      coins</strong>. Lose the JSON keystore <em>or</em> forget the passphrase and the
+      address is permanently unrecoverable: no support team, no reset email, no
+      validator override. Export <code>wallet.json</code> (gear icon &rarr; Export &amp; backup) and keep it somewhere safe.
+    </p>
+    <p style="color: var(--text); margin-bottom: 0">
+      The same keystore format is produced by the offline CLI, <code>CELLScli
+      wallet new</code>. If you would rather not trust a web page, use the CLI on a
+      machine you control; the keystore opens here either way.
+    </p>
+  </section>
+
+  <section class="panel success">
+    <p style="margin:0; font-size:14px; color:var(--text-2); line-height:1.55">
+      <strong>Sky Fang players:</strong> link your game account through
+      <a href="/download.html">CELLS Hive</a>, not this browser page.
+      <a href="https://skyfang.xyz/login?next=/dashboard/CELLS" rel="noopener" target="_blank">Open Sky Fang CELLS page</a>
+    </p>
+  </section>
+
+  <details class="panel" id="advanced-panel" style="padding:18px 20px">
+    <summary style="cursor:pointer; font-weight:600; color:var(--text-2); list-style-position:outside">
+      Advanced tools
+      <span style="display:block; font-weight:400; font-size:13px; color:var(--muted); margin-top:4px">
+        Optional: sign a message, inspect a keystore file, or use the legacy generate / balance / send tabs.
+        Everyday create, unlock, and send live in the wallet panel above.
+      </span>
+    </summary>
+    <div style="margin-top:14px">
+    <div class="tabs" role="tablist">
+      <button class="tab" data-tab="sign" role="tab" aria-selected="true">Sign message</button>
+      <button class="tab" data-tab="open" role="tab" aria-selected="false">Open keystore</button>
+      <button class="tab" data-tab="generate" role="tab" aria-selected="false">Generate</button>
+      <button class="tab" data-tab="balance" role="tab" aria-selected="false">Check balance</button>
+      <button class="tab" data-tab="send" role="tab" aria-selected="false">Send transaction</button>
+    </div>
+
+    <!-- Generate -->
+    <div class="tab-pane" data-pane="generate">
+      <h2>Generate a fresh wallet</h2>
+      <p>
+        Choose a strong passphrase (12+ characters, mix of types). The wallet
+        page never sees the passphrase in network traffic: it is fed to
+        <code>PBKDF2-HMAC-SHA-256</code> (600 000 iterations) inside this browser
+        tab, the derived key encrypts the private key under <code>AES-256-GCM</code>,
+        and the resulting JSON keystore is yours to download.
+      </p>
+      <div class="row">
+        <div class="field">
+          <label>Passphrase
+            <span class="hint">12+ chars recommended</span>
+          </label>
+          <input type="password" id="gen-pass1" autocomplete="new-password" />
+        </div>
+        <div class="field">
+          <label>Confirm passphrase</label>
+          <input type="password" id="gen-pass2" autocomplete="new-password" />
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="gen-btn">Generate keystore</button>
+        <button class="btn btn-ghost" id="gen-reveal">Reveal passphrases</button>
+      </div>
+      <div class="status-line" id="gen-status">Waiting for WASM module…</div>
+      <div id="gen-result" hidden></div>
+    </div>
+
+    <!-- Open -->
+    <div class="tab-pane" data-pane="open">
+      <h2>Open an existing keystore</h2>
+      <p>
+        Drop in a <code>wallet.json</code> file (produced here, or by
+        <code>CELLScli wallet new</code>). The browser will decrypt it locally to
+        confirm the passphrase is correct and the file isn't tampered with.
+        Nothing is uploaded.
+      </p>
+      <div class="field">
+        <label>Keystore file</label>
+        <input type="file" id="open-file" accept="application/json,.json" />
+      </div>
+      <div class="field">
+        <label>Passphrase</label>
+        <input type="password" id="open-pass" autocomplete="off" />
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="open-btn">Decrypt &amp; verify</button>
+      </div>
+      <div class="status-line" id="open-status"></div>
+      <div id="open-result" hidden></div>
+    </div>
+
+    <!-- Sign -->
+    <div class="tab-pane active" data-pane="sign">
+      <h2>Sign a message</h2>
+      <p>
+        Decrypt the keystore and produce a <code>ML-DSA-87</code> signature over
+        an arbitrary message. The decrypted private key is held only inside the
+        WASM call; the browser zeros the JS reference as soon as the signature
+        is returned.
+      </p>
+      <div class="field">
+        <label>Keystore file</label>
+        <input type="file" id="sign-file" accept="application/json,.json" />
+      </div>
+      <div class="field">
+        <label>Passphrase</label>
+        <input type="password" id="sign-pass" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label>Message <span class="hint">UTF-8 text</span></label>
+        <textarea id="sign-msg" placeholder="hello, CELLS"></textarea>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="sign-btn">Sign</button>
+      </div>
+      <div class="status-line" id="sign-status"></div>
+      <div id="sign-result" hidden></div>
+    </div>
+
+    <!-- Balance -->
+    <div class="tab-pane" data-pane="balance">
+      <h2>Check an address balance</h2>
+      <p>
+        <strong>Unlike the other three tabs, this one talks to the network.</strong>
+        It sends a single <code>GET https://api.CELLS.tech/api/v1/wallet/balance?address=&lt;addr&gt;</code>
+        and renders the response. An address is public information &mdash; it's already on
+        chain &mdash; so the request leaks no private material, but it does correlate
+        <em>this browser</em> with <em>this address</em> at the validator's HTTP log
+        layer. If you want to avoid that correlation, ask a friend's node, run your own
+        validator, or skip this tab entirely.
+      </p>
+      <div class="field">
+        <label>Address <span class="hint">64 hex chars · <code>hex(sha256(public_key))</code></span></label>
+        <input type="text" id="bal-addr" autocomplete="off" spellcheck="false"
+               placeholder="e.g. 605ab7550bd6c74ce3e5b394c1f6334cea0f6e2951938ae7fc5c775a7e1ac7e2"
+               style="font-family: var(--mono); font-size: 13px;" />
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="bal-btn">Look up balance</button>
+        <button class="btn btn-ghost" id="bal-use-last" disabled
+                title="Use the address from the most recent Generate / Open in this tab">Use my last address</button>
+      </div>
+      <div class="status-line" id="bal-status">Address goes in &rarr; balance comes back.</div>
+      <div id="bal-result" hidden></div>
+    </div>
+
+    <!-- Send transaction (v0.4.0 self-custody) -->
+    <div class="tab-pane" data-pane="send">
+      <h2>Send a transaction (self-custody)</h2>
+      <p>
+        <strong>This is the only tab that spends from your wallet.</strong>
+        Decrypt your keystore with the passphrase, fill in the recipient
+        and amount, click Send. The transaction is built and signed
+        <em>inside this browser tab</em> with your <code>ML-DSA-87</code>
+        private key — the private key never leaves the tab — and only
+        the already-signed envelope is POSTed to
+        <code>api.CELLS.tech/api/v1/wallet/submit-signed</code>. The
+        validator verifies the signature against the embedded public
+        key and enforces <code>sender == hex(sha256(public_key))</code>,
+        so the validator can never spend on your behalf.
+      </p>
+      <p style="font-size: 13px; margin: -8px 0 14px; color: var(--text-2)">
+        <strong>v0.4.1 replay protection:</strong> every send carries a
+        per-account <code>nonce</code> that the validator atomically
+        bumps inside the same transaction as the balance debit. Replays
+        (same envelope, same nonce, twice) return HTTP 409
+        <code>nonce_replay</code> rather than double-spending. The
+        Nonce field below auto-resolves from the validator before
+        sign-time; you can override it manually for off-line ceremonies.
+      </p>
+      <div class="field">
+        <label>Keystore file</label>
+        <input type="file" id="send-file" accept="application/json,.json" />
+      </div>
+      <div class="field">
+        <label>Passphrase</label>
+        <input type="password" id="send-pass" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label>Recipient address <span class="hint">64 hex chars · <code>hex(sha256(recipient_public_key))</code></span></label>
+        <input type="text" id="send-recipient" autocomplete="off" spellcheck="false"
+               placeholder="e.g. 605ab7550bd6c74ce3e5b394c1f6334cea0f6e2951938ae7fc5c775a7e1ac7e2" />
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Amount <span class="hint">CELL</span></label>
+          <input type="text" id="send-amount" autocomplete="off" placeholder="1.0" />
+        </div>
+        <div class="field">
+          <label>Fee <span class="hint">CELL (≥ 0)</span></label>
+          <input type="text" id="send-fee" autocomplete="off" placeholder="0.01" />
+        </div>
+        <div class="field">
+          <label>Geotag <span class="hint">2 letters · ISO-3166-1</span></label>
+          <input type="text" id="send-geotag" autocomplete="off" placeholder="US" maxlength="3" />
+        </div>
+      </div>
+      <div class="field">
+        <label>Parent cells <span class="hint">optional · committed tx_ids · proof-of-entanglement</span></label>
+        <textarea id="send-parents" placeholder="(leave empty to use the validator's two newest committed transactions)"></textarea>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Nonce <span class="hint">v0.4.1 · per-sender · auto = ask validator</span></label>
+          <input type="text" id="send-nonce" autocomplete="off" placeholder="auto"
+                 inputmode="numeric" pattern="[0-9]*" />
+        </div>
+        <div class="field" style="flex:2">
+          <label>Validator endpoint <span class="hint">override only if you self-host</span></label>
+          <input type="text" id="send-endpoint" autocomplete="off"
+                 value="https://api.CELLS.tech/api/v1/wallet/submit-signed" />
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="send-btn">Sign &amp; send</button>
+      </div>
+      <div class="status-line" id="send-status">Recipient + amount + passphrase &rarr; signed envelope &rarr; validator POST.</div>
+      <div id="send-result" hidden></div>
+    </div>
+    </div>
+  </details>
+
+  <details class="panel" style="padding:18px 20px">
+    <summary style="cursor:pointer; font-weight:600; color:var(--text-2)">
+      How this works &amp; CLI
+    </summary>
+    <div style="margin-top:14px">
+    <ul style="color: var(--text-2); margin: 0; padding-left: 20px; line-height: 1.8">
+      <li><strong>Keypair generation:</strong> a <code>~3 MB</code> Go WebAssembly
+        module (<code>wallet.wasm</code>) runs the same <a href="https://github.com/cloudflare/circl/tree/main/sign/mldsa">cloudflare/circl</a>
+        <code>ML-DSA-87</code> implementation that CELLS validators use to verify your
+        transactions. It calls the browser's <code>crypto.getRandomValues</code> for
+        the keygen entropy.</li>
+      <li><strong>Encryption:</strong> the browser's <code>WebCrypto</code> API
+        (<code>crypto.subtle</code>) derives the AES-256 key with
+        <code>PBKDF2-SHA256</code> (600 000 iterations, 16-byte salt), then
+        encrypts the private key under <code>AES-256-GCM</code> with a fresh
+        12-byte nonce. The on-disk format is identical to <code>pkg/keystore</code>
+        (Go) so the CLI and browser can swap keystores freely.</li>
+      <li><strong>Address derivation:</strong> the CELLS address is
+        <code>hex(sha256(public_key))</code>. Same shape as the validator-side
+        <code>pkg/wallet</code> derivation.</li>
+      <li><strong>Bounded network surface:</strong> the Generate / Open / Sign
+        tabs only fetch the three static files
+        (<code>wallet.wasm</code>, <code>wasm_exec.js</code>, <code>wallet.js</code>).
+        They never POST the passphrase, the private key, the public key, or even
+        the address. The <em>Check balance</em> and <em>Send transaction</em>
+        tabs are the two exceptions &mdash; <em>Balance</em> does a single
+        read-only <code>GET</code> against <code>api.CELLS.tech</code> with the
+        address in the query string, and <em>Send</em> does a single
+        <code>POST</code> to <code>/api/v1/wallet/submit-signed</code> with the
+        <strong>already-signed</strong> transaction envelope (the body contains
+        your public key + signature + amount + recipient; <em>never</em> the
+        private key or passphrase). Both happen only after you click their
+        button. Confirm in DevTools → Network.</li>
+      <li><strong>WASM build version:</strong> <span id="wasm-version" style="font-family: var(--mono)">loading…</span></li>
+    </ul>
+    <h3 style="margin: 22px 0 10px; font-size: 16px; color: var(--text-2)">Or do it from the CLI</h3>
+    <p style="color: var(--text-2); font-size: 14px; line-height: 1.55">
+      Identical keystore format, offline. Import into CELLS Hive for normal use.
+      Advanced operators can use <code>CELLSminer-console --protocol=v2</code>
+      (see <a href="/docs/#/miner-quickstart">miner quickstart</a>).
+    </p>
+    <pre style="background:rgba(0,0,0,.35);padding:14px 16px;border-radius:var(--radius-sm);overflow-x:auto;font-family:var(--mono);font-size:13px;color:var(--text);margin:0"># Build once
+git clone https://github.com/blackbeardONE/CELLS
+cd CELLS/CELLS/source
+go build -o CELLScli ./cmd/CELLScli
+
+# Generate a keystore (passphrase prompted)
+./CELLScli wallet new --out ~/.CELLS/wallet.json
+./CELLScli wallet show</pre>
+    </div>
+  </details>
+  <p class="wui-source">
+    This wallet page runs entirely in your browser. Source:
+    <a href="https://github.com/blackbeardONE/CELLS/blob/main/CELLS/source/wasm_modules/wallet/cmd/CELLS-wallet/main.go">wallet WASM</a>
+    +
+    <a href="https://github.com/blackbeardONE/CELLS/blob/main/CELLS/deploy/landing/wallet.js">wallet.js</a>.
+  </p>
+</main>
+
+<footer id="site-footer"></footer>
+
+<!-- First-run safety checklist (remembered in localStorage). -->
+<dialog class="wui-dialog" id="wui-gate" aria-labelledby="wui-gate-title">
+  <div class="wui-dialog-body">
+    <h2 id="wui-gate-title">Before you continue</h2>
+    <p>This page can create, unlock and spend a self-custody wallet. Check these first:</p>
+    <p class="wui-domain-bad" id="wui-gate-domain" hidden></p>
+    <ul class="wui-checklist">
+      <li><div>The address bar shows exactly <code>https://CELLS.tech</code><span>Phishing copies of this page can steal keys the moment they are created or unlocked.</span></div></li>
+      <li><div>This is not a shared or public computer<span>Use your own up-to-date device, ideally after a malware scan.</span></div></li>
+      <li><div>No remote-access or screen-sharing software is running<span>Close remote desktop tools and browser extensions you do not trust.</span></div></li>
+      <li><div>Keys never leave this browser<span>Nobody from CELLS will ever ask for your passphrase, keystore file or private key.</span></div></li>
+      <li><div>There is no undo<span>Signed transfers are final, and a lost keystore or passphrase cannot be recovered.</span></div></li>
+    </ul>
+  </div>
+  <div class="wui-dialog-actions">
+    <button type="button" class="btn btn-ghost" id="wui-gate-back">Go back</button>
+    <button type="button" class="btn btn-primary" id="wui-gate-ok">I understand</button>
+  </div>
+</dialog>
+
+<!-- Wallet settings sheet (opened from the gear icon of the unlocked view). -->
+<dialog class="wui-dialog wui-sheet" id="wui-settings" aria-labelledby="wui-settings-title">
+  <div class="wui-dialog-body">
+    <div class="wsheet-head">
+      <h2 id="wui-settings-title">Settings</h2>
+      <button type="button" class="wapp-x" id="wui-settings-close" aria-label="Close settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+
+    <div class="wset">
+      <h3>Export &amp; backup</h3>
+      <p>Download the encrypted keystore. To restore, use Advanced tools &rarr; Open keystore (or Import) with the <code>wallet.json</code> and your passphrase.</p>
+      <button type="button" class="btn btn-primary wbtn-full" id="vault-export-btn">Download wallet.json</button>
+    </div>
+
+    <div class="wset">
+      <h3><label for="vault-idle-minutes">Auto-lock</label></h3>
+      <p>Re-lock after this many idle minutes (and when the tab is hidden). <code>0</code> disables idle auto-lock.</p>
+      <div class="wset-inline">
+        <input type="number" id="vault-idle-minutes" min="0" max="120" step="1" value="5" />
+        <span>minutes</span>
+      </div>
+    </div>
+
+    <div class="wset">
+      <h3>Safety</h3>
+      <div class="wset-links">
+        <button type="button" class="btn btn-ghost" id="wui-settings-checklist">Show the safety checklist</button>
+        <a class="btn btn-ghost" id="wui-settings-explorer" href="/explorer.html">Address in Explorer</a>
+      </div>
+    </div>
+
+    <div class="wset wset-danger">
+      <h3>Forget this wallet</h3>
+      <p>Wipe the encrypted vault from this browser. Export a backup first; this cannot be undone.</p>
+      <button type="button" class="btn btn-danger" id="vault-settings-forget">Wipe local vault</button>
+    </div>
+    <div class="status-line" id="vault-settings-status"></div>
+  </div>
+</dialog>
+
+<!-- Send review: vault.js waits for this before signing. -->
+<dialog class="wui-dialog wui-review" id="wui-review" aria-labelledby="wui-review-title">
+  <div class="wui-dialog-body">
+    <h2 id="wui-review-title">Review transfer</h2>
+    <p>Nothing has been signed yet. Check every line; a signed transfer cannot be reversed.</p>
+    <dl>
+      <dt>To</dt><dd id="wui-rv-to"></dd>
+      <dt>Amount</dt><dd id="wui-rv-amount"></dd>
+      <dt>Fee</dt><dd id="wui-rv-fee"></dd>
+      <dt>Total</dt><dd id="wui-rv-total" class="total"></dd>
+      <dt>Nonce</dt><dd id="wui-rv-nonce"></dd>
+      <dt>From</dt><dd id="wui-rv-from"></dd>
+      <dt>Balance</dt><dd id="wui-rv-balance">&mdash;</dd>
+      <dt>Geotag</dt><dd id="wui-rv-geotag"></dd>
+    </dl>
+    <p class="wui-warn" id="wui-rv-warn" hidden></p>
+  </div>
+  <div class="wui-dialog-actions">
+    <button type="button" class="btn btn-ghost" id="wui-rv-cancel">Cancel</button>
+    <button type="button" class="btn btn-primary" id="wui-rv-ok">Sign &amp; send</button>
+  </div>
+</dialog>
+
+<script src="/assets/site-shell.js" defer></script>
+<script src="/assets/explorer/shell-fallback.js" defer></script>
+<!--
+  Subresource Integrity is enforced on external scripts and (via wallet.js)
+  on the WASM module. The sha384 values below are emitted by
+  CELLS/scripts/build_wallet_wasm.sh and rotated automatically whenever
+  the Go toolchain rebuilds wallet.wasm (which also re-emits wallet.js
+  with a fresh embedded WASM hash, which in turn changes wallet.js's
+  own hash; the build script handles the dependency chain in order).
+  Manual edits to these literals will work but are not required.
+-->
+<script src="/wasm_exec.js" integrity="sha384-PWCs+V4BDf9yY1yjkD/p+9xNEs4iEbuvq+HezAOJiY3XL5GI6VyJXMsvnjiwNbce" crossorigin="anonymous"></script>
+<script src="/wallet.js" integrity="sha384-l59ay6YynVsgHil0zOYDyg9XWgdlhlSBmR9vzdxt8PTe/dBe8+xy5ntdXRT02aro" crossorigin="anonymous"></script>
+<script src="/wallet-provider.js" integrity="sha384-8nwpNVX7JsCie/Yrs+q6YzhLh8XPyHpLwZuCOwGu2KpxL/yfwR7kqcRa2MIhKIXc" crossorigin="anonymous"></script>
+<!--
+  UX layer (no cryptography): read-only explorer client for on-chain
+  activity, a local QR encoder, the checklist / review dialogs, and the
+  persistent vault UI (formerly an inline script; it reaches PBKDF2,
+  AES-GCM and ML-DSA-87 only through window.CELLSWallet from wallet.js).
+-->
+<script src="/assets/explorer/core.js"></script>
+<script src="/assets/wallet-ui/qr.js"></script>
+<script src="/assets/wallet-ui/wallet-ui.js"></script>
+<script src="/assets/wallet-ui/vault.js"></script>
+</body>
+</html>

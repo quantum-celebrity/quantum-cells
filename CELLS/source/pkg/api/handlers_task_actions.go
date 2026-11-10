@@ -1,0 +1,527 @@
+package api
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/blackbeardONE/CELLS/pkg/chain"
+	"github.com/blackbeardONE/CELLS/pkg/mempool"
+)
+
+const CELLSTaskActionLogPathEnv = "CELLS_TASK_ACTION_LOG_PATH"
+
+// CELLSTaskActionLogSource is the "source" GET /api/v1/tasks/actions reports
+// when the log is configured. It is a label like the task routes' "chain",
+// "operator-overlay" and "operator-registry"; the route used to report the
+// log's file path on the node.
+const CELLSTaskActionLogSource = "operator-action-log"
+
+var CELLSTaskActionLogMu sync.Mutex
+
+type CELLSTaskActionSubmitterHolder struct {
+	mu   sync.RWMutex
+	pool MempoolSubmitter
+}
+
+var CELLSTaskActionMempoolHolder = &CELLSTaskActionSubmitterHolder{}
+
+// SetTaskActionMempool installs (or removes, when pool==nil)
+// the process-wide MempoolSubmitter used by signed task-action
+// submission. Validators call this at startup after constructing
+// the live mempool.
+func SetTaskActionMempool(pool MempoolSubmitter) {
+	CELLSTaskActionMempoolHolder.mu.Lock()
+	defer CELLSTaskActionMempoolHolder.mu.Unlock()
+	CELLSTaskActionMempoolHolder.pool = pool
+}
+
+func currentTaskActionMempool() MempoolSubmitter {
+	CELLSTaskActionMempoolHolder.mu.RLock()
+	defer CELLSTaskActionMempoolHolder.mu.RUnlock()
+	return CELLSTaskActionMempoolHolder.pool
+}
+
+// TaskActionMempoolReady reports whether signed task actions can be submitted
+// to the live validator mempool. Validators use this during startup so a
+// partially wired task-action API cannot silently return 503 in production.
+func TaskActionMempoolReady() bool {
+	return currentTaskActionMempool() != nil
+}
+
+// TaskActionSubmissionReady reports whether the public signed-task endpoint
+// has both of its process-wide dependencies: a live mempool and durable action
+// logging. It is safe to expose through the public status response.
+func TaskActionSubmissionReady() bool {
+	return TaskActionMempoolReady() && CELLSTaskActionLogPath() != ""
+}
+
+type CELLSTaskActionEnvelope struct {
+	ID        string  `json:"id"`
+	Sender    string  `json:"sender"`
+	TaskID    string  `json:"task_id"`
+	Action    string  `json:"action"`
+	Amount    float64 `json:"amount,omitempty"`
+	Payload   string  `json:"payload,omitempty"`
+	Nonce     uint64  `json:"nonce,omitempty"`
+	Timestamp string  `json:"timestamp"`
+	Signature string  `json:"signature"`
+	PublicKey string  `json:"public_key,omitempty"`
+}
+
+type CELLSTaskActionRecord struct {
+	ReceivedAt string                 `json:"received_at"`
+	Envelope   CELLSTaskActionEnvelope `json:"envelope"`
+}
+
+type CELLSTaskActionSubmitResponse struct {
+	ActionID         string `json:"action_id"`
+	Status           string `json:"status"`
+	Sender           string `json:"sender"`
+	TaskID           string `json:"task_id"`
+	Action           string `json:"action"`
+	LastNonce        uint64 `json:"last_nonce,omitempty"`
+	MempoolSubmitted bool   `json:"mempool_submitted"`
+	MempoolStatus    string `json:"mempool_status,omitempty"`
+	MempoolError     string `json:"mempool_error,omitempty"`
+}
+
+type CELLSTaskActionsListResponse struct {
+	Configured bool                   `json:"configured"`
+	Source     string                 `json:"source,omitempty"`
+	Actions    []CELLSTaskActionRecord `json:"actions"`
+}
+
+func CELLSTaskActionLogPath() string {
+	return strings.TrimSpace(os.Getenv(CELLSTaskActionLogPathEnv))
+}
+
+func validateCELLSTaskActionEnvelope(env CELLSTaskActionEnvelope) error {
+	if err := ValidateTransactionID(env.ID); err != nil {
+		return fmt.Errorf("invalid action id: %w", err)
+	}
+	if err := ValidateAddress(env.Sender); err != nil {
+		return fmt.Errorf("invalid sender address: %w", err)
+	}
+	if err := ValidateString(env.TaskID, "task_id", 1, 256); err != nil {
+		return err
+	}
+	switch env.Action {
+	case "start", "stop", "stake", "fund", "unstake", "submit", "claim", "withdraw", "migrate",
+		chain.TaskActionCatalogRegister, chain.TaskActionCatalogUpdate,
+		chain.TaskActionCatalogPause, chain.TaskActionCatalogResume:
+	default:
+		return fmt.Errorf("unsupported action %q", SanitizeString(env.Action, 64))
+	}
+	if env.Amount < 0 {
+		return fmt.Errorf("amount cannot be negative")
+	}
+	if env.Amount > 0 {
+		if err := ValidateAmount(env.Amount); err != nil {
+			return err
+		}
+	}
+	if err := ValidateString(env.Payload, "payload", 0, 100000); err != nil {
+		return err
+	}
+	if err := ValidateTimestamp(env.Timestamp); err != nil {
+		return err
+	}
+	if env.PublicKey == "" {
+		return fmt.Errorf("envelope.public_key is required")
+	}
+	if env.Signature == "" {
+		return fmt.Errorf("envelope.signature is required")
+	}
+	return nil
+}
+
+func (h *Handlers) verifyCELLSTaskActionEnvelope(env CELLSTaskActionEnvelope) error {
+	if h.walletService == nil {
+		return errors.New(msgWalletServiceUnavailable)
+	}
+	pubBytes, err := hex.DecodeString(env.PublicKey)
+	if err != nil {
+		return fmt.Errorf("envelope.public_key is not valid hex")
+	}
+	derivedAddr := hex.EncodeToString(sha256Sum(pubBytes))
+	if derivedAddr != env.Sender {
+		return fmt.Errorf("envelope.sender does not match hex(sha256(public_key))")
+	}
+
+	sigBytes, err := hex.DecodeString(env.Signature)
+	if err != nil {
+		return fmt.Errorf("envelope.signature is not valid hex")
+	}
+
+	unsigned := env
+	unsigned.Signature = ""
+	unsigned.PublicKey = ""
+	canonical, err := json.Marshal(unsigned)
+	if err != nil {
+		return fmt.Errorf("failed to canonicalise envelope")
+	}
+	ok, verr := h.walletService.VerifySignature(canonical, sigBytes, pubBytes)
+	if verr != nil || !ok {
+		return fmt.Errorf("signature does not verify under envelope.public_key")
+	}
+	return nil
+}
+
+type CELLSTaskActionAppendResult struct {
+	Duplicate   bool
+	NonceReplay bool
+	LastNonce   uint64
+}
+
+func inspectCELLSTaskActionLog(path string, env CELLSTaskActionEnvelope) (CELLSTaskActionAppendResult, error) {
+	file, err := os.Open(path) // #nosec G304 -- path is the operator-configured task action ledger.
+	if os.IsNotExist(err) {
+		return CELLSTaskActionAppendResult{}, nil
+	}
+	if err != nil {
+		return CELLSTaskActionAppendResult{}, err
+	}
+	defer file.Close()
+
+	var result CELLSTaskActionAppendResult
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		var record CELLSTaskActionRecord
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			continue
+		}
+		if record.Envelope.ID == env.ID {
+			result.Duplicate = true
+			return result, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return CELLSTaskActionAppendResult{}, err
+	}
+	return result, nil
+}
+
+func appendCELLSTaskAction(path string, record CELLSTaskActionRecord) (CELLSTaskActionAppendResult, error) {
+	CELLSTaskActionLogMu.Lock()
+	defer CELLSTaskActionLogMu.Unlock()
+
+	result, err := inspectCELLSTaskActionLog(path, record.Envelope)
+	if err != nil {
+		return CELLSTaskActionAppendResult{}, err
+	}
+	if result.Duplicate || result.NonceReplay {
+		return result, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return CELLSTaskActionAppendResult{}, err
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return CELLSTaskActionAppendResult{}, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- path is the operator-configured task action ledger.
+	if err != nil {
+		return CELLSTaskActionAppendResult{}, err
+	}
+	defer file.Close()
+	if _, err := file.Write(append(raw, '\n')); err != nil {
+		return CELLSTaskActionAppendResult{}, err
+	}
+	return result, nil
+}
+
+func readCELLSTaskActions(path, taskID, sender string, limit int) ([]CELLSTaskActionRecord, error) {
+	file, err := os.Open(path) // #nosec G304 -- path is the operator-configured task action ledger.
+	if os.IsNotExist(err) {
+		return []CELLSTaskActionRecord{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	unlimited := limit < 0
+	if !unlimited && limit <= 0 {
+		limit = 100
+	}
+	if !unlimited && limit > 500 {
+		limit = 500
+	}
+
+	actions := []CELLSTaskActionRecord{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		var record CELLSTaskActionRecord
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			continue
+		}
+		if taskID != "" && record.Envelope.TaskID != taskID {
+			continue
+		}
+		if sender != "" && record.Envelope.Sender != sender {
+			continue
+		}
+		actions = append(actions, record)
+		if !unlimited && len(actions) >= limit {
+			break
+		}
+	}
+	return actions, scanner.Err()
+}
+
+func (h *Handlers) CELLSTaskActionSubmitSignedHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	path := CELLSTaskActionLogPath()
+	if path == "" {
+		writeErrorResponse(w, http.StatusServiceUnavailable, CELLSTaskActionLogPathEnv+" is not configured")
+		return
+	}
+	if h.walletService == nil {
+		writeErrorResponse(w, http.StatusServiceUnavailable, msgWalletServiceUnavailable)
+		return
+	}
+
+	var env CELLSTaskActionEnvelope
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&env); err != nil {
+		writeErrorResponse(w, http.StatusBadRequest, "invalid envelope: "+err.Error())
+		return
+	}
+	env.Action = strings.ToLower(strings.TrimSpace(env.Action))
+	env.Sender = strings.TrimSpace(strings.ToLower(env.Sender))
+	env.TaskID = strings.TrimSpace(env.TaskID)
+
+	if err := validateCELLSTaskActionEnvelope(env); err != nil {
+		writeErrorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.verifyCELLSTaskActionEnvelope(env); err != nil {
+		if strings.Contains(err.Error(), "sender does not match") {
+			writeErrorResponse(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeErrorResponse(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	preflightResult, err := inspectCELLSTaskActionLog(path, env)
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, "failed to inspect task action log: "+err.Error())
+		return
+	}
+	if preflightResult.Duplicate {
+		writeJSONResponse(w, http.StatusConflict, CELLSTaskActionSubmitResponse{
+			ActionID: env.ID,
+			Status:   "duplicate",
+			Sender:   env.Sender,
+			TaskID:   env.TaskID,
+			Action:   env.Action,
+		})
+		return
+	}
+
+	mempoolSubmitted, mempoolStatus, mempoolError := submitCELLSTaskActionToMempool(env)
+	if !mempoolSubmitted {
+		statusCode := http.StatusUnprocessableEntity
+		if mempoolStatus == "not_configured" {
+			statusCode = http.StatusServiceUnavailable
+		}
+		writeJSONResponse(w, statusCode, CELLSTaskActionSubmitResponse{
+			ActionID:         env.ID,
+			Status:           "rejected",
+			Sender:           env.Sender,
+			TaskID:           env.TaskID,
+			Action:           env.Action,
+			MempoolSubmitted: false,
+			MempoolStatus:    mempoolStatus,
+			MempoolError:     mempoolError,
+		})
+		return
+	}
+
+	record := CELLSTaskActionRecord{
+		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Envelope:   env,
+	}
+	appendResult, err := appendCELLSTaskAction(path, record)
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, "failed to persist task action: "+err.Error())
+		return
+	}
+	if appendResult.Duplicate {
+		writeJSONResponse(w, http.StatusConflict, CELLSTaskActionSubmitResponse{
+			ActionID: env.ID,
+			Status:   "duplicate",
+			Sender:   env.Sender,
+			TaskID:   env.TaskID,
+			Action:   env.Action,
+		})
+		return
+	}
+
+	writeJSONResponse(w, http.StatusOK, CELLSTaskActionSubmitResponse{
+		ActionID:         env.ID,
+		Status:           "accepted",
+		Sender:           env.Sender,
+		TaskID:           env.TaskID,
+		Action:           env.Action,
+		MempoolSubmitted: mempoolSubmitted,
+		MempoolStatus:    mempoolStatus,
+		MempoolError:     mempoolError,
+	})
+}
+
+func submitCELLSTaskActionToMempool(env CELLSTaskActionEnvelope) (bool, string, string) {
+	pool := currentTaskActionMempool()
+	if pool == nil {
+		return false, "not_configured", ""
+	}
+	tx, err := CELLSTaskActionMempoolTx(env)
+	if err != nil {
+		return false, "encode_failed", SanitizeString(err.Error(), 256)
+	}
+	if err := pool.Add(tx); err != nil {
+		if errors.Is(err, mempool.ErrDuplicateTx) {
+			return true, "duplicate", ""
+		}
+		return false, "rejected", SanitizeString(err.Error(), 256)
+	}
+	return true, "submitted", ""
+}
+
+func CELLSTaskActionMempoolTx(env CELLSTaskActionEnvelope) (*mempool.Tx, error) {
+	payload, err := json.Marshal(CELLSTaskActionToChain(env))
+	if err != nil {
+		return nil, err
+	}
+	amount := 0.0
+	if env.Action == "stake" || env.Action == "fund" {
+		amount = env.Amount
+	}
+	return &mempool.Tx{
+		ID:         env.ID,
+		Sender:     env.Sender,
+		Amount:     amount,
+		Nonce:      env.Nonce,
+		Payload:    payload,
+		ContractID: chain.TaskContractID,
+		// Carry the proof. This handler verifies the envelope and used to
+		// drop these two fields, so consensus replay had nothing to
+		// re-check and a proposer could inject task actions against any
+		// account. See chain.VerifyTaskActionSignature.
+		Signature: env.Signature,
+		PublicKey: env.PublicKey,
+	}, nil
+}
+
+func CELLSTaskActionToChain(env CELLSTaskActionEnvelope) chain.TaskAction {
+	return chain.TaskAction{
+		ID:        env.ID,
+		Sender:    env.Sender,
+		TaskID:    env.TaskID,
+		Action:    env.Action,
+		Amount:    env.Amount,
+		Payload:   env.Payload,
+		Nonce:     env.Nonce,
+		Timestamp: env.Timestamp,
+	}
+}
+
+func isIgnorableTaskActionProjectionError(err error) bool {
+	return errors.Is(err, chain.ErrDuplicateTaskAction) ||
+		errors.Is(err, chain.ErrTaskActionNonceReplay) ||
+		errors.Is(err, chain.ErrTaskActionRequiresStake) ||
+		errors.Is(err, chain.ErrInsufficientTaskRewardPool) ||
+		// The operator log predates block-height-aware replay and can contain
+		// valid historical CPU proofs without a resource discriminator. The
+		// canonical chain provider already contains those actions; ignore only
+		// this typed legacy shape while building the read-only API projection.
+		errors.Is(err, chain.ErrLegacyResourceWorkerProof)
+}
+
+func (h *Handlers) CELLSTaskActionsListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	path := CELLSTaskActionLogPath()
+	if path == "" {
+		writeJSONResponse(w, http.StatusOK, CELLSTaskActionsListResponse{
+			Configured: false,
+			Actions:    []CELLSTaskActionRecord{},
+		})
+		return
+	}
+
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	actions, err := readCELLSTaskActions(
+		path,
+		strings.TrimSpace(r.URL.Query().Get("task_id")),
+		strings.TrimSpace(strings.ToLower(r.URL.Query().Get("sender"))),
+		limit,
+	)
+	if err != nil {
+		// The error names the log's file path; it goes to the node's log only.
+		WriteServerError(w, h.logger, "read_task_action_log", err)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, CELLSTaskActionsListResponse{
+		Configured: true,
+		Source:     CELLSTaskActionLogSource,
+		Actions:    actions,
+	})
+}
+
+func (h *Handlers) CELLSTaskActionRouteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	actionID := strings.TrimPrefix(r.URL.Path, "/api/v1/tasks/actions/")
+	actionID = strings.TrimSpace(strings.Trim(actionID, "/"))
+	if actionID == "" || actionID == "submit-signed" {
+		writeErrorResponse(w, http.StatusBadRequest, "action_id required")
+		return
+	}
+
+	path := CELLSTaskActionLogPath()
+	if path == "" {
+		writeErrorResponse(w, http.StatusServiceUnavailable, CELLSTaskActionLogPathEnv+" is not configured")
+		return
+	}
+
+	actions, err := readCELLSTaskActions(path, "", "", 500)
+	if err != nil {
+		WriteServerError(w, h.logger, "read_task_action_log", err)
+		return
+	}
+	for _, action := range actions {
+		if action.Envelope.ID == actionID {
+			writeJSONResponse(w, http.StatusOK, action)
+			return
+		}
+	}
+	writeErrorResponse(w, http.StatusNotFound, "task action not found")
+}

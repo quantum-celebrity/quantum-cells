@@ -1,0 +1,69 @@
+# CELLS Configuration for Development (Game Integration)
+# This config disables TLS and uses HTTP on port 8080
+
+# Network Configuration
+network:
+  port: 4001
+  bind_address: "127.0.0.1"
+  bootstrap_peers: []
+
+# Storage Configuration
+storage:
+  type: "sqlite"  # Local validator uses SQLite when built with CGO.
+  sqlite_path: "CELLS.db"
+
+# Monitoring Configuration
+monitoring:
+  dashboard_port: 8081
+  dashboard_bind_address: "127.0.0.1"
+  log_viewer_port: 8082  # Changed from 8080 to avoid conflict with API
+  log_file: "CELLS.log"
+  log_level: "INFO"
+
+# API Server Configuration (HTTP for development)
+api:
+  port: 8080
+  bind_address: "127.0.0.1"
+  enable_tls: false  # Disable TLS for development
+  tls_cert_file: ""
+  tls_key_file: ""
+
+# Wallet Configuration
+wallet:
+  initial_balance: 1000.0
+
+# Governance Configuration
+governance:
+  proposal_file: "proposals.json"
+
+# Consensus Configuration
+consensus:
+  task_action_signature_activation_height: 625000
+  tx_content_root_activation_height: 625000
+  enrollment_state_root_activation_height: 625000
+  # Proof-of-Entanglement parent rules for signed wallet transfers.
+  # 0 = never (default); every validator must use the same height.
+  poe_activation_height: 0
+
+  # Producers whose blocks this node will append from the `CELLS-blocks` gossip
+  # topic. Leaving this empty accepts a block from ANY peer that reaches the
+  # topic: TryAppendExternalBlock authenticates the block but not the right to
+  # produce one, and live blocks are unsigned, so an arbitrary peer could build
+  # a block on the current tip and have this node replay its transactions.
+  #
+  # The value below is the reference network's current signed block producer.
+  # This is NOT the libp2p bootstrap peer ID; signed blocks derive ProducerID
+  # from the validator signing key. Verify against:
+  #   GET /api/v1/chain/blocks?from=<recent-height>&limit=1
+  #
+  # If you run your own producer, replace this with the producer_id shown in
+  # its signed blocks. An entry that does not match the producer stops this node
+  # following the chain.
+  authorized_block_producers:
+    - "42d05e653f004d0aa71ae9cebc7b2a5b5d0dc7bb41b219a8e99d7c29229c438b"
+
+# Performance Configuration
+performance:
+  demo_transactions: false
+  transaction_interval: "30s"
+  health_check_interval: "30s"

@@ -1,0 +1,9 @@
+{
+  "public_site": "https://CELLS.tech",
+  "public_api_base": "https://api.CELLS.tech",
+  "core_api_base": "https://api.CELLS.tech/api/v1",
+  "home_gateway_relay": "https://api.CELLS.tech",
+  "home_gateway_slot": "home-validator",
+  "reference_bootstrap_peer": "/dns4/api.CELLS.tech/tcp/4001/p2p/12D3KooWRH4MGiaRYMZEr9LvdxYrpePT5LPbNqLTMGukD32yhkZ8",
+  "vps_ssh_target": "root@node.CELLS.tech"
+}

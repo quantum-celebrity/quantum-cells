@@ -1,0 +1,514 @@
+package chain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+
+	"github.com/blackbeardONE/CELLS/pkg/mempool"
+)
+
+// Account represents a user's on-chain state.
+type Account struct {
+	Address string  `json:"address"`
+	Balance float64 `json:"balance"`
+	Nonce   uint64  `json:"nonce"`
+
+	// BalanceDust is the authoritative balance once the integer-dust fork
+	// is active (see account_dust.go). Below the fork it is unset and
+	// Balance is authoritative; at and above it, Balance becomes a derived
+	// mirror kept in sync for JSON and API consumers. Omitted from JSON
+	// while zero so pre-fork snapshots round-trip byte-identically.
+	BalanceDust uint64 `json:"balance_dust,omitempty"`
+}
+
+// AccountStore manages all account states and enforces nonce ordering.
+type AccountStore struct {
+	mu        sync.RWMutex
+	persistMu sync.Mutex
+	accounts  map[string]*Account
+
+	// heightFn supplies the current chain height so the store can tell
+	// whether integer-dust accounting is active. Nil means pre-fork.
+	heightFn func() uint64
+	// dustMigrated records that MigrateToDust has run.
+	dustMigrated bool
+}
+
+// NewAccountStore creates an empty account store.
+func NewAccountStore() *AccountStore {
+	return &AccountStore{accounts: make(map[string]*Account)}
+}
+
+// GetOrCreate returns an existing account or creates one with zero balance.
+func (as *AccountStore) GetOrCreate(address string) *Account {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	acc, ok := as.accounts[address]
+	if !ok {
+		acc = &Account{Address: address}
+		as.accounts[address] = acc
+	}
+	cp := *acc
+	return &cp
+}
+
+// Get returns a copy of the account, or nil if it doesn't exist.
+func (as *AccountStore) Get(address string) (*Account, bool) {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+	acc, ok := as.accounts[address]
+	if !ok {
+		return nil, false
+	}
+	cp := *acc
+	return &cp, true
+}
+
+// DebitAndBumpNonce atomically validates the sender's nonce, checks
+// balance, debits `amount`, and bumps the sender's nonce by one.
+// Intended for non-transfer transactions (enrollment, future contract
+// calls) that go through AccountStore but don't match the
+// Sender→Recipient transfer shape of ApplyTx.
+//
+// Returns an error — with the store UN-mutated — if:
+//   - the sender account doesn't exist
+//   - tx.Nonce doesn't match the sender's current nonce
+//   - the sender's balance is below `amount`
+//   - `amount` is non-positive (to keep the contract symmetric with
+//     Debit; a zero-amount "just bump the nonce" caller should use a
+//     future dedicated helper, not smuggle it through here)
+//
+// Matches the atomicity guarantee of ApplyTx: either the whole
+// debit-and-bump happens, or nothing changes. Required because
+// consensus receipts reference the post-apply nonce; any code path
+// that bumps the nonce without the debit (or vice-versa) would
+// produce inconsistent state roots across validators.
+func (as *AccountStore) DebitAndBumpNonce(sender string, amount float64, expectedNonce uint64) error {
+	if amount <= 0 {
+		return fmt.Errorf("debit amount must be positive, got %.8f", amount)
+	}
+	return as.ChargeAndBumpNonce(sender, amount, expectedNonce)
+}
+
+// ChargeAndBumpNonce atomically validates the sender nonce, charges
+// a non-negative amount, and bumps the nonce by one. It is the
+// contract-call sibling of DebitAndBumpNonce: zero-fee calls still
+// consume nonce space so replay protection stays tied to account
+// state.
+func (as *AccountStore) ChargeAndBumpNonce(sender string, amount float64, expectedNonce uint64) error {
+	if amount < 0 {
+		return fmt.Errorf("charge amount cannot be negative, got %.8f", amount)
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	acc, ok := as.accounts[sender]
+	if !ok {
+		return fmt.Errorf("sender %s not found", sender)
+	}
+	if acc.Nonce != expectedNonce {
+		return fmt.Errorf("nonce mismatch for %s: expected %d, got %d",
+			sender, acc.Nonce, expectedNonce)
+	}
+	if acc.Balance < amount {
+		return fmt.Errorf("insufficient balance: have %.8f, need %.8f",
+			acc.Balance, amount)
+	}
+	acc.Balance -= amount
+	acc.Nonce++
+	return nil
+}
+
+// ChargeAndBumpNonceAllowCreate is the zero-balance onboarding variant of
+// ChargeAndBumpNonce. A missing sender may be created only for a zero charge
+// with nonce 0; all other calls retain the normal missing-account rejection.
+// Creation, validation, and nonce advancement happen under one lock so a
+// rejected enrollment cannot leave a consensus-visible empty account behind.
+func (as *AccountStore) ChargeAndBumpNonceAllowCreate(sender string, amount float64, expectedNonce uint64) error {
+	if amount < 0 {
+		return fmt.Errorf("charge amount cannot be negative, got %.8f", amount)
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	acc, ok := as.accounts[sender]
+	if !ok {
+		if amount != 0 || expectedNonce != 0 {
+			return fmt.Errorf("sender %s not found", sender)
+		}
+		acc = &Account{Address: sender}
+		as.accounts[sender] = acc
+	}
+	if acc.Nonce != expectedNonce {
+		return fmt.Errorf("nonce mismatch for %s: expected %d, got %d",
+			sender, acc.Nonce, expectedNonce)
+	}
+	if acc.Balance < amount {
+		return fmt.Errorf("insufficient balance: have %.8f, need %.8f",
+			acc.Balance, amount)
+	}
+	acc.Balance -= amount
+	acc.Nonce++
+	return nil
+}
+
+// ApplyProtocolReward debits the full protocol reward from the system funder
+// while crediting only liquidAmount to the recipient. The difference is held
+// in consensus enrollment state as a deferred mining bond.
+func (as *AccountStore) ApplyProtocolReward(tx *mempool.Tx, liquidAmount float64) error {
+	if tx == nil {
+		return fmt.Errorf("nil protocol reward tx")
+	}
+	if liquidAmount < 0 || liquidAmount > tx.Amount {
+		return fmt.Errorf("invalid liquid reward %.8f for total %.8f", liquidAmount, tx.Amount)
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	sender, ok := as.accounts[tx.Sender]
+	if !ok {
+		return fmt.Errorf("sender %s not found", tx.Sender)
+	}
+	if tx.Nonce != sender.Nonce {
+		return fmt.Errorf("nonce mismatch for %s: expected %d, got %d", tx.Sender, sender.Nonce, tx.Nonce)
+	}
+	total := tx.Amount + tx.Fee
+	if sender.Balance < total {
+		return fmt.Errorf("insufficient balance: have %.8f, need %.8f", sender.Balance, total)
+	}
+	sender.Balance -= total
+	sender.Nonce++
+	if liquidAmount > 0 {
+		recipient, exists := as.accounts[tx.Recipient]
+		if !exists {
+			recipient = &Account{Address: tx.Recipient}
+			as.accounts[tx.Recipient] = recipient
+		}
+		recipient.Balance += liquidAmount
+	}
+	return nil
+}
+
+// Debit removes funds if the account exists and has sufficient balance.
+func (as *AccountStore) Debit(address string, amount float64) error {
+	if amount <= 0 {
+		return fmt.Errorf("debit amount must be positive")
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	acc, ok := as.accounts[address]
+	if !ok {
+		return fmt.Errorf("account %s not found", address)
+	}
+	if acc.Balance < amount {
+		return fmt.Errorf("insufficient balance for %s", address)
+	}
+	acc.Balance -= amount
+	return nil
+}
+
+// Credit adds funds to an account (e.g. genesis allocation, rewards).
+func (as *AccountStore) Credit(address string, amount float64) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	acc, ok := as.accounts[address]
+	if !ok {
+		acc = &Account{Address: address}
+		as.accounts[address] = acc
+	}
+	if as.dustActiveLocked() {
+		// Integer credit. Floor the incoming amount: crediting more than
+		// was asked for would mint money out of a rounding decision.
+		d, err := CellToDust(amount)
+		if err != nil {
+			d = uint64(math.Max(0, math.Floor(amount*float64(DustPerCellInt))))
+		}
+		setBalanceDustLocked(acc, balanceDustLocked(acc)+d)
+		return
+	}
+	acc.Balance += amount
+}
+
+// ApplyTx validates and applies a transaction: checks balance, nonce, and transfers funds.
+func (as *AccountStore) ApplyTx(tx *mempool.Tx) error {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	sender, ok := as.accounts[tx.Sender]
+	if !ok {
+		return fmt.Errorf("sender %s not found", tx.Sender)
+	}
+
+	// Nonce check: tx.Nonce must equal sender's current nonce
+	if tx.Nonce != sender.Nonce {
+		return fmt.Errorf("nonce mismatch for %s: expected %d, got %d", tx.Sender, sender.Nonce, tx.Nonce)
+	}
+
+	if as.dustActiveLocked() {
+		// Integer transfer. Debit and credit are computed in the same
+		// unit at the same precision, so the amount leaving the sender is
+		// exactly the amount arriving — the property float64 lost when
+		// the two accounts sat at different magnitudes.
+		amountDust := floorToDust(tx.Amount)
+		feeDust := floorToDust(tx.Fee)
+		totalDust := amountDust + feeDust
+		if totalDust < amountDust { // overflow
+			return fmt.Errorf("transfer amount overflows dust range")
+		}
+		have := balanceDustLocked(sender)
+		if have < totalDust {
+			return fmt.Errorf("insufficient balance: have %d dust, need %d dust", have, totalDust)
+		}
+		setBalanceDustLocked(sender, have-totalDust)
+		sender.Nonce++
+
+		recipient, ok := as.accounts[tx.Recipient]
+		if !ok {
+			recipient = &Account{Address: tx.Recipient}
+			as.accounts[tx.Recipient] = recipient
+		}
+		setBalanceDustLocked(recipient, balanceDustLocked(recipient)+amountDust)
+		return nil
+	}
+
+	total := tx.Amount + tx.Fee
+	if sender.Balance < total {
+		return fmt.Errorf("insufficient balance: have %.8f, need %.8f", sender.Balance, total)
+	}
+
+	// Apply
+	sender.Balance -= total
+	sender.Nonce++
+
+	recipient, ok := as.accounts[tx.Recipient]
+	if !ok {
+		recipient = &Account{Address: tx.Recipient}
+		as.accounts[tx.Recipient] = recipient
+	}
+	recipient.Balance += tx.Amount
+
+	return nil
+}
+
+// Clone returns an independent copy of the account store for speculative block building.
+// Mutations on the clone do not affect the receiver.
+func (as *AccountStore) Clone() *AccountStore {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+	out := &AccountStore{
+		accounts:     make(map[string]*Account, len(as.accounts)),
+		heightFn:     as.heightFn,
+		dustMigrated: as.dustMigrated,
+	}
+	for k, v := range as.accounts {
+		cp := *v
+		out.accounts[k] = &cp
+	}
+	return out
+}
+
+// ChainReplayClone implements ChainReplayApplier.
+func (as *AccountStore) ChainReplayClone() ChainReplayApplier {
+	if as == nil {
+		return nil
+	}
+	return as.Clone()
+}
+
+// RestoreFromChainReplay implements ChainReplayApplier.
+func (as *AccountStore) RestoreFromChainReplay(from ChainReplayApplier) error {
+	if as == nil {
+		return fmt.Errorf("chain: nil account store")
+	}
+	other, ok := from.(*AccountStore)
+	if !ok || other == nil {
+		return fmt.Errorf("chain: replay restore expects *AccountStore snapshot")
+	}
+	as.RestoreFrom(other)
+	return nil
+}
+
+// RestoreFrom replaces all accounts with a deep copy of snap's map (rollback / atomic apply helper).
+func (as *AccountStore) RestoreFrom(snap *AccountStore) {
+	if as == nil || snap == nil {
+		return
+	}
+	snap.mu.RLock()
+	out := make(map[string]*Account, len(snap.accounts))
+	for k, v := range snap.accounts {
+		cp := *v
+		out[k] = &cp
+	}
+	dustMigrated := snap.dustMigrated
+	snap.mu.RUnlock()
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	as.accounts = out
+	as.dustMigrated = dustMigrated
+}
+
+// StateRoot computes a deterministic hash of all account states.
+func (as *AccountStore) StateRoot() string {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+
+	addrs := make([]string, 0, len(as.accounts))
+	for addr := range as.accounts {
+		addrs = append(addrs, addr)
+	}
+	sort.Strings(addrs)
+
+	dust := as.dustActiveLocked()
+	h := sha256.New()
+	for _, addr := range addrs {
+		acc := as.accounts[addr]
+		if dust {
+			// Integer encoding. %f below renders six decimal places, so
+			// any balance under 1e-6 CELL was invisible to the pre-fork
+			// state root even though the protocol's unit is 1e-8 — two
+			// nodes could disagree by up to 99 dust and still agree on
+			// the root.
+			fmt.Fprint(h, dustStateRootSegment(acc))
+			continue
+		}
+		fmt.Fprintf(h, "%s:%f:%d;", acc.Address, acc.Balance, acc.Nonce)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// AllAccounts returns a snapshot of all accounts.
+func (as *AccountStore) AllAccounts() []Account {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+	out := make([]Account, 0, len(as.accounts))
+	for _, acc := range as.accounts {
+		out = append(out, *acc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Address < out[j].Address })
+	return out
+}
+
+// Count returns the number of accounts.
+func (as *AccountStore) Count() int {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+	return len(as.accounts)
+}
+
+// Save persists all accounts to a JSON file.
+func (as *AccountStore) Save(path string) error {
+	if path == "" {
+		return fmt.Errorf("account store save path is required")
+	}
+	as.persistMu.Lock()
+	defer as.persistMu.Unlock()
+
+	accounts := as.AllAccounts()
+	data, err := json.MarshalIndent(accounts, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmpPath := path + ".pending"
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	cleanup := true
+	defer func() {
+		_ = tmp.Close()
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+// Load restores accounts from a JSON file.
+//
+// Returns the number of accounts actually STORED, which is not necessarily the
+// number of entries in the file: duplicate addresses last-write-wins, and the
+// count used to be len(accounts), so a file carrying the same address twice
+// reported more accounts than the store held. That number is logged at boot as
+// "accounts_loaded" (cmd/CELLS/main.go:2120), so the inflation was operator-
+// facing.
+//
+// NOTE ON VALIDATION. This performs none beyond JSON well-formedness, so a
+// restored file can carry balances no runtime path would produce -- Debit's
+// insufficient-balance refusal, ApplyTx's pre-debit check and the SQLite
+// CHECK(balance >= 0) all guard the LIVE ledger, not this one. That is less
+// alarming than it first looks: Load runs only on the restore path, and both
+// state-root comparisons there (main.go:270 and main.go:2038) fold every
+// balance into SHA-256, so accidental corruption changes the root and the node
+// refuses to boot rather than running on it. A negative balance is therefore
+// only reachable by someone who can also forge a matching root -- and such an
+// adversary can write a non-negative balance just as easily, which is why this
+// logs rather than refuses. CELLS_cell_supply_negative_total reports the same
+// condition at scrape time.
+func (as *AccountStore) Load(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var accounts []Account
+	if err := json.Unmarshal(data, &accounts); err != nil {
+		return 0, err
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	var negative []string
+	// Distinct addresses THIS FILE contributed. Not len(as.accounts): the store
+	// may already hold accounts from genesis or an earlier restore, so the total
+	// store size is a different number again -- I wrote that first while fixing
+	// the len(accounts) miscount, which would have replaced one wrong count with
+	// another.
+	seen := make(map[string]struct{}, len(accounts))
+	for _, acc := range accounts {
+		cp := acc
+		as.accounts[acc.Address] = &cp
+		seen[acc.Address] = struct{}{}
+		if cp.Balance < 0 {
+			negative = append(negative, cp.Address)
+		}
+	}
+	if len(negative) > 0 {
+		// Not fatal, deliberately: see the note above. Surfaced because a
+		// balance this file should never contain is worth a line in the boot
+		// log, not only a gauge someone has to go looking for.
+		shown := negative
+		if len(shown) > 5 {
+			shown = shown[:5]
+		}
+		fmt.Fprintf(os.Stderr,
+			"WARNING: restored account state contains %d negative balance(s) from %s (e.g. %v); "+
+				"no runtime path produces these -- see CELLS_cell_supply_negative_total\n",
+			len(negative), path, shown)
+	}
+	return len(seen), nil
+}

@@ -1,0 +1,516 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestValidate_StrictSecrets_rejectsShort(t *testing.T) {
+	c := &Config{
+		NetworkPort:             4001,
+		DashboardPort:           8081,
+		LogViewerPort:           9000,
+		APIPort:                 8080,
+		StorageType:             "file",
+		StrictProductionSecrets: true,
+		NGCIngestSecret:         "short",
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for short NGC ingest secret")
+	}
+}
+
+func TestValidate_StrictSecrets_rejectsCharming123Prefix(t *testing.T) {
+	c := &Config{
+		NetworkPort:             4001,
+		DashboardPort:           8081,
+		LogViewerPort:           9000,
+		APIPort:                 8080,
+		StorageType:             "file",
+		StrictProductionSecrets: true,
+		NGCIngestSecret:         "Charming1234567890", // 18 chars, demo prefix
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for charming123-prefixed secret")
+	}
+}
+
+func TestValidate_StrictSecrets_okLongRandom(t *testing.T) {
+	c := &Config{
+		NetworkPort:              4001,
+		DashboardPort:            8081,
+		LogViewerPort:            9000,
+		APIPort:                  8080,
+		StorageType:              "file",
+		StrictProductionSecrets:  true,
+		NGCIngestSecret:          "not-the-demo-value-ok-16",
+		AuthorizedBlockProducers: []string{"producer-main"},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidate_StrictSecrets_requiresAuthorizedProducerForValidators(t *testing.T) {
+	c := &Config{
+		NetworkPort:              4001,
+		DashboardPort:            8081,
+		LogViewerPort:            9000,
+		APIPort:                  8080,
+		StorageType:              "file",
+		StrictProductionSecrets:  true,
+		AuthorizedBlockProducers: []string{"   "},
+	}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected strict validator config to require authorized_block_producers")
+	}
+	if !strings.Contains(err.Error(), "authorized_block_producers") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_StrictSecrets_acceptsPinnedAuthorizedProducerForValidators(t *testing.T) {
+	c := &Config{
+		NetworkPort:              4001,
+		DashboardPort:            8081,
+		LogViewerPort:            9000,
+		APIPort:                  8080,
+		StorageType:              "file",
+		StrictProductionSecrets:  true,
+		AuthorizedBlockProducers: []string{"producer-main"},
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("strict validator config with a pinned producer should validate: %v", err)
+	}
+}
+
+func TestValidate_StrictSecrets_allowsMinerWithoutAuthorizedProducer(t *testing.T) {
+	c := &Config{
+		NodeRole:                NodeRoleMiner,
+		MiningEnabled:           true,
+		NetworkPort:             4001,
+		DashboardPort:           8081,
+		LogViewerPort:           9000,
+		APIPort:                 8080,
+		StorageType:             "file",
+		StrictProductionSecrets: true,
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("miner nodes do not append external validator blocks and should not need a producer allowlist: %v", err)
+	}
+}
+
+func TestLoadConfigFile_TOML_StrictSecrets(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "node.toml")
+	content := `
+[network]
+port = 4001
+
+[api]
+port = 8080
+strict_secrets = true
+`
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{}
+	if err := loadConfigFile(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.StrictProductionSecrets {
+		t.Fatal("expected StrictProductionSecrets from TOML strict_secrets")
+	}
+}
+
+func TestValidate_NvidiaLockGateP2PRequiresLock(t *testing.T) {
+	c := &Config{
+		NetworkPort:        4001,
+		DashboardPort:      8081,
+		LogViewerPort:      9000,
+		APIPort:            8080,
+		StorageType:        "file",
+		NvidiaLockEnabled:  false,
+		NvidiaLockGateP2P:  true,
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when gate_p2p without nvidia_lock")
+	}
+}
+
+func TestApplyEnvOverrides_StrictSecrets(t *testing.T) {
+	t.Setenv("CELLS_STRICT_SECRETS", "")
+	cfg := &Config{}
+	applyEnvOverrides(cfg)
+	if cfg.StrictProductionSecrets {
+		t.Fatal("expected false when env empty")
+	}
+	t.Setenv("CELLS_STRICT_SECRETS", "1")
+	cfg2 := &Config{}
+	applyEnvOverrides(cfg2)
+	if !cfg2.StrictProductionSecrets {
+		t.Fatal("expected true for CELLS_STRICT_SECRETS=1")
+	}
+}
+
+func TestResolvedSubmeshConfigPath_relativeToMainConfig(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "repo", "CELLS.toml")
+	cfg := &Config{
+		ConfigFileUsed:      base,
+		SubmeshConfigPath:   "config/micropayments.toml",
+	}
+	want := filepath.Join(filepath.Dir(base), "config", "micropayments.toml")
+	if got := cfg.ResolvedSubmeshConfigPath(); got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestValidate_SubmeshConfig_missingFile(t *testing.T) {
+	c := &Config{
+		NetworkPort:       4001,
+		DashboardPort:     8081,
+		LogViewerPort:     9000,
+		APIPort:           8080,
+		StorageType:       "file",
+		SubmeshConfigPath: filepath.Join(t.TempDir(), "nope.toml"),
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for missing submesh file")
+	}
+}
+
+func TestApplyEnvOverrides_APIRateLimit(t *testing.T) {
+	t.Setenv("CELLS_API_RATE_LIMIT_MAX", "250")
+	t.Setenv("CELLS_API_RATE_LIMIT_WINDOW", "2m")
+	cfg := &Config{}
+	applyDefaults(cfg)
+	applyEnvOverrides(cfg)
+	if cfg.APIRateLimitMaxRequests != 250 {
+		t.Fatalf("max: %d", cfg.APIRateLimitMaxRequests)
+	}
+	if cfg.APIRateLimitWindow != 2*time.Minute {
+		t.Fatalf("window: %v", cfg.APIRateLimitWindow)
+	}
+}
+
+func TestApplyDefaults_logViewerDoesNotClashWithAPI(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.APIPort != 8080 {
+		t.Fatalf("APIPort: %d", cfg.APIPort)
+	}
+	if cfg.LogViewerPort != 9000 {
+		t.Fatalf("LogViewerPort: %d (want 9000, distinct from API)", cfg.LogViewerPort)
+	}
+}
+
+func TestValidate_APIRateLimit_tooHigh(t *testing.T) {
+	c := &Config{
+		NetworkPort:             4001,
+		DashboardPort:           8081,
+		LogViewerPort:           9000,
+		APIPort:                 8080,
+		StorageType:             "file",
+		APIRateLimitMaxRequests: 20_000_000,
+		APIRateLimitWindow:      time.Minute,
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for excessive rate limit max")
+	}
+}
+
+// chdirCleanup is shared by the CELLSplus.* fallback tests below: each
+// test cd's into a fresh t.TempDir() so applyDefaults' os.Stat probes
+// against bare relative names ("CELLS.db" / "CELLSplus.db") only see
+// the marker files we lay down. Restoring the original CWD on cleanup
+// keeps the rest of the package-level tests running where they expect.
+func chdirCleanup(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir(%q): %v", tmp, err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	return tmp
+}
+
+// Regression: the rebrand commit (db9b590) collapsed both branches
+// of the SQLitePath fallback (`os.Stat("CELLS.db") ... else os.Stat("CELLSplus.db") ...`)
+// into identical-name probes, so an operator upgrading from a
+// pre-rebrand CELLS+ deployment with an existing CELLSplus.db would
+// silently get a fresh empty CELLS.db next to it (state divergence /
+// data-loss class).
+//
+// Restored in the same commit that adds these three tests.
+func TestApplyDefaults_SQLitePath_legacyCELLSplusDBPicked(t *testing.T) {
+	tmp := chdirCleanup(t)
+	if err := os.WriteFile(filepath.Join(tmp, "CELLSplus.db"), []byte("legacy"), 0o600); err != nil {
+		t.Fatalf("write legacy db: %v", err)
+	}
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.SQLitePath != "CELLSplus.db" {
+		t.Fatalf("SQLitePath = %q, want %q "+
+			"(pre-rebrand fallback regressed; operators upgrading from CELLS+ "+
+			"would lose state — see fix(branding) commit and the comment "+
+			"in applyDefaults' SQLitePath branch)",
+			cfg.SQLitePath, "CELLSplus.db")
+	}
+}
+
+func TestApplyDefaults_SQLitePath_CELLSDBPreferredOverLegacy(t *testing.T) {
+	tmp := chdirCleanup(t)
+	if err := os.WriteFile(filepath.Join(tmp, "CELLS.db"), []byte("new"), 0o600); err != nil {
+		t.Fatalf("write new db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "CELLSplus.db"), []byte("old"), 0o600); err != nil {
+		t.Fatalf("write legacy db: %v", err)
+	}
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.SQLitePath != "CELLS.db" {
+		t.Fatalf("SQLitePath = %q, want %q (canonical preferred over legacy when both exist)",
+			cfg.SQLitePath, "CELLS.db")
+	}
+}
+
+func TestApplyDefaults_SQLitePath_freshDeployDefault(t *testing.T) {
+	chdirCleanup(t)
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.SQLitePath != "CELLS.db" {
+		t.Fatalf("SQLitePath = %q, want %q (fresh-deploy default)", cfg.SQLitePath, "CELLS.db")
+	}
+}
+
+func TestApplyDefaults_LogFile_legacyCELLSplusLogPicked(t *testing.T) {
+	tmp := chdirCleanup(t)
+	if err := os.WriteFile(filepath.Join(tmp, "CELLSplus.log"), []byte("legacy"), 0o600); err != nil {
+		t.Fatalf("write legacy log: %v", err)
+	}
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.LogFile != "CELLSplus.log" {
+		t.Fatalf("LogFile = %q, want %q (pre-rebrand log fallback regressed; "+
+			"operators upgrading would split history across two files)",
+			cfg.LogFile, "CELLSplus.log")
+	}
+}
+
+// TestLoadConfigFile_TOML_GovernanceAuthorities covers the wiring gap that
+// left ~2,500 LOC of tested governance unreachable in production: the
+// v2wiring applier honoured GovernanceAuthorities, but no config path ever
+// populated it, so every `CELLS/gov/v1` tx rejected with
+// ErrGovernanceNotConfigured on a real node.
+func TestLoadConfigFile_TOML_GovernanceAuthorities(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "node.toml")
+	content := `
+[network]
+port = 4001
+
+[governance]
+authorities = ["addr-alice", "addr-carol"]
+`
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{}
+	if err := loadConfigFile(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.GovernanceAuthorities) != 2 ||
+		cfg.GovernanceAuthorities[0] != "addr-alice" ||
+		cfg.GovernanceAuthorities[1] != "addr-carol" {
+		t.Fatalf("expected governance authorities from TOML, got %#v", cfg.GovernanceAuthorities)
+	}
+}
+
+// Absent a [governance] authorities key, governance stays disabled — the
+// documented pre-governance posture, not an error.
+func TestApplyDefaults_GovernanceAuthorities_defaultsEmpty(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.GovernanceAuthorities == nil {
+		t.Fatal("GovernanceAuthorities should default to an empty slice, not nil")
+	}
+	if len(cfg.GovernanceAuthorities) != 0 {
+		t.Fatalf("governance must default to disabled, got %#v", cfg.GovernanceAuthorities)
+	}
+}
+
+func TestApplyEnvOverrides_GovernanceAuthorities(t *testing.T) {
+	t.Setenv("CELLS_GOVERNANCE_AUTHORITIES", " addr-alice , addr-carol ,, ")
+	cfg := &Config{}
+	applyEnvOverrides(cfg)
+	if len(cfg.GovernanceAuthorities) != 2 ||
+		cfg.GovernanceAuthorities[0] != "addr-alice" ||
+		cfg.GovernanceAuthorities[1] != "addr-carol" {
+		t.Fatalf("expected trimmed authorities from env, got %#v", cfg.GovernanceAuthorities)
+	}
+}
+
+func TestLoadConfigFile_TOML_RequireSignedVotes(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "node.toml")
+	content := `
+[network]
+port = 4001
+
+[consensus]
+require_signed_votes = true
+signed_message_activation_height = 500000
+signer_key_path = "validator-signing.json"
+`
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{}
+	if err := loadConfigFile(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RequireSignedVotes {
+		t.Fatal("expected RequireSignedVotes from [consensus] require_signed_votes")
+	}
+	if cfg.SignedConsensusActivationHeight != 500000 {
+		t.Fatalf("expected signed activation height 500000, got %d", cfg.SignedConsensusActivationHeight)
+	}
+	if cfg.ConsensusSignerKeyPath != "validator-signing.json" {
+		t.Fatalf("unexpected signer key path %q", cfg.ConsensusSignerKeyPath)
+	}
+}
+
+// Enforcement defaults OFF so a mixed-version validator set can roll
+// forward; operators enable it once every peer signs its votes.
+func TestApplyDefaults_RequireSignedVotes_defaultsOff(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.RequireSignedVotes {
+		t.Fatal("inbound vote signature enforcement must default to off for rollout compatibility")
+	}
+}
+
+func TestApplyEnvOverrides_RequireSignedVotes(t *testing.T) {
+	t.Setenv("CELLS_REQUIRE_SIGNED_VOTES", "1")
+	t.Setenv("CELLS_SIGNED_MESSAGE_ACTIVATION_HEIGHT", "500000")
+	t.Setenv("CELLS_CONSENSUS_SIGNER_KEY_PATH", "consensus.json")
+	cfg := &Config{}
+	applyEnvOverrides(cfg)
+	if !cfg.RequireSignedVotes {
+		t.Fatal("CELLS_REQUIRE_SIGNED_VOTES=1 should enable enforcement")
+	}
+	if cfg.SignedConsensusActivationHeight != 500000 || cfg.ConsensusSignerKeyPath != "consensus.json" {
+		t.Fatalf("signed consensus env overrides not applied: %#v", cfg)
+	}
+}
+
+func TestValidate_SignedConsensusNeedsCoordinatedHeight(t *testing.T) {
+	base := Config{NetworkPort: 4001, DashboardPort: 8081, LogViewerPort: 9000, APIPort: 8080, StorageType: "file"}
+
+	missingHeight := base
+	missingHeight.RequireSignedVotes = true
+	if err := missingHeight.Validate(); err == nil || !strings.Contains(err.Error(), "signed_message_activation_height") {
+		t.Fatalf("expected missing activation height error, got %v", err)
+	}
+
+	orphanHeight := base
+	orphanHeight.SignedConsensusActivationHeight = 500000
+	if err := orphanHeight.Validate(); err == nil || !strings.Contains(err.Error(), "require_signed_votes=false") {
+		t.Fatalf("expected orphan activation height error, got %v", err)
+	}
+
+	coordinated := base
+	coordinated.RequireSignedVotes = true
+	coordinated.SignedConsensusActivationHeight = 500000
+	if err := coordinated.Validate(); err != nil {
+		t.Fatalf("coordinated signed consensus config should validate: %v", err)
+	}
+}
+
+func TestLoadConfigFile_TOML_ForkDustHeight(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "node.toml")
+	content := `
+[network]
+port = 4001
+
+[consensus]
+fork_dust_height = 250000
+`
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{}
+	if err := loadConfigFile(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ForkDustHeight != 250000 {
+		t.Fatalf("expected fork_dust_height 250000, got %d", cfg.ForkDustHeight)
+	}
+}
+
+// Zero means never activate. A node that has not opted in must keep the
+// legacy float64 accounting bit-for-bit, so this defaulting to anything
+// other than zero would silently fork the network.
+func TestApplyDefaults_ForkDustHeight_defaultsDisabled(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.ForkDustHeight != 0 {
+		t.Fatalf("dust fork must default to disabled, got %d", cfg.ForkDustHeight)
+	}
+}
+
+func TestApplyEnvOverrides_ForkDustHeight(t *testing.T) {
+	t.Setenv("CELLS_FORK_DUST_HEIGHT", "777")
+	cfg := &Config{}
+	applyEnvOverrides(cfg)
+	if cfg.ForkDustHeight != 777 {
+		t.Fatalf("expected 777 from env, got %d", cfg.ForkDustHeight)
+	}
+}
+
+func TestValidate_ForkDustHeightFailsClosed(t *testing.T) {
+	cfg := &Config{
+		NetworkPort:    4001,
+		DashboardPort:  8081,
+		LogViewerPort:  9000,
+		APIPort:        8080,
+		StorageType:    "file",
+		ForkDustHeight: 777,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("non-zero fork_dust_height must be rejected until the transition is implemented")
+	}
+	if !strings.Contains(err.Error(), "not activation-ready") {
+		t.Fatalf("unexpected refusal: %v", err)
+	}
+}
+
+func TestApplyDefaults_AuthorizedBlockProducers_defaultsEmpty(t *testing.T) {
+	// Empty means "accept any producer", which is the pre-existing behaviour.
+	// Defaulting to anything else would stop a node following the chain.
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if len(cfg.AuthorizedBlockProducers) != 0 {
+		t.Fatalf("expected an empty allowlist by default, got %v", cfg.AuthorizedBlockProducers)
+	}
+}
+
+func TestApplyEnvOverrides_AuthorizedBlockProducers(t *testing.T) {
+	t.Setenv("CELLS_AUTHORIZED_BLOCK_PRODUCERS", "peer-a,peer-b")
+	cfg := &Config{}
+	applyEnvOverrides(cfg)
+	if len(cfg.AuthorizedBlockProducers) != 2 ||
+		cfg.AuthorizedBlockProducers[0] != "peer-a" ||
+		cfg.AuthorizedBlockProducers[1] != "peer-b" {
+		t.Fatalf("unexpected allowlist from env: %v", cfg.AuthorizedBlockProducers)
+	}
+}

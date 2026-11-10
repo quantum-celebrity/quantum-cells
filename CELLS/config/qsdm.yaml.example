@@ -1,0 +1,137 @@
+# CELLS Configuration File Example (YAML format, post-Major-Update 2026-04).
+# Copy this file to CELLS.yaml and customize as needed.
+# Environment variables override config file values.
+#
+# See CELLS/config/CELLS.toml.example for the authoritative section-
+# by-section commentary; this file mirrors its structure.
+
+# Node role (Major Update Phase 2.1). Two-tier validator / miner model.
+node:
+  role: "validator"        # "validator" (default) or "miner"; env CELLS_NODE_ROLE
+  mining_enabled: false    # must be true for miner, false for validator
+
+# Network Configuration
+network:
+  port: 4001
+  bootstrap_peers: []
+  # submesh_config: "config/micropayments.yml"  # optional; env CELLS_SUBMESH_CONFIG overrides
+    # - "127.0.0.1:4001"
+    # - "192.168.1.100:4001"
+  # Bridge relay authentication (CELLS/docs/docs/BRIDGE_RELAY_AUTH.md); leave unset on public nodes.
+  # bridge_relay_trusted_keys: []  # hex ML-DSA-87 public keys whose signed bridge events are applied
+  # bridge_relay_trusted_keys_file: "/opt/CELLS/bridge_relayers.txt"  # one hex key per line
+  # bridge_relay_signer_key_path: "/opt/CELLS/bridge_relayer_key.json"  # signs local events; never the consensus key
+  # bridge_relay_max_event_age: "10m"
+  # Private P2P mode (CELLS/docs/docs/PRIVATE_P2P.md); off by default. When on, bind_address
+  # must be a literal private IP and only the listed libp2p peer IDs may connect.
+  # private_p2p: false
+  # private_p2p_allowed_peers: []      # libp2p peer IDs, 12D3KooW...
+  # P2P connection, stream and gossip limits (CELLS/docs/docs/P2P_LIMITS.md). They are
+  # opt-in. Without p2p_limits_enabled the other keys are refused. With it every key is
+  # optional; 0 or unset means the default shown. Env names as in CELLS.toml.example.
+  # p2p_limits_enabled: false           # true applies the limits below
+  # p2p_limits_disabled: false          # true: libp2p library defaults even when enabled
+  # conn_low_water: 64
+  # conn_high_water: 96
+  # conn_grace_period: "1m"
+  # max_conns: 192
+  # max_inbound_conns: 128
+  # max_streams: 2048
+  # max_inbound_streams: 1024
+  # max_conns_per_peer: 8
+  # max_streams_per_peer: 256
+  # max_inbound_streams_per_peer: 128
+  # max_conns_per_ip: 8                 # per IPv4 address or IPv6 /56; loopback exempt
+  # gossip_max_message_bytes: 1048576
+  # gossip_peer_rate: 100.0             # messages/s per topic per forwarding peer; < 0 turns it off
+  # gossip_peer_burst: 1000
+  # gossip_peer_scoring_disabled: false
+  # gossip_validate_queue: 256
+  # gossip_validate_throttle: 2048
+  # gossip_topic_max_bytes:             # per-topic size limits, merged over the defaults
+  #   CELLS-transactions: 262144
+
+# Storage Configuration
+storage:
+  type: "sqlite"  # Options: "sqlite" or "scylla"
+  sqlite_path: "CELLS.db"
+  scylla_hosts:
+    - "127.0.0.1"
+  scylla_keyspace: "CELLS"
+
+# Monitoring Configuration
+monitoring:
+  dashboard_port: 8081
+  log_viewer_port: 9000  # avoid clashing with api.port when using HTTP on 8080
+  log_file: "CELLS.log"
+  log_level: "INFO"  # Options: "DEBUG", "INFO", "WARN", "ERROR"
+  # metrics_scrape_secret: ""  # optional Prometheus scrape auth for /api/metrics/prometheus
+  # strict_dashboard_auth: false  # production: fail closed on JWT init failure (see CELLS.toml.example)
+
+# API Server Configuration
+api:
+  port: 8443
+  enable_tls: true
+  tls_cert_file: ""  # Path to TLS certificate file
+  tls_key_file: ""    # Path to TLS private key file
+  # NGC sidecar: load CELLS_NGC_INGEST_SECRET from a secret store with a unique random value
+  # NVIDIA-lock: require recent GPU-attested proof for mint/send/create-token
+  # nvidia_lock: false
+  # nvidia_lock_max_proof_age: "15m"
+  # nvidia_lock_expected_node_id: ""  # optional; match CELLS_NGC_PROOF_NODE_ID on sidecar
+  # nvidia_lock_proof_hmac_secret: "<replace-with-random-32-byte-secret>"  # match sidecar
+  # nvidia_lock_require_ingest_nonce: false
+  # nvidia_lock_gate_p2p: false  # optional: gate libp2p transaction storage (with nvidia_lock); env CELLS_NVIDIA_LOCK_GATE_P2P
+  # nvidia_lock_ingest_nonce_ttl: "10m"
+  # jwt_hmac_secret: "<replace-with-separate-random-32-byte-secret>"  # env: CELLS_JWT_HMAC_SECRET
+  # strict_secrets: false  # true: reject weak secrets at startup (env CELLS_STRICT_SECRETS overrides)
+  # rate_limit_max_requests: 100  # global API limit per client window (health exempt)
+  # rate_limit_window: "1m"
+  # GET /api/v1/monitoring/ngc-challenge: ~15 req/min per client when nonce mode is on
+
+# Wallet Configuration
+wallet:
+  initial_balance: 1000.0
+
+# Governance Configuration
+governance:
+  proposal_file: "proposals.json"
+
+# Consensus (see the [consensus] section of CELLS.toml.example).
+# consensus:
+#   stream_ed25519_retirement_height: 0  # CELL stream opens (Ed25519 session keys) refused from this height; 0 = never; same value on every validator; env CELLS_STREAM_ED25519_RETIREMENT_HEIGHT
+#   CELLS20_activation_height: 0  # CELLS-20 token transactions valid from this height; 0 = off; same value on every validator; env CELLS_CELLS20_ACTIVATION_HEIGHT
+#   producer_transition:  # which consensus key may sign each height; same table on every node; see CELLS/docs/docs/PRODUCER_TRANSITION.md
+#     version: 2  # version 1 names one hand-over with the scalar keys instead of epochs
+#     historical_prefix_bytes: 0
+#     historical_prefix_sha256: "<64 hex>"
+#     epochs:
+#       - from_height: 1  # epoch 0: first signed height, no checkpoint_hash
+#         producer_id: "<64 hex consensus address>"
+#       - from_height: 1001  # checkpoint height + 1
+#         producer_id: "<64 hex consensus address>"
+#         checkpoint_hash: "<64 hex hash of block from_height - 1>"
+
+# Performance Configuration
+performance:
+  transaction_interval: "30s"      # Duration between transaction checks
+  health_check_interval: "30s"    # Duration between health checks
+
+# Attestation transparency (Major Update §8.5). Transparency signal only;
+# NOT a consensus rule. See CELLS/docs/docs/NVIDIA_LOCK_CONSENSUS_SCOPE.md.
+trust:
+  disabled: false            # true -> /api/v1/trust/attestations/* returns 404
+  fresh_within: "15m"        # attestations older than this are treated as stale
+  refresh_interval: "10s"    # background cache rebuild cadence
+  region_hint: ""            # "eu" | "us" | "apac" | "other" | ""
+
+# Verified snapshot bootstrap (CELLS/docs/docs/SNAPSHOT_BOOTSTRAP.md); off by default. When
+# enabled, CELLS --snapshot-import may fill an empty follower state directory from a snapshot
+# whose tip is exactly this checkpoint, and every start checks the block at checkpoint_height.
+# A checkpoint key set while enabled is false is refused. Env names as in CELLS.toml.example.
+# snapshot_bootstrap:
+#   enabled: false
+#   checkpoint_height: 0           # N, at least 1 when enabled
+#   checkpoint_block_hash: ""      # 64 lower-case hex
+#   checkpoint_state_root: ""      # 64 lower-case hex
+#   checkpoint_producer_id: ""     # optional: the ML-DSA-87 producer address

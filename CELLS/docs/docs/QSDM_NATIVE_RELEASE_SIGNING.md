@@ -1,0 +1,122 @@
+# CELLS-native release signing
+
+CELLS Hive uses a pinned ML-DSA-87 release key to authenticate its Windows and
+Linux update channel. This is an application-level trust system. It complements
+checksums and future platform signing, but it is not Microsoft Authenticode.
+
+To check a download yourself, see
+[Downloads & verification](DOWNLOADS_AND_VERIFICATION.md).
+
+## Enforced trust chain
+
+1. A release owner builds immutable Hive artifacts from one reviewed commit.
+2. The offline CELLS release wallet signs an exact JSON manifest containing the
+   version, commit, validity window, platform, artifact names, sizes, roles, and
+   SHA-256 hashes.
+3. The manifest and signature are published as one atomic
+   `CELLS.signed-release.v1` envelope on the hive-v2 release channel,
+   `https://CELLS.tech/downloads/hive-v2/`:
+   - `CELLS-hive-release-windows-v2.json`
+   - `CELLS-hive-release-linux-v2.json`
+4. Hive verifies the envelope with its pinned ML-DSA-87 public key and rejects
+   any other `key_id`.
+5. Hive verifies the updater metadata against the signed size and hash, then
+   checks that its version and installer name match the signed release.
+6. After download, Hive verifies the installer filename, size, and SHA-256
+   before allowing installation.
+
+Any missing, expired, malformed, mismatched, or incorrectly signed input is
+rejected. Hive then falls back only to the last envelope it verified (see
+[Website outages](#website-outages)); without one it fails closed. Older
+clients and unapproved higher-version clients remain blocked by the
+exact-version policy.
+
+Signed manifests carry at most 90 days of signature validity and are re-signed
+before they expire. Hive rejects a manifest that is expired, dated in the future
+beyond normal clock skew, or valid for more than 120 days.
+
+## Website outages
+
+Hive keeps working while CELLS.tech is down or the computer is offline, until
+the signed envelope's own `expires_at`. After every successful check, Hive saves
+the exact envelope bytes it verified, one file per platform and release
+channel, in a `release-envelope-cache` folder in its application-data
+directory. When a later check fails, Hive verifies the saved envelope again in
+full (pinned key, signature, schema, product, channel, platform, and validity
+window with the usual clock skew) and enforces it exactly like a fresh one, so
+a version mismatch still requires the update. There is no other grace period.
+A missing, damaged, tampered, or expired saved envelope is ignored, and Hive
+fails closed as it would without one.
+
+Renew the envelopes before they expire. An envelope that expires during an
+outage locks every Hive that cannot reach the website.
+
+## `issued_at` must always increase
+
+Hive never goes back to an older envelope. An envelope that verifies but was
+issued before the envelope a Hive already saved is ignored, and that Hive keeps
+using the saved one. A renewal (the same version signed again) and a new
+release are signed later, so they replace it.
+
+- Every envelope must have a later `issued_at` than every envelope published
+  before it for the same platform. `new_hive_release_manifest.ps1` takes
+  `issued_at` from the signing computer's clock, so that clock must be right.
+- To roll back to an older version, sign a new envelope for that version.
+  Putting an older envelope file back on the website does not roll Hive back:
+  every Hive that saw the newer envelope ignores it.
+
+## Current release key (v2)
+
+The current public release-key ID is:
+
+```text
+4081bf2c4755f4c5c1565b4fac75e14a7e0b52042ac3d34bf8a7f525866c64a9
+```
+
+The public key is tracked at
+`CELLS/deploy/release-trust/CELLS-hive-release-key-v2.json`. It contains no secret
+material. The `key_id` is the SHA-256 of the raw public key bytes, so it can be
+recomputed from that file.
+
+## Key rotation (October 2026)
+
+The previous release key (`key_id`
+`10ab9c5710761d4c9dca59d42446e9ea0e3315d15cdc3715df1dcb8c96fa07a1`, file
+`CELLS/deploy/release-trust/CELLS-hive-release-key.json`) was rotated in October
+2026 and no longer signs new releases. Hive 1.4.21 is the first release that
+pins the v2 key.
+
+Because Hive 1.4.20 (Windows) and 1.4.17 (Linux) trust only the previous key,
+they cannot verify 1.4.21 or newer on their own. Updating to the current
+release (Hive 1.4.22) is a one-time manual
+install from the [download page](https://CELLS.tech/download.html); wallet and
+settings are kept. The previous `/downloads/` channel stays online so those
+versions keep working until their signed manifests expire.
+
+## Security boundaries
+
+CELLS-native signing proves that an artifact was approved by the pinned CELLS
+release key and remained byte-for-byte intact. It does not:
+
+- make Windows show a verified publisher;
+- remove Microsoft SmartScreen warnings;
+- replace Authenticode, trusted timestamping, or platform reputation;
+- prevent reverse engineering of a distributed desktop application;
+- recover safely from theft of both the release private key and the source that
+  pins its public key.
+
+Never ask users to install a private root certificate. Continue pursuing
+Authenticode when it becomes financially practical. A release-key rotation is
+a security migration: ship a reviewed Hive version that pins the new key before
+publishing releases signed only by that key. Do not silently replace the public
+key on the website.
+
+Key custody and the release-signing procedure are documented privately for
+release owners.
+
+## Incident response
+
+If the release key may be exposed, stop publishing immediately, remove update
+pointers, preserve evidence, and publish a security notice. Do not reuse a
+version number or overwrite immutable artifacts. Generate a new key under clean
+custody and require a reviewed trust-root migration.

@@ -1,0 +1,167 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: CELLS-node
+  namespace: CELLS
+  labels:
+    app: CELLS
+    component: node
+spec:
+  serviceName: CELLS-service
+  replicas: 3
+  selector:
+    matchLabels:
+      app: CELLS
+      component: node
+  template:
+    metadata:
+      labels:
+        app: CELLS
+        component: node
+    spec:
+      containers:
+      - name: CELLS
+        # Must match what CI actually publishes (see
+        # .github/workflows/release-container.yml). The bare `CELLS:latest`
+        # this used to carry resolves to Docker Hub and does not exist, so
+        # every apply ended in ImagePullBackOff. Pin a released tag instead
+        # of :latest for reproducible rollouts.
+        image: ghcr.io/blackbeardone/CELLS:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: network
+          containerPort: 4001
+          protocol: TCP
+        - name: api
+          containerPort: 8080
+          protocol: TCP
+        - name: dashboard
+          containerPort: 8081
+          protocol: TCP
+        - name: logviewer
+          containerPort: 9000
+          protocol: TCP
+        env:
+        # Bind the dashboard to all interfaces INSIDE the pod. The process
+        # default is 127.0.0.1, correct on bare metal but unreachable here:
+        # the Service and kube-proxy route to the pod's non-loopback
+        # interface, not into its loopback namespace.
+        - name: CELLS_DASHBOARD_BIND_ADDRESS
+          value: "0.0.0.0"
+        # WebSocket origin allowlist; see configmap.yaml for how to pick the
+        # value. Without it CheckOrigin stays permissive.
+        - name: CELLS_WS_ALLOWED_ORIGINS
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: ws_allowed_origins
+        - name: NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NETWORK_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: network_port
+        - name: API_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: api_port
+        - name: DASHBOARD_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: dashboard_port
+        - name: LOG_VIEWER_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: log_viewer_port
+        - name: STORAGE_TYPE
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: storage_type
+        - name: SQLITE_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: sqlite_path
+        - name: LOG_FILE
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: log_file
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: log_level
+        - name: ENABLE_TLS
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: enable_tls
+        - name: API_RATE_LIMIT_MAX
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: api_rate_limit_max
+        - name: API_RATE_LIMIT_WINDOW
+          valueFrom:
+            configMapKeyRef:
+              name: CELLS-config
+              key: api_rate_limit_window
+        # Headless service DNS for StatefulSet peers (override via patch if topology differs)
+        - name: BOOTSTRAP_PEERS
+          value: "CELLS-node-0.CELLS-service.CELLS.svc.cluster.local:4001"
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+        - name: logs
+          mountPath: /app/logs
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health/live
+            port: api
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/v1/health/ready
+            port: api
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: logs
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+

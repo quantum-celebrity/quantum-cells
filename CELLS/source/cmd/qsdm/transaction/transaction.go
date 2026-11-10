@@ -1,0 +1,357 @@
+package transaction
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/blackbeardONE/CELLS/internal/logging"
+	"github.com/blackbeardONE/CELLS/pkg/api"
+	"github.com/blackbeardONE/CELLS/pkg/consensus"
+	"github.com/blackbeardONE/CELLS/pkg/mesh3d"
+	"github.com/blackbeardONE/CELLS/pkg/monitoring"
+	"github.com/blackbeardONE/CELLS/pkg/quarantine"
+	"github.com/blackbeardONE/CELLS/pkg/submesh"
+	"github.com/blackbeardONE/CELLS/pkg/wallet"
+	"github.com/blackbeardONE/CELLS/pkg/walletp2p"
+	"github.com/blackbeardONE/CELLS/pkg/wasm"
+)
+
+// Storage interface for storing transactions
+type Storage interface {
+	StoreTransaction(tx []byte) error
+	Close() error
+}
+
+// ParentCheck reports whether a transfer's parents are committed
+// transactions under this node's Proof-of-Entanglement rules (in cmd/CELLS:
+// chain.(*BlockProducer).CheckWalletTransferParents, which returns nil below
+// the activation height). Nil skips the history check; the context-free
+// parent rules and the signer binding always run.
+type ParentCheck func(txID string, parents []string) error
+
+// HandleTransaction validates and stores a wallet JSON transaction received
+// over peer-to-peer gossip. It verifies the signature under the
+// transaction's own public_key, with sender = hex(sha256(public_key)), and
+// the context-free PoE parent rules.
+func HandleTransaction(logger *logging.Logger, msg []byte, dynamicManager *submesh.DynamicSubmeshManager, wasmSdk *wasm.WASMSDK, consensus *consensus.ProofOfEntanglement, storage Storage, nvidiaP2PGate *monitoring.NvidiaLockP2PGate) {
+	handleTransaction(logger, msg, dynamicManager, wasmSdk, consensus, storage, nvidiaP2PGate, nil)
+}
+
+func handleTransaction(logger *logging.Logger, msg []byte, dynamicManager *submesh.DynamicSubmeshManager, wasmSdk *wasm.WASMSDK, consensus *consensus.ProofOfEntanglement, storage Storage, nvidiaP2PGate *monitoring.NvidiaLockP2PGate, parentCheck ParentCheck) {
+	tx, err := ParseTransaction(msg)
+	if err != nil {
+		logger.Warn("Failed to parse transaction", "error", err, "hint", "Check transaction format and required fields (id, sender, recipient, amount, signature)")
+		return
+	}
+
+	dedupeCommitted := false
+	if tx.ID != "" {
+		if !walletp2p.Reserve(tx.ID) {
+			monitoring.RecordP2PWalletIngressDedupeSkip()
+			logger.Debug("P2P wallet ingress dedupe: same tx id already ingested (mesh companion, gossip, or duplicate publish)", "tx_id", tx.ID)
+			return
+		}
+		defer func() {
+			if !dedupeCommitted {
+				walletp2p.Release(tx.ID)
+			}
+		}()
+	}
+
+	if ok, perr := wasm.TryPreflightP2PTransactionJSON(wasmSdk, msg); perr != nil {
+		logger.Warn("WASM preflight failed", "error", perr)
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		return
+	} else if !ok {
+		logger.Warn("WASM preflight rejected transaction", "tx_id", tx.ID)
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		return
+	}
+
+	// MED-2: sanitize user-supplied strings before logging. The fields are
+	// already format-validated above (hex address, bounded length), but
+	// defence-in-depth costs nothing — if a future ParseTransaction relax
+	// permits richer characters, log injection (CWE-117) cannot bypass
+	// the structured-logging guard.
+	logger.Info("Processing P2P transaction",
+		"sender", api.SanitizeForLog(tx.Sender),
+		"recipient", api.SanitizeForLog(tx.Recipient),
+		"amount", tx.Amount,
+		"fee", tx.Fee,
+	)
+
+	ds, subErr := dynamicManager.MatchP2POrReject(tx.Fee, tx.GeoTag, msg)
+	if subErr != nil {
+		logger.Warn("P2P transaction rejected by submesh policy", "error", subErr)
+		switch {
+		case errors.Is(subErr, submesh.ErrSubmeshNoRoute):
+			monitoring.RecordSubmeshP2PRejectRoute()
+		case errors.Is(subErr, submesh.ErrSubmeshPayloadTooLarge):
+			monitoring.RecordSubmeshP2PRejectSize()
+		}
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		return
+	}
+	if ds != nil {
+		logger.Info("Routing transaction to dynamic submesh:", ds.Name, "with priority", ds.PriorityLevel)
+	} else {
+		_, err := dynamicManager.RouteTransaction(tx.Fee, tx.GeoTag)
+		if err != nil {
+			logger.Warn("No dynamic submesh matched for transaction:", err)
+		}
+	}
+
+	// Transaction is already signed, we need to verify it
+	// Extract signature from transaction
+	if tx.Signature == "" {
+		logger.Warn("Transaction has no signature, discarding", "tx_id", tx.ID, "hint", "All transactions must be signed with ML-DSA-87 before submission")
+		return
+	}
+
+	// Decode hex signature
+	signatureBytes, err := hex.DecodeString(tx.Signature)
+	if err != nil {
+		logger.Warn("Failed to decode signature", "tx_id", tx.ID, "error", err, "hint", "Signature must be valid hex-encoded ML-DSA-87 signature")
+		return
+	}
+
+	// The signer is identified by the transaction's own public key. The
+	// earlier code verified under this node's PoE key, which can only
+	// accept data this node signed itself.
+	if tx.PublicKey == "" {
+		logger.Warn("Transaction has no public_key, discarding", "tx_id", tx.ID, "hint", "Wallet envelopes must carry the signer's ML-DSA-87 public key")
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		return
+	}
+	publicKey, err := hex.DecodeString(tx.PublicKey)
+	if err != nil {
+		logger.Warn("Failed to decode public_key", "tx_id", tx.ID, "error", err)
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		return
+	}
+
+	// The signed bytes are the envelope with signature and public_key
+	// cleared, exactly as wallets sign it (including the nonce).
+	canonical, err := tx.CanonicalBytes()
+	if err != nil {
+		logger.Warn("Failed to marshal transaction for verification:", err)
+		return
+	}
+
+	valid, err := consensus.ValidateTransaction(signedTransactionFor(*tx, canonical, signatureBytes, publicKey), logger)
+	if err != nil || !valid {
+		logger.Warn("Received invalid transaction, discarding", "error", err)
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		monitoring.GetMetrics().RecordError(fmt.Sprintf("Transaction validation failed: %v", err))
+		return
+	}
+	if parentCheck != nil {
+		if err := parentCheck(tx.ID, tx.ParentCells); err != nil {
+			logger.Warn("Received transaction whose parents are not committed, discarding", "tx_id", tx.ID, "error", err)
+			monitoring.GetMetrics().IncrementTransactionsInvalid()
+			monitoring.GetMetrics().RecordError("Transaction PoE parent check failed: " + err.Error())
+			return
+		}
+	}
+
+	if !nvidiaP2PGate.Allows() {
+		logger.Warn("Discarding P2P transaction: NVIDIA-lock P2P gate not satisfied", "hint", "Ingest GPU NGC proofs or disable CELLS_NVIDIA_LOCK_GATE_P2P")
+		monitoring.RecordNvidiaLockP2PReject()
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		monitoring.GetMetrics().RecordError("NVIDIA-lock P2P gate blocked transaction after consensus validation")
+		return
+	}
+
+	monitoring.GetMetrics().IncrementTransactionsValid()
+
+	// Store the transaction
+	err = storage.StoreTransaction(msg)
+	if err != nil {
+		logger.Error("Failed to store transaction", "error", err, "hint", "Check database connection and disk space")
+		monitoring.GetMetrics().RecordError(fmt.Sprintf("Storage failed: %v", err))
+	} else {
+		dedupeCommitted = true
+		logger.Info("Transaction stored successfully")
+		monitoring.GetMetrics().IncrementTransactionsStored()
+	}
+}
+
+// signedTransactionFor maps a wallet envelope onto the PoE validator's input.
+func signedTransactionFor(tx Transaction, canonical, signature, publicKey []byte) consensus.SignedTransaction {
+	return consensus.SignedTransaction{
+		ID:           tx.ID,
+		Sender:       tx.Sender,
+		SigningBytes: canonical,
+		ParentCells:  tx.ParentCells,
+		Signatures:   [][]byte{signature},
+		PublicKey:    publicKey,
+	}
+}
+
+// HandlePhase3Transaction decodes a mesh3d wire envelope and runs the phase-3 pipeline. No-op if msg is not wire format.
+func HandlePhase3Transaction(logger *logging.Logger, msg []byte, mesh3dValidator *mesh3d.Mesh3DValidator, quarantineManager *quarantine.QuarantineManager, reputationManager *quarantine.ReputationManager, consensus *consensus.ProofOfEntanglement, storage Storage, nvidiaP2PGate *monitoring.NvidiaLockP2PGate) {
+	tx, submeshKey, err := ParsePhase3Wire(msg)
+	if err != nil {
+		return
+	}
+	if mesh3dValidator == nil {
+		logger.Warn("mesh3d wire message ignored: validator nil")
+		return
+	}
+	HandlePhase3MeshTx(logger, tx, submeshKey, mesh3dValidator, quarantineManager, reputationManager, consensus, storage, nvidiaP2PGate)
+}
+
+func meshReputationPeer(txID string) string {
+	if txID == "" {
+		return "mesh3d:unknown"
+	}
+	if len(txID) > 48 {
+		return "mesh3d:" + txID[:48]
+	}
+	return "mesh3d:" + txID
+}
+
+// HandlePhase3MeshTx validates and stores a decoded mesh3d transaction (quarantine + reputation + consensus + storage).
+func HandlePhase3MeshTx(logger *logging.Logger, tx *mesh3d.Transaction, submeshKey string, mesh3dValidator *mesh3d.Mesh3DValidator, quarantineManager *quarantine.QuarantineManager, reputationManager *quarantine.ReputationManager, consensus *consensus.ProofOfEntanglement, storage Storage, nvidiaP2PGate *monitoring.NvidiaLockP2PGate) {
+	handlePhase3MeshTx(logger, tx, submeshKey, mesh3dValidator, quarantineManager, reputationManager, consensus, storage, nvidiaP2PGate, nil)
+}
+
+func handlePhase3MeshTx(logger *logging.Logger, tx *mesh3d.Transaction, submeshKey string, mesh3dValidator *mesh3d.Mesh3DValidator, quarantineManager *quarantine.QuarantineManager, reputationManager *quarantine.ReputationManager, _ *consensus.ProofOfEntanglement, storage Storage, nvidiaP2PGate *monitoring.NvidiaLockP2PGate, parentCheck ParentCheck) {
+	if logger == nil || tx == nil || mesh3dValidator == nil || quarantineManager == nil || reputationManager == nil || storage == nil {
+		return
+	}
+
+	walletDedupeID := walletp2p.WalletJSONIDFromBytes(tx.Data)
+	dedupeCommitted := false
+	if walletDedupeID != "" {
+		if !walletp2p.Reserve(walletDedupeID) {
+			monitoring.RecordP2PWalletIngressDedupeSkip()
+			logger.Debug("P2P mesh ingress dedupe: wallet payload id already ingested", "wallet_tx_id", walletDedupeID)
+			return
+		}
+		defer func() {
+			if !dedupeCommitted {
+				walletp2p.Release(walletDedupeID)
+			}
+		}()
+	}
+
+	peerKey := meshReputationPeer(tx.ID)
+
+	// The mesh validator rejects any entanglement-structure failure and
+	// verifies the payload envelope's signature under its own public key with
+	// the sender bound to it (pkg/mesh3d/structure.go). It replaces the
+	// earlier sign-with-this-node's-key-then-verify step, which proved
+	// nothing about the sender.
+	valid, err := mesh3dValidator.ValidateTransaction(tx)
+	if err != nil {
+		logger.Warn("3D mesh validation failed, discarding", "tx_id", tx.ID, "error", err)
+		quarantineManager.RecordTransaction(submeshKey, false)
+		reputationManager.Penalize(peerKey)
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		monitoring.GetMetrics().IncrementReputationUpdates()
+		monitoring.GetMetrics().RecordError("3D mesh validation error: " + err.Error())
+		return
+	}
+	quarantineManager.RecordTransaction(submeshKey, valid)
+	if valid {
+		reputationManager.Reward(peerKey)
+		monitoring.GetMetrics().IncrementTransactionsValid()
+		monitoring.GetMetrics().IncrementReputationUpdates()
+	} else {
+		reputationManager.Penalize(peerKey)
+		monitoring.GetMetrics().IncrementTransactionsInvalid()
+		monitoring.GetMetrics().IncrementReputationUpdates()
+	}
+
+	if !valid {
+		logger.Warn("Transaction failed 3D mesh validation, discarding", "tx_id", tx.ID)
+		return
+	}
+
+	if parentCheck != nil {
+		env, err := mesh3d.DecodeWalletPayload(tx.Data)
+		if err == nil {
+			err = parentCheck(env.ID, env.ParentCells)
+		}
+		if err != nil {
+			logger.Warn("Mesh transaction parents are not committed, discarding", "tx_id", tx.ID, "error", err)
+			monitoring.GetMetrics().IncrementTransactionsInvalid()
+			monitoring.GetMetrics().RecordError("Phase3 PoE parent check failed: " + err.Error())
+			return
+		}
+	}
+
+	if nvidiaP2PGate != nil && !nvidiaP2PGate.Allows() {
+		logger.Warn("Discarding Phase3 P2P transaction: NVIDIA-lock P2P gate not satisfied")
+		monitoring.RecordNvidiaLockP2PReject()
+		monitoring.GetMetrics().RecordError("NVIDIA-lock P2P gate blocked Phase3 transaction")
+		return
+	}
+
+	err = storage.StoreTransaction(tx.Data)
+	if err != nil {
+		logger.Error("Failed to store transaction", "error", err)
+		monitoring.GetMetrics().RecordError("Storage failed: " + err.Error())
+	} else {
+		dedupeCommitted = true
+		logger.Info("Phase3 transaction stored successfully", "tx_id", tx.ID, "submesh", submeshKey)
+		monitoring.GetMetrics().IncrementTransactionsStored()
+	}
+}
+
+func ParseTransaction(msg []byte) (*Transaction, error) {
+	var tx Transaction
+	err := json.Unmarshal(msg, &tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse transaction JSON: %w (hint: ensure transaction contains valid JSON with required fields: id, sender, recipient, amount, signature)", err)
+	}
+
+	// Validate required fields with comprehensive validation
+	if err := api.ValidateTransactionID(tx.ID); err != nil {
+		return nil, fmt.Errorf("transaction ID validation failed: %w", err)
+	}
+	if err := api.ValidateAddress(tx.Sender); err != nil {
+		return nil, fmt.Errorf("sender address validation failed: %w", err)
+	}
+	if err := api.ValidateAddress(tx.Recipient); err != nil {
+		return nil, fmt.Errorf("recipient address validation failed: %w", err)
+	}
+	if err := api.ValidateAmount(tx.Amount); err != nil {
+		return nil, fmt.Errorf("amount validation failed: %w", err)
+	}
+	if tx.Fee < 0 {
+		return nil, errors.New("fee cannot be negative")
+	}
+	if err := api.ValidateAmount(tx.Fee); err != nil {
+		return nil, fmt.Errorf("fee validation failed: %w", err)
+	}
+	if err := api.ValidateGeoTag(tx.GeoTag); err != nil {
+		return nil, fmt.Errorf("geotag validation failed: %w", err)
+	}
+	if err := api.ValidateParentCells(tx.ParentCells); err != nil {
+		return nil, fmt.Errorf("parent cells validation failed: %w", err)
+	}
+	if err := api.ValidateSignature(tx.Signature); err != nil {
+		return nil, fmt.Errorf("signature validation failed: %w", err)
+	}
+	if err := api.ValidateOptionalMLDSAPublicKeyHex(tx.PublicKey); err != nil {
+		return nil, fmt.Errorf("public_key validation failed: %w", err)
+	}
+	// MED-3 (timestamp): bounded freshness window prevents replay of
+	// year-old envelopes and rejects clocks set far in the future
+	// (e.g. an attacker trying to game a future-state validation rule).
+	if err := api.ValidateTimestamp(tx.Timestamp); err != nil {
+		return nil, fmt.Errorf("timestamp validation failed: %w", err)
+	}
+
+	return &tx, nil
+}
+
+// Transaction is the signed wallet envelope as it travels over gossip. It is
+// wallet.TransactionData itself, so the bytes verified here are exactly the
+// bytes wallets sign and validators replay (the earlier local copy lacked
+// the nonce field, so a nonce-bearing envelope could never verify).
+type Transaction = wallet.TransactionData

@@ -1,0 +1,892 @@
+package hmac
+
+// Tests for the nvidia-hmac-v1 acceptance flow. One test per
+// branch of spec §3.2.2's 9-step flow (with step 8 deferred to
+// Phase 2c-iv). Each test owns its own InMemoryRegistry /
+// InMemoryNonceStore so the t.Parallel() runner doesn't cross-
+// contaminate.
+//
+// Structure:
+//
+//   TestVerify_Accepts_Valid         - happy path (all 7 active steps green)
+//   TestVerify_Rejects_WrongType     - dispatch guard
+//   TestVerify_Rejects_Malformed_*   - bundle-malformed family (4 cases)
+//   TestVerify_Rejects_ChallengeBind - step 2 failure
+//   TestVerify_Rejects_Unregistered  - step 3 failure
+//   TestVerify_Rejects_Revoked       - step 3 failure, revoked sentinel
+//   TestVerify_Rejects_HMACMismatch  - step 4 failure
+//   TestVerify_Rejects_WrongGPUUUID  - step 5 failure
+//   TestVerify_Rejects_NonceMismatch - step 6a inner vs outer nonce
+//   TestVerify_Rejects_StaleAge      - step 6b past the window
+//   TestVerify_Rejects_FutureSkew    - step 6b impossibly-future
+//   TestVerify_Rejects_NonceReplay   - step 6c replay detection
+//   TestVerify_Rejects_DeniedGPU     - step 7 deny-list hit
+//   TestVerify_NilRegistry           - misconfiguration guard
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/blackbeardONE/CELLS/pkg/mining"
+	"github.com/blackbeardONE/CELLS/pkg/mining/challenge"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+)
+
+// ----- fixtures ----------------------------------------------------
+
+// fixtureNode is the registered GPU used across tests. A single
+// constant tuple keeps the test code short; tests that need a
+// different node enroll one locally.
+const (
+	fixtureNodeID  = "alice-rtx4090-01"
+	fixtureGPUUUID = "GPU-01234567-89ab-cdef-0123-456789abcdef"
+	fixtureGPUName = "NVIDIA GeForce RTX 4090"
+)
+
+// fixtureHMACKey is a deterministic 32-byte key so test output is
+// reproducible. The value is NOT real key material; it's a literal
+// "test key do not use" string padded to 32 bytes.
+var fixtureHMACKey = []byte("test-key-do-not-use----32-bytes!")
+
+// buildFixture returns a pre-enrolled registry, a fresh proof at
+// the given time, and the matching bundle — all consistent with
+// each other. Tests mutate copies of the returned values to
+// exercise rejection branches.
+func buildFixture(t *testing.T, now time.Time) (*InMemoryRegistry, mining.Proof, Bundle) {
+	t.Helper()
+	reg := NewInMemoryRegistry()
+	if err := reg.Enroll(fixtureNodeID, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	var batchRoot [32]byte
+	for i := range batchRoot {
+		batchRoot[i] = byte(i)
+	}
+	var mix [32]byte
+	for i := range mix {
+		mix[i] = byte(0xFF - i)
+	}
+	minerAddr := "CELLS1testminer"
+
+	p := mining.Proof{
+		Version:    mining.ProtocolVersionV2,
+		Epoch:      0,
+		Height:     100,
+		HeaderHash: [32]byte{0xAA},
+		BatchRoot:  batchRoot,
+		BatchCount: 1,
+		Nonce:      [16]byte{0x03},
+		MixDigest:  mix,
+		MinerAddr:  minerAddr,
+		Attestation: mining.Attestation{
+			Type:     mining.AttestationTypeHMAC,
+			GPUArch:  "ada",
+			Nonce:    nonce,
+			IssuedAt: now.Unix(),
+		},
+	}
+
+	bundle := Bundle{
+		ChallengeBind: HexChallengeBind(minerAddr, batchRoot, mix),
+		ComputeCap:    "8.9",
+		CUDAVersion:   "12.8",
+		DriverVer:     "572.16",
+		GPUName:       fixtureGPUName,
+		GPUUUID:       fixtureGPUUUID,
+		IssuedAt:      now.Unix(),
+		NodeID:        fixtureNodeID,
+		Nonce:         hex.EncodeToString(nonce[:]),
+	}
+	signed, err := bundle.Sign(fixtureHMACKey)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	bundleB64, err := signed.MarshalBase64()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	p.Attestation.BundleBase64 = bundleB64
+	return reg, p, signed
+}
+
+// reSign rebuilds the proof's bundle after a test mutates a bundle
+// field that's covered by the HMAC — otherwise the HMAC check
+// (step 4) fires before whatever step the test is actually
+// targeting.
+func reSign(t *testing.T, p *mining.Proof, b Bundle, key []byte) {
+	t.Helper()
+	signed, err := b.Sign(key)
+	if err != nil {
+		t.Fatalf("re-sign: %v", err)
+	}
+	b64, err := signed.MarshalBase64()
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	p.Attestation.BundleBase64 = b64
+}
+
+func mustOperatorKey(t *testing.T) (string, *mldsa87.PrivateKey) {
+	t.Helper()
+	publicKey, privateKey, err := mldsa87.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	publicKeyBytes, err := publicKey.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	return hex.EncodeToString(publicKeyBytes), privateKey
+}
+
+func signOperatorBundle(t *testing.T, p *mining.Proof, b Bundle, hmacKey []byte, privateKey *mldsa87.PrivateKey) Bundle {
+	t.Helper()
+	canonical, err := b.CanonicalForOperatorSignature(*p)
+	if err != nil {
+		t.Fatalf("operator canonical: %v", err)
+	}
+	sig := make([]byte, mldsa87.SignatureSize)
+	if err := mldsa87.SignTo(privateKey, canonical, nil, true, sig); err != nil {
+		t.Fatalf("operator sign: %v", err)
+	}
+	b.OperatorSig = hex.EncodeToString(sig)
+	reSign(t, p, b, hmacKey)
+	return b
+}
+
+// mustReject asserts that VerifyAttestation returned an error
+// wrapping `want`. On mismatch it fails with the full error chain
+// so diagnostics are useful.
+func mustReject(t *testing.T, err error, want error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected rejection wrapping %v, got nil", want)
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("expected error to wrap %v, got %v", want, err)
+	}
+}
+
+// ----- happy path --------------------------------------------------
+
+func TestVerify_Accepts_Valid(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	v := NewVerifier(reg)
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("happy-path rejected: %v", err)
+	}
+}
+
+func TestVerify_Accepts_OwnerBoundProofWhenRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, _ := buildFixture(t, now)
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOwner(fixtureNodeID, p.MinerAddr, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOwner: %v", err)
+	}
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("owner-bound proof rejected: %v", err)
+	}
+}
+
+func TestVerify_Rejects_MissingOwnerWhenRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_Rejects_OwnerMismatchWhenRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, b := buildFixture(t, now)
+	registeredOwner := p.MinerAddr
+
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOwner(fixtureNodeID, registeredOwner, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOwner: %v", err)
+	}
+
+	// Model the dangerous path: the bundle is self-consistent and re-signed,
+	// but rewards are redirected away from the enrolled owner.
+	p.MinerAddr = "CELLS1attacker"
+	b.ChallengeBind = HexChallengeBind(p.MinerAddr, p.BatchRoot, p.MixDigest)
+	reSign(t, &p, b, fixtureHMACKey)
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_Accepts_OperatorSignedProofWhenRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, b := buildFixture(t, now)
+	operatorPublicKey, operatorPrivateKey := mustOperatorKey(t)
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOperatorPublicKey(fixtureNodeID, p.MinerAddr, operatorPublicKey, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOperatorPublicKey: %v", err)
+	}
+	signOperatorBundle(t, &p, b, fixtureHMACKey, operatorPrivateKey)
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	v.RequireOperatorSignature = true
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("operator-signed proof rejected: %v", err)
+	}
+}
+
+func TestVerify_Accepts_UnsignedProofWhenOperatorSignatureNotRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	operatorPublicKey, _ := mustOperatorKey(t)
+	_, p, _ := buildFixture(t, now)
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOperatorPublicKey(fixtureNodeID, p.MinerAddr, operatorPublicKey, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOperatorPublicKey: %v", err)
+	}
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("legacy unsigned proof should pass until the rail is required: %v", err)
+	}
+}
+
+func TestVerify_Rejects_MissingOperatorPublicKeyWhenRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, b := buildFixture(t, now)
+	_, operatorPrivateKey := mustOperatorKey(t)
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOwner(fixtureNodeID, p.MinerAddr, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOwner: %v", err)
+	}
+	signOperatorBundle(t, &p, b, fixtureHMACKey, operatorPrivateKey)
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	v.RequireOperatorSignature = true
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_Rejects_MissingOperatorSignatureWhenRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, _ := buildFixture(t, now)
+	operatorPublicKey, _ := mustOperatorKey(t)
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOperatorPublicKey(fixtureNodeID, p.MinerAddr, operatorPublicKey, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOperatorPublicKey: %v", err)
+	}
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	v.RequireOperatorSignature = true
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+func TestVerify_Rejects_TamperedOperatorSignatureWhenRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, b := buildFixture(t, now)
+	operatorPublicKey, operatorPrivateKey := mustOperatorKey(t)
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOperatorPublicKey(fixtureNodeID, p.MinerAddr, operatorPublicKey, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOperatorPublicKey: %v", err)
+	}
+	b = signOperatorBundle(t, &p, b, fixtureHMACKey, operatorPrivateKey)
+	sigBytes, err := hex.DecodeString(b.OperatorSig)
+	if err != nil {
+		t.Fatalf("decode operator sig: %v", err)
+	}
+	sigBytes[0] ^= 0x01
+	b.OperatorSig = hex.EncodeToString(sigBytes)
+	b64, err := b.MarshalBase64()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	p.Attestation.BundleBase64 = b64
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	v.RequireOperatorSignature = true
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_Rejects_OperatorSignatureBoundToDifferentProof(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, b := buildFixture(t, now)
+	operatorPublicKey, operatorPrivateKey := mustOperatorKey(t)
+	reg := NewInMemoryRegistry()
+	if err := reg.EnrollWithOperatorPublicKey(fixtureNodeID, p.MinerAddr, operatorPublicKey, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOperatorPublicKey: %v", err)
+	}
+	signOperatorBundle(t, &p, b, fixtureHMACKey, operatorPrivateKey)
+	p.Height++
+
+	v := NewVerifier(reg)
+	v.RequireOwnerBinding = true
+	v.RequireOperatorSignature = true
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestInMemoryRegistry_RetainsOperatorPublicKey(t *testing.T) {
+	reg := NewInMemoryRegistry()
+	operatorPublicKey := strings.Repeat("ab", mldsa87.PublicKeySize)
+	if err := reg.EnrollWithOperatorPublicKey(fixtureNodeID, "CELLS1owner", operatorPublicKey, fixtureGPUUUID, fixtureHMACKey); err != nil {
+		t.Fatalf("EnrollWithOperatorPublicKey: %v", err)
+	}
+	entry, err := reg.Lookup(fixtureNodeID)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if entry.OperatorPublicKey != operatorPublicKey {
+		t.Fatalf("operator public key dropped: got %q want %q", entry.OperatorPublicKey, operatorPublicKey)
+	}
+}
+
+// ----- dispatch guard ----------------------------------------------
+
+func TestVerify_Rejects_WrongType(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	p.Attestation.Type = mining.AttestationTypeCC // wrong dispatch target
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationTypeUnknown)
+}
+
+// ----- malformed bundles (step 1) ----------------------------------
+
+func TestVerify_Rejects_MalformedBase64(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	p.Attestation.BundleBase64 = "!!!not valid base64!!!"
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+func TestVerify_Rejects_MalformedJSON(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	p.Attestation.BundleBase64 = base64.StdEncoding.EncodeToString([]byte("{not json"))
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+func TestVerify_Rejects_TrailingBytes(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, b := buildFixture(t, now)
+	// Produce valid JSON followed by extra bytes. ParseBundle must
+	// catch this via dec.More().
+	raw, err := b.MarshalBase64()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(raw)
+	poisoned := append([]byte{}, decoded...)
+	poisoned = append(poisoned, []byte(`{"garbage":true}`)...)
+	p.Attestation.BundleBase64 = base64.StdEncoding.EncodeToString(poisoned)
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+func TestVerify_Rejects_UnknownBundleField(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	// A bundle with an extra field — DisallowUnknownFields must
+	// trip. This protects against attackers who stuff replay
+	// material into a bundle via unrecognised keys.
+	poisoned := []byte(`{"node_id":"x","gpu_uuid":"y","gpu_name":"z","driver_ver":"","cuda_version":"","compute_cap":"","nonce":"","issued_at":0,"challenge_bind":"","hmac":"","extra_field":true}`)
+	p.Attestation.BundleBase64 = base64.StdEncoding.EncodeToString(poisoned)
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+// ----- step 2: challenge-bind --------------------------------------
+
+func TestVerify_Rejects_ChallengeBindMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, b := buildFixture(t, now)
+	// Flip one byte of challenge_bind. The HMAC must be recomputed
+	// because challenge_bind is covered by it — otherwise step 4
+	// fires first and the test becomes useless.
+	var bogus [32]byte
+	for i := range bogus {
+		bogus[i] = byte(0xAB)
+	}
+	b.ChallengeBind = hex.EncodeToString(bogus[:])
+	reSign(t, &p, b, fixtureHMACKey)
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+// ----- step 3: registry --------------------------------------------
+
+func TestVerify_Rejects_Unregistered(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, b := buildFixture(t, now)
+	// Empty registry. The bundle still refers to fixtureNodeID
+	// which nothing enrolled.
+	emptyReg := NewInMemoryRegistry()
+	// Re-sign not needed — node_id is the lookup key, not part of
+	// what the caller can lie about.
+	_ = b
+	v := NewVerifier(emptyReg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_Rejects_Revoked(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	reg.Revoke(fixtureNodeID)
+	v := NewVerifier(reg)
+	err := v.VerifyAttestation(p, now)
+	mustReject(t, err, mining.ErrAttestationSignatureInvalid)
+	// Additionally check the revocation sentinel surfaces somewhere
+	// in the chain — this is what dashboards key off for the
+	// "operator misbehaved" bucket vs "random unknown".
+	if !errors.Is(err, ErrNodeRevoked) {
+		t.Fatalf("revoked rejection should wrap ErrNodeRevoked, got %v", err)
+	}
+}
+
+// ----- step 4: HMAC ------------------------------------------------
+
+func TestVerify_Rejects_HMACMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, b := buildFixture(t, now)
+	// Overwrite the HMAC field with a syntactically-valid but
+	// wrong 32-byte hex value. Do NOT re-sign — that would
+	// overwrite our tamper.
+	b.HMAC = hex.EncodeToString(bytes.Repeat([]byte{0xCC}, 32))
+	b64, err := b.MarshalBase64()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	p.Attestation.BundleBase64 = b64
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_Rejects_HMACNotHex(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, b := buildFixture(t, now)
+	b.HMAC = "not-hex"
+	b64, _ := b.MarshalBase64()
+	p.Attestation.BundleBase64 = b64
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+// ----- step 5: GPU UUID --------------------------------------------
+
+func TestVerify_Rejects_WrongGPUUUID(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, b := buildFixture(t, now)
+	b.GPUUUID = "GPU-different-uuid-0000-0000-000000000000"
+	reSign(t, &p, b, fixtureHMACKey)
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_Accepts_CaseInsensitiveGPUUUID(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, b := buildFixture(t, now)
+	b.GPUUUID = strings.ToUpper(fixtureGPUUUID)
+	reSign(t, &p, b, fixtureHMACKey)
+	v := NewVerifier(reg)
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("uppercase UUID should still match: %v", err)
+	}
+}
+
+// ----- step 6a: inner vs outer nonce -------------------------------
+
+func TestVerify_Rejects_NonceMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	// Rewrite the outer Attestation.Nonce to something other than
+	// what the bundle says (and is HMAC'd over).
+	var different [32]byte
+	for i := range different {
+		different[i] = byte(0x55)
+	}
+	p.Attestation.Nonce = different
+	// Do NOT re-sign; the bundle still carries the original nonce.
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationNonceMismatch)
+}
+
+func TestVerify_Rejects_IssuedAtMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	p.Attestation.IssuedAt++ // bundle signed one, outer claims another
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationNonceMismatch)
+}
+
+// ----- step 6b: freshness ------------------------------------------
+
+func TestVerify_Rejects_StaleAge(t *testing.T) {
+	issuedAt := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, issuedAt)
+	// Validator's wall clock is 120s later, window is 60s default.
+	later := issuedAt.Add(mining.FreshnessWindow + 30*time.Second)
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, later), mining.ErrAttestationStale)
+}
+
+func TestVerify_Rejects_FutureBeyondSkew(t *testing.T) {
+	future := time.Unix(1_700_000_100, 0)
+	reg, p, _ := buildFixture(t, future)
+	// Validator's wall clock is 30s before the bundle's issued_at.
+	earlier := future.Add(-30 * time.Second)
+	v := NewVerifier(reg)
+	mustReject(t, v.VerifyAttestation(p, earlier), mining.ErrAttestationStale)
+}
+
+func TestVerify_Accepts_WithinSkew(t *testing.T) {
+	future := time.Unix(1_700_000_100, 0)
+	reg, p, _ := buildFixture(t, future)
+	// 3s in the future — inside default 5s allowed skew.
+	almost := future.Add(-3 * time.Second)
+	v := NewVerifier(reg)
+	if err := v.VerifyAttestation(p, almost); err != nil {
+		t.Fatalf("within-skew proof rejected: %v", err)
+	}
+}
+
+// ----- step 6c: replay ---------------------------------------------
+
+func TestVerify_Rejects_NonceReplay(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	store := NewInMemoryNonceStore(2 * mining.FreshnessWindow)
+	v := NewVerifier(reg)
+	v.NonceStore = store
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("first use should accept: %v", err)
+	}
+	// Second use with the same nonce must be flagged as replay
+	// regardless of clock — the store records it, so the second
+	// call finds it.
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationNonceMismatch)
+}
+
+// ----- step 7: deny-list -------------------------------------------
+
+func TestVerify_Rejects_DeniedGPU(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	v := NewVerifier(reg)
+	v.DenyList = SubstringDenyList{Substrings: []string{"RTX 4090"}}
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+func TestVerify_EmptyDenyList_Accepts(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _ := buildFixture(t, now)
+	v := NewVerifier(reg)
+	v.DenyList = EmptyDenyList{}
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("empty deny-list should accept: %v", err)
+	}
+}
+
+// ----- misconfiguration --------------------------------------------
+
+func TestVerify_NilRegistry(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	_, p, _ := buildFixture(t, now)
+	v := &Verifier{Registry: nil}
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+// ----- round-trip & canonical-form stability -----------------------
+
+// TestBundle_CanonicalForMAC_Stable locks the byte output of
+// CanonicalForMAC against a known-good reference. If this test
+// breaks, a cross-implementation test vector has been invalidated
+// and every non-Go miner must re-sign.
+func TestBundle_CanonicalForMAC_Stable(t *testing.T) {
+	b := Bundle{
+		ChallengeBind:     "00112233",
+		ChallengeSig:      "cafe1234",
+		ChallengeSignerID: "validator-01",
+		ComputeCap:        "8.9",
+		CUDAVersion:       "12.8",
+		DriverVer:         "572.16",
+		GPUName:           "NVIDIA GeForce RTX 4090",
+		GPUUUID:           "GPU-abc",
+		HMAC:              "ignored-by-canonical-form",
+		IssuedAt:          1_700_000_000,
+		NodeID:            "alice-rtx4090-01",
+		Nonce:             "deadbeef",
+	}
+	got, err := b.CanonicalForMAC()
+	if err != nil {
+		t.Fatalf("canonical: %v", err)
+	}
+	// Phase 2c-iii: the canonical form gained challenge_sig and
+	// challenge_signer_id in alphabetical position right after
+	// challenge_bind. Every non-Go miner must be updated to emit
+	// these fields (empty string is legal wire-wise, but rejected
+	// by a verifier that has a ChallengeVerifier wired in).
+	want := `{"challenge_bind":"00112233","challenge_sig":"cafe1234","challenge_signer_id":"validator-01","compute_cap":"8.9","cuda_version":"12.8","driver_ver":"572.16","gpu_name":"NVIDIA GeForce RTX 4090","gpu_uuid":"GPU-abc","issued_at":1700000000,"node_id":"alice-rtx4090-01","nonce":"deadbeef"}`
+	if string(got) != want {
+		t.Fatalf("canonical form drifted:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestBundle_SignVerifyRoundTrip confirms a freshly signed bundle
+// verifies under the same key and fails under a wrong key, giving
+// us confidence the Sign helper matches the verifier's MAC
+// recomputation.
+func TestBundle_SignVerifyRoundTrip(t *testing.T) {
+	b := Bundle{
+		ChallengeBind: "cafe",
+		ComputeCap:    "8.9",
+		CUDAVersion:   "12.8",
+		DriverVer:     "572.16",
+		GPUName:       "TEST GPU",
+		GPUUUID:       "GPU-test",
+		IssuedAt:      1_700_000_000,
+		NodeID:        "test-node",
+		Nonce:         "00",
+	}
+	key := []byte("test-key-do-not-use----32-bytes!")
+	signed, err := b.Sign(key)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if signed.HMAC == "" {
+		t.Fatal("signed HMAC field empty")
+	}
+	canonical, _ := signed.CanonicalForMAC()
+	mac := ComputeMAC(key, canonical)
+	if hex.EncodeToString(mac) != signed.HMAC {
+		t.Fatal("signed HMAC does not match recomputed MAC")
+	}
+	// Wrong key must fail.
+	wrongMAC := ComputeMAC([]byte("wrong-key-wrong-wrong-wrong-wrong"), canonical)
+	if hex.EncodeToString(wrongMAC) == signed.HMAC {
+		t.Fatal("different keys produced identical MAC — impossible")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2c-iii: ChallengeVerifier collaborator tests
+// -----------------------------------------------------------------------------
+
+// buildChallengeFixture extends buildFixture with a valid
+// validator-issued challenge signature over the bundle's
+// (nonce, issued_at) tuple. Returns the registry, the proof, the
+// signed bundle, and the matching SignerVerifier the test can
+// plug into Verifier.ChallengeVerifier.
+//
+// This is the "happy path" fixture for the new optional check —
+// every rejection test below mutates one piece of it.
+func buildChallengeFixture(t *testing.T, now time.Time) (
+	*InMemoryRegistry, mining.Proof, Bundle, *challenge.HMACSignerVerifier,
+) {
+	t.Helper()
+	reg, p, bundle := buildFixture(t, now)
+
+	// Build the challenge signer / verifier pair. Using HMAC here
+	// because the reference Issuer uses HMAC; in production this
+	// is swapped for an ML-DSA signer but the interface contract
+	// is identical.
+	const signerID = "validator-01"
+	chgKey := bytes.Repeat([]byte{0x99}, 32)
+	signer, err := challenge.NewHMACSigner(signerID, chgKey)
+	if err != nil {
+		t.Fatalf("challenge signer: %v", err)
+	}
+	sv := challenge.NewHMACSignerVerifier()
+	if err := sv.Register(signerID, chgKey); err != nil {
+		t.Fatalf("challenge verifier register: %v", err)
+	}
+
+	// Decode the bundle nonce so we can hand the right 32 bytes to
+	// Challenge.SigningBytes.
+	rawNonce, err := hex.DecodeString(bundle.Nonce)
+	if err != nil {
+		t.Fatalf("decode nonce hex: %v", err)
+	}
+	var nonceArr [32]byte
+	copy(nonceArr[:], rawNonce)
+
+	c := challenge.Challenge{
+		Nonce:    nonceArr,
+		IssuedAt: bundle.IssuedAt,
+		SignerID: signerID,
+	}
+	sig, err := signer.Sign(c.SigningBytes())
+	if err != nil {
+		t.Fatalf("challenge sign: %v", err)
+	}
+
+	bundle.ChallengeSig = hex.EncodeToString(sig)
+	bundle.ChallengeSignerID = signerID
+	reSign(t, &p, bundle, fixtureHMACKey)
+	return reg, p, bundle, sv
+}
+
+// TestVerify_Accepts_WithChallengeVerifier is the happy path with
+// the new check wired in: a valid issuer-signed challenge must
+// pass every step end-to-end.
+func TestVerify_Accepts_WithChallengeVerifier(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _, sv := buildChallengeFixture(t, now)
+	v := NewVerifier(reg)
+	v.ChallengeVerifier = sv
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("unexpected reject: %v", err)
+	}
+}
+
+// TestVerify_Rejects_ChallengeSignatureTampered confirms that if
+// the signature does not match the (nonce, issued_at) the miner
+// committed to, the bundle is rejected with signature-invalid
+// (NOT nonce-mismatch — the nonce IS what the miner committed to,
+// the signature is what fails).
+func TestVerify_Rejects_ChallengeSignatureTampered(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, bundle, sv := buildChallengeFixture(t, now)
+	// Flip one byte of the signature.
+	rawSig, err := hex.DecodeString(bundle.ChallengeSig)
+	if err != nil {
+		t.Fatalf("decode sig: %v", err)
+	}
+	rawSig[0] ^= 0x01
+	bundle.ChallengeSig = hex.EncodeToString(rawSig)
+	reSign(t, &p, bundle, fixtureHMACKey)
+
+	v := NewVerifier(reg)
+	v.ChallengeVerifier = sv
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+// TestVerify_Rejects_ChallengeSignerUnknown checks that when the
+// bundle names a signer the verifier has never heard of, we
+// reject.
+func TestVerify_Rejects_ChallengeSignerUnknown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, bundle, _ := buildChallengeFixture(t, now)
+	bundle.ChallengeSignerID = "not-a-real-validator"
+	reSign(t, &p, bundle, fixtureHMACKey)
+
+	// Empty SignerVerifier — no signer_id registered.
+	sv := challenge.NewHMACSignerVerifier()
+	v := NewVerifier(reg)
+	v.ChallengeVerifier = sv
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}
+
+// TestVerify_Rejects_EmptyChallengeSignerID — when the verifier
+// is configured to require challenge sigs, an empty signer_id is
+// malformed.
+func TestVerify_Rejects_EmptyChallengeSignerID(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, bundle, sv := buildChallengeFixture(t, now)
+	bundle.ChallengeSignerID = ""
+	reSign(t, &p, bundle, fixtureHMACKey)
+
+	v := NewVerifier(reg)
+	v.ChallengeVerifier = sv
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+// TestVerify_Rejects_MalformedChallengeSig — non-hex in the sig
+// field is a malformed bundle.
+func TestVerify_Rejects_MalformedChallengeSig(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, bundle, sv := buildChallengeFixture(t, now)
+	bundle.ChallengeSig = "not-hex!"
+	reSign(t, &p, bundle, fixtureHMACKey)
+
+	v := NewVerifier(reg)
+	v.ChallengeVerifier = sv
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+// TestVerify_Rejects_EmptyChallengeSig — no signature at all.
+func TestVerify_Rejects_EmptyChallengeSig(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, bundle, sv := buildChallengeFixture(t, now)
+	bundle.ChallengeSig = ""
+	reSign(t, &p, bundle, fixtureHMACKey)
+
+	v := NewVerifier(reg)
+	v.ChallengeVerifier = sv
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationBundleMalformed)
+}
+
+// TestVerify_Accepts_WithoutChallengeVerifier_BackCompat — when
+// no ChallengeVerifier is wired in (nil), the bundle's
+// challenge_sig / challenge_signer_id fields are carried inertly
+// and the verifier still accepts the proof. This guarantees the
+// introduction of the fields does NOT cascade-break existing
+// validators that haven't opted into the check yet.
+func TestVerify_Accepts_WithoutChallengeVerifier_BackCompat(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, _, _ := buildChallengeFixture(t, now)
+	v := NewVerifier(reg) // ChallengeVerifier deliberately nil
+	if err := v.VerifyAttestation(p, now); err != nil {
+		t.Fatalf("nil ChallengeVerifier should skip the check; got %v", err)
+	}
+}
+
+// TestVerify_Rejects_SignatureBoundToDifferentNonce — signature
+// is cryptographically valid for a DIFFERENT (nonce, issued_at)
+// than the miner committed to. This simulates an attacker trying
+// to transplant a valid signature onto their own freshly-computed
+// nonce.
+func TestVerify_Rejects_SignatureBoundToDifferentNonce(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reg, p, bundle, sv := buildChallengeFixture(t, now)
+
+	// Build a signature over a DIFFERENT nonce but keep the
+	// bundle's nonce the same. The legitimate signer happily
+	// signs the "different" nonce (an attacker would get this
+	// blob by calling GET /challenge and then swapping in the
+	// nonce they computed PoW against).
+	signerID := bundle.ChallengeSignerID
+	chgKey := bytes.Repeat([]byte{0x99}, 32)
+	signer, err := challenge.NewHMACSigner(signerID, chgKey)
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	var otherNonce [32]byte
+	for i := range otherNonce {
+		otherNonce[i] = 0xEE
+	}
+	wrong := challenge.Challenge{
+		Nonce:    otherNonce,
+		IssuedAt: bundle.IssuedAt,
+		SignerID: signerID,
+	}
+	wrongSig, err := signer.Sign(wrong.SigningBytes())
+	if err != nil {
+		t.Fatalf("sign wrong: %v", err)
+	}
+	bundle.ChallengeSig = hex.EncodeToString(wrongSig)
+	reSign(t, &p, bundle, fixtureHMACKey)
+
+	v := NewVerifier(reg)
+	v.ChallengeVerifier = sv
+	mustReject(t, v.VerifyAttestation(p, now), mining.ErrAttestationSignatureInvalid)
+}

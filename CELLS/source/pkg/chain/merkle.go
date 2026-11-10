@@ -1,0 +1,201 @@
+package chain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"math/bits"
+
+	"github.com/blackbeardONE/CELLS/pkg/mempool"
+)
+
+// MerkleTree builds a binary hash tree over a list of data items.
+type MerkleTree struct {
+	Root   string
+	Leaves []string
+	nodes  [][]string // nodes[level][index]
+}
+
+// BuildMerkleTree constructs a tree from leaf data (e.g. transaction IDs).
+func BuildMerkleTree(items []string) *MerkleTree {
+	if len(items) == 0 {
+		return &MerkleTree{Root: emptyHash()}
+	}
+
+	leaves := make([]string, len(items))
+	for i, item := range items {
+		leaves[i] = hashLeaf(item)
+	}
+
+	levels := [][]string{leaves}
+	current := leaves
+
+	for len(current) > 1 {
+		if len(current)%2 != 0 {
+			current = append(current, current[len(current)-1]) // duplicate last node
+		}
+		var next []string
+		for i := 0; i < len(current); i += 2 {
+			next = append(next, hashPair(current[i], current[i+1]))
+		}
+		levels = append(levels, next)
+		current = next
+	}
+
+	return &MerkleTree{
+		Root:   current[0],
+		Leaves: leaves,
+		nodes:  levels,
+	}
+}
+
+// MerkleProof is an inclusion proof for a leaf in the tree.
+type MerkleProof struct {
+	LeafHash string      `json:"leaf_hash"`
+	Index    int         `json:"index"`
+	Siblings []ProofNode `json:"siblings"`
+	Root     string      `json:"root"`
+}
+
+// ProofNode is one sibling in the proof path.
+type ProofNode struct {
+	Hash    string `json:"hash"`
+	IsRight bool   `json:"is_right"` // true if sibling is to the right
+}
+
+// GenerateProof creates an inclusion proof for the item at `index`.
+func (mt *MerkleTree) GenerateProof(index int) (*MerkleProof, error) {
+	if index < 0 || index >= len(mt.Leaves) {
+		return nil, fmt.Errorf("index %d out of range [0, %d)", index, len(mt.Leaves))
+	}
+
+	proof := &MerkleProof{
+		LeafHash: mt.Leaves[index],
+		Index:    index,
+		Root:     mt.Root,
+	}
+
+	idx := index
+	for level := 0; level < len(mt.nodes)-1; level++ {
+		row := mt.nodes[level]
+		// Ensure even length (tree build may have duplicated)
+		if len(row)%2 != 0 {
+			row = append(row, row[len(row)-1])
+		}
+		var siblingHash string
+		var isRight bool
+		if idx%2 == 0 {
+			siblingHash = row[idx+1]
+			isRight = true
+		} else {
+			siblingHash = row[idx-1]
+			isRight = false
+		}
+		proof.Siblings = append(proof.Siblings, ProofNode{Hash: siblingHash, IsRight: isRight})
+		idx /= 2
+	}
+
+	return proof, nil
+}
+
+// VerifyProof checks a Merkle inclusion proof against a root hash.
+func VerifyProof(proof *MerkleProof, expectedRoot string) bool {
+	current := proof.LeafHash
+	for _, sibling := range proof.Siblings {
+		if sibling.IsRight {
+			current = hashPair(current, sibling.Hash)
+		} else {
+			current = hashPair(sibling.Hash, current)
+		}
+	}
+	return current == expectedRoot
+}
+
+// VerifyTxInBlock verifies that a transaction ID is included in a block header.
+//
+// Only meaningful BELOW the transaction-content-root activation height. The tx
+// root merkleizes tx.ID below that height and TxContentDigest at or above it
+// (computeTxRoot), so an ID-keyed proof cannot verify against a content root.
+// Use VerifyTxContentInBlock there, which needs the transaction rather than
+// just its ID.
+//
+// The height check below IS load-bearing, and the route to it is narrow enough
+// that this comment has now been wrong twice in opposite directions.
+//
+// First it claimed the check prevents "a silent wrong answer" -- overstated,
+// since for an ordinary ID the leaf simply does not match and the result is
+// false either way. Then it claimed the check is documentation only, because "a
+// content-root leaf never equals hashLeaf(txID)" -- also wrong, because
+// mempool.Tx.ID is an unconstrained string. A caller may pass an ID that IS the
+// content digest of a real transaction in the block, and without this check the
+// proof then verifies and the function answers TRUE: a false positive on an
+// inclusion check, which is the direction that actually costs something.
+//
+// TestVerifyTxInBlock_RefusesADigestShapedID covers exactly that case, because
+// neutering the check passed every other test in the package.
+//
+// The proof must also be exactly as long as the block's tree is deep, which
+// header.TxCount fixes. A leaf is sha256(txID) and an inner node is
+// sha256(left+right) over the 64-character hex of its children, so an "ID"
+// that is two child hashes joined (128 hex characters) hashes to an inner node,
+// and with the path above that node -- one or more levels shorter than a real
+// proof -- it verified as included. The mirror image works too: if a real ID
+// begins with the hex of sha256(fake), a path one level longer proves fake.
+// With the length pinned, the claimed leaf must be a real leaf. Only this
+// check is new: the tree, tx root and block hash are computed as before. A
+// header without a transaction count (TxCount 0) proves no inclusion.
+func VerifyTxInBlock(txID string, proof *MerkleProof, header BlockHeader) bool {
+	if txContentRootActiveAt(header.Height) {
+		// The caller holds only an ID, so the correct leaf cannot be built.
+		return false
+	}
+	if header.TxCount < 1 || len(proof.Siblings) != merkleDepth(header.TxCount) {
+		return false
+	}
+	expectedLeaf := hashLeaf(txID)
+	if proof.LeafHash != expectedLeaf {
+		return false
+	}
+	return VerifyProof(proof, header.TxRoot)
+}
+
+// VerifyTxContentInBlock verifies inclusion against a content-committing tx
+// root. It needs the whole transaction, because the leaf is TxContentDigest --
+// which is the point of the content root: the proof binds what the transaction
+// SAYS, not merely that some transaction with that ID was in the block.
+//
+// Valid at or above the activation height. Below it the root merkleizes IDs, so
+// this refuses there rather than relying on the leaf failing to match -- the
+// same reasoning as the check above, which turned out to matter.
+func VerifyTxContentInBlock(tx *mempool.Tx, proof *MerkleProof, header BlockHeader) bool {
+	if tx == nil || !txContentRootActiveAt(header.Height) {
+		return false
+	}
+	if proof.LeafHash != hashLeaf(TxContentDigest(tx)) {
+		return false
+	}
+	return VerifyProof(proof, header.TxRoot)
+}
+
+// merkleDepth is the number of levels BuildMerkleTree puts above n leaves (n >=
+// 1), which is also the number of siblings in every proof GenerateProof makes:
+// 0 for one leaf, otherwise ceil(log2 n), since each level halves the row and
+// rounds up.
+func merkleDepth(n int) int {
+	return bits.Len(uint(n - 1))
+}
+
+func hashLeaf(data string) string {
+	h := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(h[:])
+}
+
+func hashPair(left, right string) string {
+	h := sha256.Sum256([]byte(left + right))
+	return hex.EncodeToString(h[:])
+}
+
+func emptyHash() string {
+	h := sha256.Sum256(nil)
+	return hex.EncodeToString(h[:])
+}

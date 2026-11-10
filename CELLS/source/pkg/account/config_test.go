@@ -1,0 +1,109 @@
+package account
+
+import (
+	"encoding/hex"
+	"strings"
+	"testing"
+)
+
+func setValidConfigEnv(t *testing.T) {
+	t.Helper()
+	values := map[string]string{
+		"CELLS_ACCOUNT_DATA_KEY":               hex.EncodeToString(testDataKey()),
+		"CELLS_ACCOUNT_LISTEN":                 "127.0.0.1:8092",
+		"CELLS_ACCOUNT_PUBLIC_BASE_URL":        "https://CELLS.tech",
+		"CELLS_ACCOUNT_SMTP_HOST":              "smtp.example.test",
+		"CELLS_ACCOUNT_SMTP_PORT":              "587",
+		"CELLS_ACCOUNT_SMTP_USERNAME":          "accounts@example.test",
+		"CELLS_ACCOUNT_SMTP_PASSWORD":          "test-only-secret",
+		"CELLS_ACCOUNT_SMTP_FROM":              "CELLS Account <accounts@example.test>",
+		"CELLS_ACCOUNT_SMTP_TLS":               "true",
+		"CELLS_ACCOUNT_TELEGRAM_CLIENT_ID":     "",
+		"CELLS_ACCOUNT_TELEGRAM_CLIENT_SECRET": "",
+	}
+	for name, value := range values {
+		t.Setenv(name, value)
+	}
+}
+
+func TestConfigAcceptsHardenedLoopbackEmailSetup(t *testing.T) {
+	setValidConfigEnv(t)
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ListenAddress != "127.0.0.1:8092" || !cfg.EmailEnabled() {
+		t.Fatalf("unexpected config: %+v", cfg)
+	}
+}
+
+func TestConfigRejectsPublicListenAddress(t *testing.T) {
+	setValidConfigEnv(t)
+	t.Setenv("CELLS_ACCOUNT_LISTEN", "0.0.0.0:8092")
+	_, err := LoadConfigFromEnv()
+	if err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("public listen address was accepted: %v", err)
+	}
+}
+
+func TestConfigRejectsBaseURLThatIsNotAnOrigin(t *testing.T) {
+	for _, value := range []string{
+		"https://CELLS.tech/account",
+		"https://operator:secret@CELLS.tech",
+		"http://CELLS.tech",
+	} {
+		t.Run(value, func(t *testing.T) {
+			setValidConfigEnv(t)
+			t.Setenv("CELLS_ACCOUNT_PUBLIC_BASE_URL", value)
+			_, err := LoadConfigFromEnv()
+			if err == nil || !strings.Contains(err.Error(), "HTTPS origin") {
+				t.Fatalf("invalid public base URL was accepted: %q error=%v", value, err)
+			}
+		})
+	}
+}
+
+func TestConfigRequiresTLSForEmailSignIn(t *testing.T) {
+	setValidConfigEnv(t)
+	t.Setenv("CELLS_ACCOUNT_SMTP_TLS", "false")
+	_, err := LoadConfigFromEnv()
+	if err == nil || !strings.Contains(err.Error(), "must remain enabled") {
+		t.Fatalf("plaintext SMTP was accepted: %v", err)
+	}
+}
+
+func TestConfigRejectsPartialSMTPEvenWhenTelegramIsEnabled(t *testing.T) {
+	setValidConfigEnv(t)
+	t.Setenv("CELLS_ACCOUNT_SMTP_FROM", "")
+	t.Setenv("CELLS_ACCOUNT_TELEGRAM_CLIENT_ID", "123456789")
+	t.Setenv("CELLS_ACCOUNT_TELEGRAM_CLIENT_SECRET", "test-only-telegram-secret")
+	_, err := LoadConfigFromEnv()
+	if err == nil || !strings.Contains(err.Error(), "SMTP host and from") {
+		t.Fatalf("partial SMTP configuration was accepted: %v", err)
+	}
+}
+
+func TestConfigRejectsUniformDataKey(t *testing.T) {
+	setValidConfigEnv(t)
+	t.Setenv("CELLS_ACCOUNT_DATA_KEY", strings.Repeat("00", 32))
+	_, err := LoadConfigFromEnv()
+	if err == nil || !strings.Contains(err.Error(), "obvious weak value") {
+		t.Fatalf("uniform account data key was accepted: %v", err)
+	}
+}
+
+func TestConfigWalletOnlyRequiresExplicitOptIn(t *testing.T) {
+	setValidConfigEnv(t)
+	for _, name := range []string{"CELLS_ACCOUNT_SMTP_HOST", "CELLS_ACCOUNT_SMTP_FROM", "CELLS_ACCOUNT_SMTP_USERNAME", "CELLS_ACCOUNT_SMTP_PASSWORD"} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("CELLS_ACCOUNT_WALLET_LOGIN_ENABLED", "false")
+	if _, err := LoadConfigFromEnv(); err == nil {
+		t.Fatal("provider-free account service started without wallet opt-in")
+	}
+	t.Setenv("CELLS_ACCOUNT_WALLET_LOGIN_ENABLED", "true")
+	cfg, err := LoadConfigFromEnv()
+	if err != nil || !cfg.WalletLoginEnabled || cfg.EmailEnabled() || cfg.TelegramEnabled() {
+		t.Fatalf("wallet-only account service rejected: %v", err)
+	}
+}

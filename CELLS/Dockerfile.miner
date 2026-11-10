@@ -1,0 +1,152 @@
+# Dockerfile.miner — GPU-enabled CELLS miner node
+# =====================================================
+# This image builds the full CELLS binary (no build tag) PLUS the CUDA runtime
+# required by pkg/mining/cuda (added in Major Update Phase 4). It is intended
+# for operators who want to run a miner node contributing Proof-of-Work
+# emission for the Cell coin.
+#
+# Build:
+#   docker build -f CELLS/Dockerfile.miner -t CELLS/miner:latest CELLS/
+#
+# Runtime:
+#   Requires nvidia-container-toolkit on the host and `--gpus all` (or a
+#   device mapping) when running the container.
+#
+# Notes:
+#   - Base is NVIDIA's official CUDA 12.x devel image on Ubuntu 22.04; this
+#     is significantly larger than the validator image (~4-6 GB) but that is
+#     the cost of shipping the CUDA runtime.
+#   - The `mining_enabled` environment variable is set to true by default;
+#     the startup guard (pkg/mining/roleguard) will refuse role=validator
+#     with mining_enabled=true.
+
+# ---- builder stage ----------------------------------------------------------
+FROM nvidia/cuda:12.3.2-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    build-essential \
+    cmake \
+    make \
+    git \
+    pkg-config \
+    libssl-dev \
+    libsqlite3-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go toolchain (pinned to match validator image).
+ENV GO_VERSION=1.26.10
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+        -o /tmp/go.tar.gz && \
+    tar -C /usr/local -xzf /tmp/go.tar.gz && \
+    rm /tmp/go.tar.gz
+ENV PATH=/usr/local/go/bin:${PATH}
+
+# Build & install liboqs.
+WORKDIR /tmp
+RUN git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git && \
+    cd liboqs && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON .. && \
+    make -j"$(nproc)" && \
+    make install && \
+    rm -rf /tmp/liboqs && \
+    ldconfig
+
+# Build CELLS miner binary (full build profile, includes pkg/mining/cuda when
+# added in Phase 4). We do NOT set the validator_only tag here.
+WORKDIR /app
+COPY source ./source
+RUN cd source && \
+    for attempt in 1 2 3; do \
+        go mod download && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        sleep $((attempt * 5)); \
+    done
+
+# Compile the CUDA kernel library that pkg/mesh3d/cuda.go links against.
+# Without this step `go build -tags cuda` dies with
+#   /usr/bin/ld: cannot find -lmesh3d_kernels
+# because the cgo LDFLAGS reference `-lmesh3d_kernels` but the shared
+# object is an artefact the repo deliberately does NOT check in (it is
+# produced by nvcc from kernels/sha256_validate.cu; see
+# CELLS/.github/workflows/cuda-build.yml and
+# pkg/mesh3d/kernels/BUILD.md). We are already on an NVIDIA devel
+# image, so nvcc is on PATH here; install the resulting .so to the
+# standard linker search path and run ldconfig so the subsequent
+# `go build -tags "miner cuda"` can resolve the symbol.
+RUN cd source/pkg/mesh3d/kernels && \
+    nvcc -shared -Xcompiler -fPIC \
+         -o libmesh3d_kernels.so sha256_validate.cu && \
+    cp libmesh3d_kernels.so /usr/local/lib/ && \
+    ldconfig
+
+RUN cd source && CGO_ENABLED=1 \
+    CGO_CFLAGS="-I/usr/local/include -I/usr/local/cuda/include" \
+    CGO_LDFLAGS="-L/usr/local/lib -L/usr/local/cuda/lib64 -loqs -lssl -lcrypto -lmesh3d_kernels -lcudart" \
+    go build -tags "miner cuda" \
+        -o ../CELLS-miner ./cmd/CELLS
+
+# ---- runtime stage ---------------------------------------------------------
+FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+# `apt-get upgrade` pulls the Ubuntu 22.04 security pocket on every
+# build so base-image CVEs that land BETWEEN NVIDIA CUDA base bumps
+# (e.g. the GnuPG OOB-write family CVE-2025-68973 found by the
+# periodic Trivy scan -- see .github/workflows/security-scan-containers.yml)
+# get patched into outgoing miner images without waiting for an
+# upstream nvidia/cuda:*-runtime-ubuntu22.04 refresh. The validator
+# and legacy images run on Alpine 3.23.4 and do not need this; this
+# is specific to the CUDA-runtime Ubuntu base.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       libsqlite3-0 \
+       libssl3 \
+       wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/liboqs.so* /usr/local/lib/
+# Ship the nvcc-built mesh3d kernel .so next to liboqs. The Go binary
+# links against it (`-lmesh3d_kernels` in pkg/mesh3d/cuda.go) and will
+# dlopen it at startup; libcudart.so itself is provided by the CUDA
+# runtime base image.
+COPY --from=builder /usr/local/lib/libmesh3d_kernels.so /usr/local/lib/
+COPY --from=builder /app/CELLS-miner /usr/local/bin/CELLS-miner
+RUN ldconfig
+
+# Convenience symlink so operators running legacy scripts that
+# expect a `CELLS` entrypoint continue to work against the role-
+# scoped miner image. (The rebrand commit's search-and-replace
+# left a duplicate symlink line here that aborted the docker
+# build with "File exists" — collapsed back to a single ln.)
+RUN ln -s /usr/local/bin/CELLS-miner /usr/local/bin/CELLS
+
+WORKDIR /app
+
+# libp2p, API, dashboard, log viewer.
+EXPOSE 4001 8080 8081 9000
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64
+ENV CELLS_NODE_ROLE=miner
+ENV CELLS_MINING_ENABLED=true
+# Surface NVIDIA visible devices so nvidia-container-toolkit wires them in.
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+  CMD wget -q -O- http://127.0.0.1:8080/api/v1/health/live > /dev/null || exit 1
+
+# Run as a dedicated non-root user. Miner processes do not need root; they
+# only need /dev/nvidia* device access which is provided by the container
+# toolkit with appropriate cgroup permissions.
+RUN groupadd -r CELLS && useradd -r -g CELLS -m -d /home/CELLS CELLS && \
+    mkdir -p /app/data && chown -R CELLS:CELLS /app /home/CELLS
+USER CELLS
+
+CMD ["CELLS-miner"]

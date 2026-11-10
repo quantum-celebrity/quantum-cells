@@ -1,0 +1,443 @@
+# Apply local source + config to VPS (Major Update edition).
+#
+# Usage:
+#   $env:CELLS_VPS_PASS="..."; python CELLS/deploy/remote_apply_paramiko.py
+#
+# What changed vs the pre-Major-Update version of this script:
+#
+#   The previous revision sftp'd four specific files (main.go, libp2p.go,
+#   go.mod, go.sum) and relied on the rest of /root/CELLS already being in
+#   sync. That was fine for single-file hotfixes, but the Major Update
+#   rebrand touches pkg/api (new trust_peer_provider.go), pkg/config (new
+#   [trust] section), pkg/audit (new checklist items), pkg/monitoring
+#   (prefix dual-emit), deploy/landing/ (live trust widget), and many
+#   other paths. Shipping only the old four files would leave the server
+#   in a half-upgraded state and the wired TrustAggregator would never
+#   compile against the missing pkg/api/trust_peer_provider.go.
+#
+# What this script now does:
+#
+#   1. Packs a tarball of the local CELLS tree (same exclude list as
+#      remote_bootstrap_paramiko.py) so every file touched by the
+#      Major Update is mirrored to the server, including new files,
+#      deletions, and renames.
+#   2. Uploads the tarball to /root/CELLS-local.tar.gz and extracts it
+#      over /root/CELLS with --overwrite (no rm -rf; preserves server-only
+#      files such as liboqs build caches, backup databases, and any
+#      locally-edited CELLS.toml).
+#   3. Rebuilds, installs, and restarts the validator systemd unit.
+#      Uses the validator_only build tag because the production VPS is
+#      a CPU-only validator per the Major Update two-tier node model.
+#   4. Ensures the server's /opt/CELLS/CELLS.toml has a [trust]
+#      section (non-destructively appended if missing) so the newly
+#      wired transparency endpoints publish on first restart.
+#   5. Verifies Caddy remains active after the static-site update. Static
+#      files are served directly and do not require a reload or restart.
+#   6. Smoke-probes the new trust endpoints locally on the server and
+#      prints the HTTP codes + small JSON excerpt, so the operator does
+#      not need to run remote_verify_paramiko.py separately just to
+#      confirm the trust surface is live.
+#
+# Rollback plan: the previous binary is copied to
+# /opt/CELLS/CELLS.prev before `install` overwrites it. If the new
+# build refuses to start or the JSON API does not become ready, the
+# script restores the previous binary and re-enables the unit before
+# exiting non-zero.
+import os
+import socket
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+import paramiko
+from paramiko import Transport
+
+from _deploy_host import host as _host, port as _port, require_root_user as _require_root_user, user as _user
+
+HOST = _host()
+USER = _user()
+PORT = _port()
+BASE = Path(__file__).resolve().parent.parent  # -> CELLS/
+
+EXCLUDE_DIR_NAMES = frozenset(
+    {
+        ".git",
+        "liboqs_build",
+        "liboqs_install",
+        "__pycache__",
+        ".pytest_cache",
+        "node_modules",
+        "target",
+        ".cursor",
+        ".vscode",
+        ".idea",
+        "testdata",  # kept on server from bootstrap; avoid huge re-uploads
+    }
+)
+
+# Binary file types excluded: server builds from source, so there is no
+# reason to push pre-built artefacts, and they bloat the tarball.
+EXCLUDE_SUFFIXES = (".exe", ".db", ".pdb", ".zip", ".tar.gz", ".whl")
+
+
+REBUILD = r"""
+set -e
+export PATH="/usr/local/go/bin:$PATH"
+export CGO_ENABLED=1
+cd /root/CELLS
+
+echo '===[ git-describe / tree hash (local snapshot) ]==='
+find . -path ./.git -prune -o -type f -printf '%s %P\n' 2>/dev/null | md5sum | awk '{print "tree-md5 "$1}' || true
+
+echo '===[ go build (production profile, CGO+liboqs) ]==='
+# The production VPS runs the full profile with CGO=1 + liboqs for
+# quantum-safe signatures. We stay on that profile here to minimise the
+# blast radius of the redeploy — the Major Update does not require a
+# profile switch, and flipping to validator_only introduces a startup
+# check on [node] role / mining_enabled that we do not want to surface
+# in the same window as the rebrand.
+#
+# Operators who want to cut over to the Major Update §4 validator_only
+# profile can re-run this script with CELLS_BUILD_TAGS=validator_only in
+# the environment; that tag drops the miner code paths (cmd/CELLSminer,
+# GPU-bound PoW hooks) from the compiled binary.
+if [ -n "${CELLS_BUILD_TAGS:-}" ]; then
+  echo "  custom build tags: $CELLS_BUILD_TAGS"
+  cd source
+  go build -trimpath -ldflags="-s -w" -tags "$CELLS_BUILD_TAGS" -o ../CELLS ./cmd/CELLS
+  cd -
+else
+  ./scripts/build.sh
+fi
+
+echo '===[ install + systemd restart ]==='
+systemctl stop CELLS || true
+if [ -f /opt/CELLS/CELLS ]; then
+  install -m0755 -o CELLS -g CELLS /opt/CELLS/CELLS /opt/CELLS/CELLS.prev || true
+fi
+install -m0755 -o CELLS -g CELLS ./CELLS /opt/CELLS/CELLS
+install -m0644 -o CELLS -g CELLS ./config/CELLS.service /etc/systemd/system/CELLS.service
+
+echo '===[ non-destructive [trust] block patch on server config ]==='
+# The wired TrustAggregator serves /api/v1/trust/attestations/* on first
+# start even without a [trust] block (defaults: enabled, 15m freshness,
+# 10s refresh). We still append an explicit block when missing so the
+# operator can edit it in place later rather than hunting the env path.
+CFG=/opt/CELLS/CELLS.toml
+if [ -f "$CFG" ] && ! grep -Eq '^\[trust\]' "$CFG"; then
+  cat >> "$CFG" <<'TRUST'
+
+# Attestation transparency (Major Update §8.5). Transparency signal only;
+# not a consensus rule. See docs/docs/NVIDIA_LOCK_CONSENSUS_SCOPE.md.
+[trust]
+disabled = false
+fresh_within = "15m"
+refresh_interval = "10s"
+region_hint = ""
+TRUST
+  echo '  appended [trust] defaults to '"$CFG"
+fi
+
+# Legacy knob: slow the demo tx generator so logs are not spammed.
+if [ -f "$CFG" ]; then
+  if grep -Eq '^\s*transaction_interval\s*=' "$CFG"; then
+    sed -i 's|^\s*transaction_interval\s*=.*|transaction_interval = "1h"|' "$CFG"
+  fi
+fi
+
+systemctl daemon-reload
+systemctl start CELLS
+
+wait_for_http_ok() {
+  url="$1"
+  label="$2"
+  timeout="${3:-180}"
+  elapsed=0
+  code=000
+  while [ "$elapsed" -lt "$timeout" ]; do
+    code=$(curl -sS -o /tmp/CELLS_ready_probe.out -m 5 -w '%{http_code}' "$url" || echo 000)
+    if [ "$code" = "200" ]; then
+      echo "  $label: ready after ${elapsed}s"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  echo "FAIL: $label did not become ready after ${timeout}s (last HTTP $code)"
+  head -c 400 /tmp/CELLS_ready_probe.out 2>/dev/null || true
+  echo
+  return 1
+}
+
+rollback_CELLS() {
+  echo 'FAIL: CELLS did not become production-ready; rolling back to previous binary'
+  if [ -f /opt/CELLS/CELLS.prev ]; then
+    systemctl stop CELLS || true
+    install -m0755 -o CELLS -g CELLS /opt/CELLS/CELLS.prev /opt/CELLS/CELLS
+    systemctl restart CELLS || true
+  fi
+  systemctl status CELLS --no-pager -l | sed -n '1,40p' || true
+  journalctl -u CELLS -n 80 --no-pager || true
+}
+
+# Backup cron (idempotent).
+(crontab -l 2>/dev/null | grep -v vps-sqlite-backup || true; \
+ echo "0 3 * * * /opt/CELLS/vps-sqlite-backup.sh") | crontab -
+
+sleep 3
+
+echo '===[ CELLS service readiness ]==='
+if ! systemctl is-active --quiet CELLS; then
+  rollback_CELLS
+  exit 1
+fi
+echo 'active'
+
+# The process can be systemd-active while it is still replaying chain state.
+# Wait for the actual JSON API before publishing static files or reporting
+# success; this is the difference between a clean restart and a confusing
+# temporary public 502 during /api/v1/status warm-up.
+if ! wait_for_http_ok http://127.0.0.1:8443/api/v1/status 'api /status' 240; then
+  rollback_CELLS
+  exit 1
+fi
+
+echo '===[ landing sync (deploy/landing/ -> /var/www/CELLS/) ]==='
+# Caddy serves the corporate site from /var/www/CELLS (see Caddyfile).
+# The tarball extract puts the latest site under /root/CELLS/deploy/landing/,
+# but Caddy does not read from there. Mirror every tracked static asset except
+# release downloads and private installer helpers. Nested products such as
+# /account/, /assets/, and /docs/ must be copied with their directory shape.
+# Idempotent: re-running installs the same bytes and does not delete releases.
+if [ -d /root/CELLS/deploy/landing ] && [ -d /var/www/CELLS ]; then
+  while IFS= read -r -d '' src; do
+    rel=${src#/root/CELLS/deploy/landing/}
+    install -D -m0644 -o root -g root "$src" "/var/www/CELLS/$rel"
+    echo "  synced $rel"
+  done < <(
+    find /root/CELLS/deploy/landing -type f \
+      ! -path '/root/CELLS/deploy/landing/downloads/*' \
+      ! -name '_*' -print0
+  )
+else
+  echo "  (skipped: /var/www/CELLS or /root/CELLS/deploy/landing missing)"
+fi
+
+echo '===[ Caddy state (if installed) ]==='
+if systemctl list-unit-files | grep -q '^caddy\.service'; then
+  # The production Caddy admin API is intentionally disabled. A static-file
+  # publish does not require a reload; fail the deploy if Caddy is not active.
+  systemctl is-active --quiet caddy
+  echo "  caddy: active"
+fi
+
+echo '===[ listening sockets ]==='
+ss -tlnp | head -n 20 || true
+
+echo '===[ local HTTP probes ]==='
+# Port map for this server (see Caddyfile):
+#   :8080  -> log viewer (Basic-Auth gated; NOT the JSON API)
+#   :8081  -> dashboard
+#   :8443  -> JSON API (HTTP; Caddy terminates TLS on :443 and proxies here)
+# Health + trust endpoints are on :8443 and are public by design (§8.5).
+#
+# TrustAggregator warm-up: the /api/v1/trust/attestations/* routes answer
+# 503 {"error":"trust aggregator warming up"} until the first refresh tick
+# fires (~10s cadence, configurable in [trust] refresh_interval). Wait on
+# the actual endpoint so a slow replay does not look like a broken deploy.
+wait_for_http_ok http://127.0.0.1:8443/api/v1/trust/attestations/summary 'trust summary' 90 || true
+for url in \
+  http://127.0.0.1:8443/api/v1/health/live \
+  http://127.0.0.1:8443/api/v1/health/ready \
+  http://127.0.0.1:8443/api/v1/trust/attestations/summary \
+  "http://127.0.0.1:8443/api/v1/trust/attestations/recent?limit=5" \
+  http://127.0.0.1:8081/ ; do
+  code=$(curl -sS -o /tmp/CELLS_probe.out -m 5 -w '%{http_code}' "$url" || echo 000)
+  echo "  $url -> $code"
+  case "$url" in
+    *trust/attestations*) head -c 400 /tmp/CELLS_probe.out ; echo ;;
+  esac
+done
+
+echo '===[ Caddy edge probes (loopback via public virtual hosts) ]==='
+# Hit Caddy through the public hostnames to confirm the edge is routing
+# /api/v1/trust/attestations/* correctly. We resolve via --resolve so the
+# probe doesn't depend on external DNS being reachable from the VPS.
+for host in api.CELLS.tech CELLS.tech ; do
+  code=$(curl -sSk -o /tmp/CELLS_edge.out -m 5 -w '%{http_code}' \
+    --resolve "$host:443:127.0.0.1" \
+    "https://$host/api/v1/trust/attestations/summary" || echo 000)
+  echo "  https://$host/api/v1/trust/attestations/summary -> $code"
+  case "$code" in
+    200) head -c 200 /tmp/CELLS_edge.out ; echo ;;
+  esac
+done
+
+echo '===[ recent log ]==='
+journalctl -u CELLS -n 25 --no-pager
+"""
+
+
+def should_skip(p: Path, root: Path) -> bool:
+    try:
+        rel = p.relative_to(root)
+    except ValueError:
+        return True
+    for part in rel.parts:
+        if part in EXCLUDE_DIR_NAMES:
+            return True
+    if p.suffix.lower() in EXCLUDE_SUFFIXES:
+        return True
+    return False
+
+
+def make_tarball(root: Path) -> Path:
+    """Pack everything under CELLS/ into a gzipped tarball.
+
+    We use a tarball rather than per-file sftp.put because Paramiko's
+    SFTP throughput on Windows is painfully slow (~1 MiB/s with default
+    buffers) and the Major Update pushes several thousand files.
+    """
+    files = [p for p in root.rglob("*") if p.is_file() and not should_skip(p, root)]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz")
+    tmp.close()
+    out = Path(tmp.name)
+    print(f"--- Packing {len(files)} files from {root} ---", flush=True)
+    with tarfile.open(out, "w:gz") as tf:
+        for i, p in enumerate(files, 1):
+            if i % 500 == 0:
+                print(f"    ... {i}/{len(files)}", flush=True)
+            arc = p.relative_to(root).as_posix()
+            tf.add(p, arcname=arc, recursive=False)
+    kib = out.stat().st_size // 1024
+    print(f"--- Tarball: {kib} KiB ({len(files)} files) ---", flush=True)
+    return out
+
+
+def _connect() -> Transport:
+    """Open an authenticated Transport to the VPS.
+
+    Prefers the local ~/.ssh/id_ed25519 key (deployed to the VPS by
+    remote_bootstrap_paramiko.py during the first provision). Falls back
+    to password auth if the key is missing or rejected. This mirrors
+    the ordinary interactive workflow — operators don't want to re-enter
+    a password on every redeploy just because the pubkey path was not
+    obvious to the script.
+    """
+    pw = os.environ.get("CELLS_VPS_PASS") or (sys.argv[1] if len(sys.argv) > 1 else "")
+    key_path = Path(os.environ.get("USERPROFILE", os.environ.get("HOME", ""))) / ".ssh" / "id_ed25519"
+
+    sock = socket.create_connection((HOST, PORT), timeout=30)
+    t = Transport(sock)
+    t.start_client(timeout=30)
+
+    authed = False
+    if key_path.is_file():
+        try:
+            pk = paramiko.Ed25519Key.from_private_key_file(str(key_path))
+            t.auth_publickey(USER, pk)
+            authed = True
+            print(f"--- Authenticated with ed25519 key: {key_path} ---", flush=True)
+        except paramiko.PasswordRequiredException:
+            print(f"--- {key_path} is passphrase-protected; trying password auth ---", flush=True)
+        except paramiko.AuthenticationException as e:
+            print(f"--- key auth rejected ({e}); trying password auth ---", flush=True)
+
+    if not authed:
+        if not pw:
+            print(
+                "Key auth unavailable and CELLS_VPS_PASS not set; cannot authenticate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        t.auth_password(USER, pw)
+        print("--- Authenticated with password ---", flush=True)
+
+    t.set_keepalive(30)
+    return t
+
+
+def main() -> int:
+    _require_root_user("remote_apply_paramiko.py")
+    t = _connect()
+
+    tball = make_tarball(BASE)
+    try:
+        sftp = paramiko.SFTPClient.from_transport(t)
+        try:
+            print("--- Uploading tarball ---", flush=True)
+            sftp.put(str(tball), "/root/CELLS-local.tar.gz")
+            # Systemd unit and the one-shot backup script are outside
+            # the CELLS/ tree in the server layout (they live in /etc and
+            # /opt respectively), so sftp them explicitly.
+            raw_backup = (BASE / "deploy/vps-sqlite-backup.sh").read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            with sftp.open("/opt/CELLS/vps-sqlite-backup.sh", "wb") as f:
+                f.write(raw_backup)
+        finally:
+            sftp.close()
+    finally:
+        try:
+            tball.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except OSError:
+            pass
+
+    # Extract the tarball over /root/CELLS. --keep-old-files=no means we
+    # overwrite server copies; --no-same-owner avoids propagating local
+    # user ids that don't exist on the VPS.
+    ch_extract = t.open_session()
+    ch_extract.exec_command(
+        "bash -lc 'set -e; mkdir -p /root/CELLS; "
+        "tar -xzf /root/CELLS-local.tar.gz -C /root/CELLS --no-same-owner --overwrite; "
+        # Restore exec bit on all *.sh + python deploy scripts: tar
+        # preserves modes from the local filesystem, but Windows does
+        # not carry Unix executable bits so every .sh lands as 0644 on
+        # the server. Do this once, here, rather than scattering
+        # chmod calls throughout the REBUILD block.
+        "find /root/CELLS -type f \\( -name \"*.sh\" -o -name \"*.py\" \\) -exec chmod +x {} +; "
+        "chmod +x /opt/CELLS/vps-sqlite-backup.sh; "
+        "echo extraction-ok'"
+    )
+    ext_out = b""
+    while True:
+        if ch_extract.recv_ready():
+            ext_out += ch_extract.recv(65536)
+        if ch_extract.recv_stderr_ready():
+            ext_out += ch_extract.recv_stderr(65536)
+        if ch_extract.exit_status_ready():
+            break
+    sys.stdout.buffer.write(ext_out)
+    sys.stdout.buffer.flush()
+    if ch_extract.recv_exit_status() != 0:
+        t.close()
+        return 2
+
+    print("--- Rebuilding on server (may take several minutes) ---", flush=True)
+    ch = t.open_session()
+    ch.exec_command("bash -s")
+    ch.sendall(REBUILD.encode())
+    ch.shutdown_write()
+    while True:
+        if ch.recv_ready():
+            chunk = ch.recv(65536)
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        if ch.recv_stderr_ready():
+            chunk = ch.recv_stderr(65536)
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+        if ch.exit_status_ready():
+            break
+    while ch.recv_ready():
+        sys.stdout.buffer.write(ch.recv(65536))
+    while ch.recv_stderr_ready():
+        sys.stderr.buffer.write(ch.recv_stderr(65536))
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.flush()
+    st = ch.recv_exit_status()
+    t.close()
+    return st
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

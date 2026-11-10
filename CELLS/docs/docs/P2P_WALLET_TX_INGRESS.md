@@ -1,0 +1,33 @@
+# P2P wallet transaction ingress (parent cells, mesh companion, dedupe)
+
+This note is for operators running `CELLS` with libp2p pubsub wallet traffic and optional mesh wire.
+
+## Parent cells (wallet JSON)
+
+- API `POST /api/v1/wallet/send` validates `parent_cells` entries like transaction IDs (length and character rules in `pkg/api/validation.go`).
+- `parent_cells` are covered by the envelope's signature. Under [Proof-of-Entanglement](PROOF_OF_ENTANGLEMENT.md) they must be 2-10 distinct transactions committed in the last 8,640 blocks, from the configured activation height. The legacy JSON handler and the mesh handler apply the context-free rules (count, format, no duplicates, no self-reference) at every height. Once PoE is active, they also check the parents against the node's own committed history (`ParentCheck`).
+- The signature is verified under the envelope's own `public_key`, and `sender` must equal `hex(sha256(public_key))`. Earlier builds verified under the receiving node's own key, so they could only accept data that node had signed itself.
+- The demo wallet loop names the node's two newest committed transactions, the same source as `GET /api/v1/chain/parents`. It falls back to deterministic synthetic IDs (`pkg/wallet/parents.go`) only before two transactions are committed. Peers accept those IDs only below the PoE activation height.
+- Mesh structure failures are fatal. The mesh wrapper's parent cells must be the envelope's signed parents plus the payload digest, each carrying `sha256(id)` (`pkg/mesh3d/structure.go`).
+
+## Mesh companion (`CELLS_mesh3d_v1`)
+
+- When `CELLS_PUBLISH_MESH_COMPANION` is `1` / `true` / `yes`, the API (and the demo wallet loop after a successful gossip publish) may send a **second** pubsub frame: a `CELLS_mesh3d_v1` envelope whose payload is the **same** wallet JSON bytes.
+- Downstream nodes decode mesh wire in `transaction.DispatchInboundP2P` → `HandlePhase3MeshTx`, which stores the **inner** wallet JSON to storage.
+
+## Dedupe (same logical transaction twice)
+
+- **In-process:** `pkg/walletp2p` (`Reserve` / `Release` / `NoteIngested`) tracks recent wallet JSON `id` values so duplicate ingress is dropped before expensive validation. `cmd/CELLS/transaction` uses `Reserve` on legacy pubsub JSON and mesh inner JSON; **`pkg/networking.TxGossipIngress` calls `NoteIngested` when gossip validation accepts**, so the same id is not processed again on the legacy wallet/mesh path. Metric: `CELLS_p2p_wallet_ingress_dedupe_skip_total`.
+- **SQLite / Scylla:** `StoreTransaction` skips insert (and balance side-effects) when a row with the same `tx_id` already exists.
+- **File storage:** when JSON includes `id`, files are named `wallet_tx_<sanitized_id>.dat`; a second store with the same id is a no-op.
+
+## Retrieval
+
+- `GetTransaction` / recent-tx APIs use storage indexes on `tx_id` (SQLite/Scylla). File-backed storage does not index by id; use SQLite or Scylla for production-style lookup.
+
+## Related env vars
+
+| Variable | Purpose |
+|----------|---------|
+| `CELLS_PUBLISH_MESH_COMPANION` | Also publish mesh wire after wallet JSON (API + demo loop). |
+| `CELLS_WASM_PREFLIGHT_MODULE` | Path to `wasm_module.wasm` for wazero `validate_raw` preflight on P2P JSON. |

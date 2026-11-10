@@ -1,0 +1,399 @@
+package hmac
+
+// This file implements the 9-step acceptance flow from
+// MINING_PROTOCOL_V2.md §3.3 as a concrete
+// implementation of pkg/mining.AttestationVerifier. It is the
+// consensus-critical half of the consumer-GPU attestation path —
+// every byte that reaches this code has already been accepted as
+// well-formed v2 by the pkg/mining Verifier's Step-1 gate.
+//
+// The code is linear by design: each step checks one invariant
+// and returns on the first failure. This is NOT a place for
+// cleverness — the flow maps one-to-one to the spec so a
+// side-by-side audit stays legible.
+//
+// Step 8 (Tensor-Core mix_digest ↔ claimed gpu_arch cross-check)
+// is deferred to Phase 2c-iv. That check is run in
+// pkg/mining/pow.go against the PoW mixin, not here; duplicating
+// it would couple two code paths that should stay independent.
+// The spec permits this factoring — step 8 guards consistency
+// between the attestation's self-reported arch and the actual
+// Tensor-Core workload, which is a PoW property.
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/blackbeardONE/CELLS/pkg/mining"
+	"github.com/blackbeardONE/CELLS/pkg/mining/attest/archcheck"
+	"github.com/blackbeardONE/CELLS/pkg/mining/challenge"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+)
+
+// Verifier implements mining.AttestationVerifier for the
+// "nvidia-hmac-v1" Attestation.Type. It is stateless aside from
+// the injected collaborators; multiple validator goroutines can
+// call VerifyAttestation concurrently.
+type Verifier struct {
+	// Registry resolves node_id -> (gpu_uuid, hmac_key). Required.
+	Registry Registry
+
+	// NonceStore detects replays within 2*FRESHNESS_WINDOW.
+	// Optional: if nil, replay detection is skipped and the
+	// verifier relies solely on the freshness-window check. Tests
+	// that only want to cover the crypto path can leave this nil.
+	// Production validators MUST wire in a real NonceStore.
+	NonceStore NonceStore
+
+	// DenyList filters gpu_name against governance-appended
+	// strings. Optional: defaults to EmptyDenyList (the genesis
+	// state).
+	DenyList DenyList
+
+	// FreshnessWindow overrides mining.FreshnessWindow for tests.
+	// Zero means use mining.FreshnessWindow.
+	FreshnessWindow time.Duration
+
+	// AllowedFutureSkew is the maximum delta the verifier tolerates
+	// for a nonce whose issued_at is slightly in the future
+	// relative to our clock. Clocks disagree; the spec doesn't
+	// pin this value, so we default to 5 seconds — small enough
+	// that a replay attacker can't use it as a time-travel
+	// amplifier, large enough to absorb ordinary NTP skew.
+	AllowedFutureSkew time.Duration
+
+	// ChallengeVerifier cryptographically authenticates the
+	// (nonce, issued_at) pair back to a known validator. When
+	// non-nil, the verifier rejects any bundle whose
+	// challenge_sig / challenge_signer_id fields don't produce a
+	// valid signature over the same (nonce, issued_at) the miner
+	// committed to. When nil, this check is skipped and
+	// freshness-window + replay-cache are the sole anti-replay
+	// defences — acceptable for bring-up and isolated testnets
+	// but NEVER for production.
+	ChallengeVerifier challenge.SignerVerifier
+
+	// RequireOwnerBinding rejects proofs whose reward wallet
+	// (Proof.MinerAddr) differs from the wallet owner stored at
+	// enrollment. Production validators enable this so a valid
+	// node/GPU HMAC cannot be redirected to a different wallet.
+	RequireOwnerBinding bool
+
+	// RequireOperatorSignature rejects proofs unless the bundle carries an
+	// ML-DSA signature made by the operator key retained from the signed
+	// enrollment transaction. This is off during migration; once enrollment-key
+	// retention is active and miners can emit operator_sig, validators can enable
+	// it to stop relying on the public HMAC key as the sole attribution rail.
+	RequireOperatorSignature bool
+
+	// OnAccept, if non-nil, is invoked exactly ONCE per
+	// successful VerifyAttestation, just before the function
+	// returns nil. Its purpose is to feed accepted-claim data
+	// into NON-CONSENSUS observability layers — today the
+	// telemetry oracle's Tier-2 advisory checker
+	// (pkg/mining/telemetrycheck), tomorrow whatever
+	// Tier-3 reputation system lands.
+	//
+	// Hard contract:
+	//
+	//   - Hook MUST NOT return an error. The proof has
+	//     already passed every consensus check; nothing the
+	//     hook learns can revoke that.
+	//   - Hook MUST NOT panic. A defensive recover() inside
+	//     the call site catches panics and discards them so
+	//     a buggy hook can never crash the validator.
+	//   - Hook is called synchronously on the verifier
+	//     goroutine. Implementations that do work that
+	//     could block (network calls, disk writes) MUST
+	//     enqueue async themselves.
+	//
+	// Setting OnAccept after the verifier has been published
+	// to the dispatcher is racy. Wire it during boot, before
+	// the dispatcher is published.
+	OnAccept func(Bundle, mining.Proof, time.Time)
+}
+
+// NewVerifier constructs a Verifier with the required collaborator
+// (Registry) and sensible defaults for the others. Callers wire in
+// NonceStore and ChallengeVerifier for production — both are nil
+// by default because some test paths intentionally exercise the
+// skip-these-checks behaviour.
+func NewVerifier(registry Registry) *Verifier {
+	return &Verifier{
+		Registry:          registry,
+		NonceStore:        nil,
+		DenyList:          EmptyDenyList{},
+		FreshnessWindow:   mining.FreshnessWindow,
+		AllowedFutureSkew: 5 * time.Second,
+		ChallengeVerifier: nil,
+	}
+}
+
+// VerifyAttestation implements mining.AttestationVerifier. Returns
+// nil on acceptance, or an error wrapping one of the
+// mining.ErrAttestation* sentinels on rejection. The error message
+// is informative but not sensitive — no HMAC key material and no
+// bundle contents that would help an attacker shape a second
+// attempt appear in the output.
+func (v *Verifier) VerifyAttestation(p mining.Proof, now time.Time) error {
+	// Defensive: the outer Verifier should have filtered by type
+	// before dispatch, but we re-check so this package is safe to
+	// use standalone (tests, future replay tools).
+	if p.Attestation.Type != mining.AttestationTypeHMAC {
+		return fmt.Errorf("hmac: got attestation type %q want %q: %w",
+			p.Attestation.Type, mining.AttestationTypeHMAC, mining.ErrAttestationTypeUnknown)
+	}
+	if v.Registry == nil {
+		return fmt.Errorf("hmac: Verifier.Registry is nil: %w", mining.ErrAttestationSignatureInvalid)
+	}
+
+	// Step 1: parse bundle.
+	bundle, err := ParseBundle(p.Attestation.BundleBase64)
+	if err != nil {
+		return fmt.Errorf("hmac: %v: %w", err, mining.ErrAttestationBundleMalformed)
+	}
+
+	// Step 2: challenge-bind. Recompute sha256(miner_addr ||
+	// batch_root || mix_digest) and compare hex-decoded bundle
+	// field. Mismatch means the bundle was signed for a different
+	// proof (replay or substitution).
+	wantBind := ComputeChallengeBind(p.MinerAddr, p.BatchRoot, p.MixDigest)
+	gotBind, err := hex.DecodeString(bundle.ChallengeBind)
+	if err != nil || len(gotBind) != 32 {
+		return fmt.Errorf("hmac: challenge_bind not 32 hex bytes: %w", mining.ErrAttestationBundleMalformed)
+	}
+	if !bytes.Equal(gotBind, wantBind[:]) {
+		return fmt.Errorf("hmac: challenge_bind mismatch: %w", mining.ErrAttestationSignatureInvalid)
+	}
+
+	// Step 3: registry lookup. Unknown or revoked node → reject.
+	// Use %w twice (Go 1.20+) so callers can errors.Is against
+	// BOTH the specific registry sentinel (ErrNodeRevoked,
+	// ErrNodeNotRegistered) AND the consensus-level
+	// mining.ErrAttestationSignatureInvalid.
+	entry, err := v.Registry.Lookup(bundle.NodeID)
+	if err != nil {
+		return fmt.Errorf("hmac: registry lookup failed: %w: %w", err, mining.ErrAttestationSignatureInvalid)
+	}
+	if entry == nil {
+		return fmt.Errorf("hmac: registry returned nil entry for %q: %w", bundle.NodeID, mining.ErrAttestationSignatureInvalid)
+	}
+	if v.RequireOwnerBinding {
+		if entry.Owner == "" {
+			return fmt.Errorf("hmac: registry entry for node %q has no owner for reward binding: %w",
+				bundle.NodeID, mining.ErrAttestationSignatureInvalid)
+		}
+		if p.MinerAddr != entry.Owner {
+			return fmt.Errorf("hmac: miner address %q != registered owner %q for node %q: %w",
+				p.MinerAddr, entry.Owner, bundle.NodeID, mining.ErrAttestationSignatureInvalid)
+		}
+	}
+
+	// Step 4: HMAC check. Recompute the MAC over the canonical
+	// form (minus hmac field) and compare in constant time.
+	canonical, err := bundle.CanonicalForMAC()
+	if err != nil {
+		return fmt.Errorf("hmac: canonical encode: %v: %w", err, mining.ErrAttestationBundleMalformed)
+	}
+	gotMAC, err := hex.DecodeString(bundle.HMAC)
+	if err != nil || len(gotMAC) != 32 {
+		return fmt.Errorf("hmac: hmac field not 32 hex bytes: %w", mining.ErrAttestationBundleMalformed)
+	}
+	wantMAC := ComputeMAC(entry.HMACKey, canonical)
+	if !hmac.Equal(gotMAC, wantMAC) {
+		return fmt.Errorf("hmac: hmac mismatch for node %q: %w", bundle.NodeID, mining.ErrAttestationSignatureInvalid)
+	}
+
+	// Step 4b: optional operator-signature rail. The HMAC proves knowledge of
+	// the enrollment-time shared key. This asymmetric signature proves the same
+	// proof came from the enrolled operator key, not merely from anyone who can
+	// read HMACKey from public chain state.
+	if v.RequireOperatorSignature {
+		if err := verifyOperatorSignature(entry.OperatorPublicKey, bundle.OperatorSig, bundle, p); err != nil {
+			return err
+		}
+	}
+
+	// Step 5: GPU UUID binding. The registry records the GPU
+	// UUID at enrollment; every subsequent proof must echo that
+	// exact UUID. Without this check one key could mine forever
+	// on any hardware (the spec's §3.2.2 step 5 rationale).
+	// Case-insensitive compare because nvidia-smi emits mixed
+	// case across driver versions.
+	if !strings.EqualFold(bundle.GPUUUID, entry.GPUUUID) {
+		return fmt.Errorf("hmac: gpu_uuid %q != registered %q: %w",
+			bundle.GPUUUID, entry.GPUUUID, mining.ErrAttestationSignatureInvalid)
+	}
+
+	// Step 6a: nonce consistency between inner bundle and outer
+	// Attestation field. A miner who signs over one nonce and
+	// ships another is attempting a swap — reject.
+	bundleNonce, err := hex.DecodeString(bundle.Nonce)
+	if err != nil || len(bundleNonce) != 32 {
+		return fmt.Errorf("hmac: nonce not 32 hex bytes: %w", mining.ErrAttestationBundleMalformed)
+	}
+	if !bytes.Equal(bundleNonce, p.Attestation.Nonce[:]) {
+		return fmt.Errorf("hmac: bundle.nonce != Attestation.Nonce: %w", mining.ErrAttestationNonceMismatch)
+	}
+	if bundle.IssuedAt != p.Attestation.IssuedAt {
+		return fmt.Errorf("hmac: bundle.issued_at != Attestation.IssuedAt: %w", mining.ErrAttestationNonceMismatch)
+	}
+
+	// Step 6a-ii: challenge signature. When a ChallengeVerifier is
+	// wired in, prove this (nonce, issued_at) came from a
+	// validator — not from the miner's own PRNG. Performed
+	// BEFORE freshness so an invalid signature fails fast
+	// without the freshness-window check; performed AFTER
+	// nonce/issued_at consistency so we verify the SAME value
+	// the inner HMAC covers.
+	if v.ChallengeVerifier != nil {
+		if bundle.ChallengeSignerID == "" {
+			return fmt.Errorf("hmac: challenge_signer_id missing: %w", mining.ErrAttestationBundleMalformed)
+		}
+		sigBytes, err := hex.DecodeString(bundle.ChallengeSig)
+		if err != nil || len(sigBytes) == 0 {
+			return fmt.Errorf("hmac: challenge_sig not hex: %w", mining.ErrAttestationBundleMalformed)
+		}
+		var nonceArr [32]byte
+		copy(nonceArr[:], bundleNonce)
+		chg := challenge.Challenge{
+			Nonce:     nonceArr,
+			IssuedAt:  bundle.IssuedAt,
+			SignerID:  bundle.ChallengeSignerID,
+			Signature: sigBytes,
+		}
+		if err := v.ChallengeVerifier.VerifySignature(
+			chg.SignerID, chg.SigningBytes(), chg.Signature,
+		); err != nil {
+			return fmt.Errorf("hmac: challenge signature: %w: %w",
+				err, mining.ErrAttestationSignatureInvalid)
+		}
+	}
+
+	// Step 6b: freshness. Reject proofs issued too far in the
+	// past or impossibly in the future.
+	window := v.FreshnessWindow
+	if window == 0 {
+		window = mining.FreshnessWindow
+	}
+	issued := time.Unix(bundle.IssuedAt, 0)
+	age := now.Sub(issued)
+	if age > window {
+		return fmt.Errorf("hmac: attestation age %v > window %v: %w", age, window, mining.ErrAttestationStale)
+	}
+	if age < -v.AllowedFutureSkew {
+		return fmt.Errorf("hmac: attestation issued %v in future (max skew %v): %w",
+			-age, v.AllowedFutureSkew, mining.ErrAttestationStale)
+	}
+
+	// Step 6c: replay check against the nonce store. Only
+	// consulted if the caller wired one in. The check and the
+	// claim are one atomic TryRecord, so concurrent submissions
+	// sharing a nonce cannot all observe it as unseen.
+	//
+	// Claim AFTER the preceding checks pass so a half-failing
+	// proof can still be replayed once the attacker fixes the
+	// other defects — but that only helps if their fix keeps
+	// the HMAC valid, which requires the operator key.
+	if v.NonceStore != nil {
+		var nonceBuf [32]byte
+		copy(nonceBuf[:], bundleNonce)
+		if !v.NonceStore.TryRecord(bundle.NodeID, nonceBuf, now) {
+			return fmt.Errorf("hmac: nonce already used by node %q: %w",
+				bundle.NodeID, mining.ErrAttestationNonceMismatch)
+		}
+	}
+
+	// Step 7: deny-list.
+	if v.DenyList != nil && v.DenyList.Denied(bundle.GPUName) {
+		return fmt.Errorf("hmac: gpu_name %q on deny-list: %w",
+			bundle.GPUName, mining.ErrAttestationSignatureInvalid)
+	}
+
+	// Step 8: arch-spoof rejection (§4.6 / §3.3 step 8). Cross-
+	// check that the claimed Attestation.GPUArch is consistent
+	// with the bundle's gpu_name. The bundle's gpu_name is
+	// HMAC-bound under the operator's enrollment-time key
+	// (covered by Bundle.CanonicalForMAC), so an attacker who
+	// has just successfully forged the HMAC cannot also flip
+	// gpu_name post-hoc — they had to choose at sign time. The
+	// "lazy spoof" (RTX 4090 claiming gpu_arch=hopper but
+	// nvidia-smi reporting "GeForce RTX 4090") is rejected here.
+	// A determined attacker who lies about BOTH is still trapped
+	// by the on-chain registry's (gpu_uuid, hmac_key) pairing
+	// and economically by §5.4 stake bonding + §8 slashing.
+	//
+	// The outer Verifier already accepted Attestation.GPUArch
+	// against the closed-enum allowlist before dispatching to
+	// us, so Canonicalise here is guaranteed to succeed in
+	// production. Defensive re-validation kept so this verifier
+	// is also safe to use standalone.
+	arch, ok := archcheck.Canonicalise(p.Attestation.GPUArch)
+	if !ok {
+		return fmt.Errorf("hmac: gpu_arch %q not in allowlist: %w",
+			p.Attestation.GPUArch, mining.ErrAttestationSignatureInvalid)
+	}
+	if err := archcheck.ValidateBundleArchConsistencyHMAC(arch, bundle.GPUName); err != nil {
+		return fmt.Errorf("hmac: %w: %w",
+			err, mining.ErrAttestationSignatureInvalid)
+	}
+
+	// Step 10 (NON-CONSENSUS): emit accepted claim into the
+	// observability hook. Wrapped in a recover so a buggy
+	// observer never trips the validator. Errors swallowed
+	// deliberately — once we are here the proof IS accepted
+	// and nothing the hook learns can change that.
+	if v.OnAccept != nil {
+		safeOnAccept(v.OnAccept, bundle, p, now)
+	}
+
+	return nil
+}
+
+func verifyOperatorSignature(operatorPublicKeyHex, operatorSigHex string, bundle Bundle, p mining.Proof) error {
+	if strings.TrimSpace(operatorPublicKeyHex) == "" {
+		return fmt.Errorf("hmac: operator public key missing for node %q: %w",
+			bundle.NodeID, mining.ErrAttestationSignatureInvalid)
+	}
+	publicKeyBytes, err := hex.DecodeString(operatorPublicKeyHex)
+	if err != nil || len(publicKeyBytes) != mldsa87.PublicKeySize {
+		return fmt.Errorf("hmac: operator_public_key must be %d-byte hex for node %q: %w",
+			mldsa87.PublicKeySize, bundle.NodeID, mining.ErrAttestationSignatureInvalid)
+	}
+	operatorSigBytes, err := hex.DecodeString(operatorSigHex)
+	if err != nil || len(operatorSigBytes) != mldsa87.SignatureSize {
+		return fmt.Errorf("hmac: operator_sig must be %d-byte hex: %w",
+			mldsa87.SignatureSize, mining.ErrAttestationBundleMalformed)
+	}
+	var publicKey mldsa87.PublicKey
+	if err := publicKey.UnmarshalBinary(publicKeyBytes); err != nil {
+		return fmt.Errorf("hmac: decode operator public key for node %q: %w: %w",
+			bundle.NodeID, err, mining.ErrAttestationSignatureInvalid)
+	}
+	canonical, err := bundle.CanonicalForOperatorSignature(p)
+	if err != nil {
+		return fmt.Errorf("hmac: operator signature canonical encode: %v: %w",
+			err, mining.ErrAttestationBundleMalformed)
+	}
+	if !mldsa87.Verify(&publicKey, canonical, nil, operatorSigBytes) {
+		return fmt.Errorf("hmac: operator signature mismatch for node %q: %w",
+			bundle.NodeID, mining.ErrAttestationSignatureInvalid)
+	}
+	return nil
+}
+
+// safeOnAccept runs the OnAccept callback under a deferred
+// recover so a panic inside the observer cannot disturb the
+// caller. Lifted into its own function so the recover is a
+// crisp two-liner instead of inline noise on the hot path.
+func safeOnAccept(fn func(Bundle, mining.Proof, time.Time), bundle Bundle, p mining.Proof, now time.Time) {
+	defer func() { _ = recover() }()
+	fn(bundle, p, now)
+}
+
+// compile-time check that Verifier satisfies the interface.
+var _ mining.AttestationVerifier = (*Verifier)(nil)

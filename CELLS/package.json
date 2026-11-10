@@ -1,0 +1,11 @@
+{
+  "name": "CELLS-wasm-tests",
+  "version": "1.0.0",
+  "description": "CELLS WASM integration test scripts",
+  "scripts": {
+    "test": "node tests/wasm_js_integration_test_node_final.js"
+  },
+  "dependencies": {
+    "wasi": "*"
+  }
+}

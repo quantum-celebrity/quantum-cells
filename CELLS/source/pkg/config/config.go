@@ -1,0 +1,1331 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/joho/godotenv"
+	"gopkg.in/yaml.v3"
+
+	"github.com/blackbeardONE/CELLS/pkg/envcompat"
+	"github.com/blackbeardONE/CELLS/pkg/producerpolicy"
+)
+
+// envPreferred is a thin local alias for envcompat.Lookup kept so the large
+// number of call sites below read compactly. Callers OUTSIDE this package
+// should import pkg/envcompat directly.
+func envPreferred(preferred, legacy string) string {
+	return envcompat.Lookup(preferred, legacy)
+}
+
+// Config holds the application configuration
+type Config struct {
+	// Node role (two-tier model introduced by the Major Update).
+	// NodeRole is the canonical role (validator or miner). When unset at load
+	// time it defaults to NodeRoleValidator. MiningEnabled must agree with
+	// NodeRole at Validate() time: miner ⇒ true, validator ⇒ false.
+	// Env overrides: CELLS_NODE_ROLE, CELLS_MINING_ENABLED.
+	NodeRole      NodeRole
+	MiningEnabled bool
+	// RequireMiningOperatorSignatures makes validators reject nvidia-hmac-v1
+	// proofs unless they carry operator_sig signed by the retained enrollment
+	// ML-DSA public key. Default false for staged miner rollout.
+	// TOML/YAML: [node] require_mining_operator_signatures; env:
+	// CELLS_REQUIRE_MINING_OPERATOR_SIGNATURES.
+	RequireMiningOperatorSignatures bool
+	// MiningOperatorPublicKeyRetentionHeight is the first block height where
+	// signed mining enrollments retain their operator ML-DSA public key for
+	// later proof verification. Zero keeps retention disabled.
+	// TOML/YAML: [node] mining_operator_public_key_retention_height; env:
+	// CELLS_MINING_OPERATOR_PUBLIC_KEY_RETENTION_HEIGHT.
+	MiningOperatorPublicKeyRetentionHeight uint64
+
+	// Network
+	NetworkPort        int
+	NetworkBindAddress string
+	BootstrapPeers     []string
+	// NetworkHostKeyPath: optional file persisting the libp2p host
+	// PrivateKey across restarts so peer.ID is stable. Empty (default)
+	// = ephemeral key, generated fresh every restart (acceptable for
+	// dev/CI; on production this causes pre-restart trust attestation
+	// rows to age out of the freshness window because node_id flips).
+	// Env override: CELLS_NETWORK_HOST_KEY_PATH; TOML:
+	// [network] host_key_path; YAML: network.host_key_path. File
+	// format: single line of base64(proto.Marshal(libp2p PrivKey)),
+	// mode 0600; see pkg/networking/hostkey.go.
+	NetworkHostKeyPath string
+	// P2PLimits bounds libp2p connections/streams and GossipSub traffic.
+	// Zero fields use the defaults in pkg/networking/p2p_limits.go.
+	// TOML/YAML: keys under [network] (see p2p_limits.go); env: CELLS_P2P_*.
+	P2PLimits P2PLimitsConfig
+	// BridgeRelay authenticates CELLS-bridge gossip events. With no trusted
+	// keys (the default) remote bridge events are never applied.
+	// TOML/YAML: bridge_relay_* under [network]; env: CELLS_BRIDGE_RELAY_*.
+	BridgeRelay BridgeRelayConfig
+	// PrivateP2P restricts libp2p to a private-network bind and a fixed list
+	// of peer IDs. Off by default: no change.
+	// TOML/YAML: private_p2p, private_p2p_allowed_peers under [network];
+	// env: CELLS_P2P_PRIVATE, CELLS_P2P_PRIVATE_ALLOWED_PEERS.
+	PrivateP2P PrivateP2PConfig
+	// SnapshotBootstrap pins a trusted checkpoint for the verified snapshot
+	// bootstrap (snapshot_bootstrap.go). Off by default: no change.
+	// TOML/YAML: [snapshot_bootstrap]; env: CELLS_SNAPSHOT_BOOTSTRAP,
+	// CELLS_SNAPSHOT_CHECKPOINT_*.
+	SnapshotBootstrap SnapshotBootstrapConfig
+	// SubmeshConfigPath: optional file (e.g. config/micropayments.toml) loaded into DynamicSubmeshManager at startup.
+	SubmeshConfigPath string
+	// ConfigFileUsed is the absolute path to the main config file when one was loaded; used to resolve relative submesh_config.
+	ConfigFileUsed string
+
+	// Storage
+	StorageType string // "sqlite", "scylla", or "file" (for non-CGO builds)
+	SQLitePath  string
+	// UserStorePath: path to the JSON file that persists the dashboard
+	// user map (Argon2id password hashes). When empty the store is in-
+	// memory only, which matches legacy test behaviour but is unsafe in
+	// production: every service restart wipes every account (see the
+	// 2026-04-23 wipe incident). In production this defaults to
+	// <state_dir>/CELLS_users.json where state_dir = filepath.Dir(SQLitePath).
+	// Env override: CELLS_USER_STORE_PATH (the pre-rebrand CELLSPLUS_USER_STORE_PATH env var
+	// is no longer read; see pkg/envcompat godoc).
+	UserStorePath               string
+	ScyllaHosts                 []string
+	ScyllaKeyspace              string
+	ScyllaUsername              string
+	ScyllaPassword              string
+	ScyllaTLSCaPath             string
+	ScyllaTLSCertPath           string
+	ScyllaTLSKeyPath            string
+	ScyllaTLSInsecureSkipVerify bool
+
+	// Monitoring
+	DashboardPort        int
+	DashboardBindAddress string
+	LogViewerPort        int
+	LogFile              string
+	LogLevel             string
+	// NGCProofPersistPath: optional path the in-memory NGC
+	// attestation ring (see pkg/monitoring/ngc_proofs.go) is
+	// persisted to as JSONL. When set, CELLS.service restart no
+	// longer wipes pre-restart bundles; cmd/CELLS replays the file
+	// at startup so /api/v1/trust/attestations/summary stays
+	// > 0 across restarts (assuming pre-restart timestamps are
+	// still inside cfg.TrustFreshWithin, default 15m). Empty
+	// (default) = legacy in-memory-only ring.
+	// TOML: [monitoring] ngc_proof_persist_path; YAML:
+	// monitoring.ngc_proof_persist_path; env:
+	// CELLS_NGC_PROOF_PERSIST_PATH. See
+	// pkg/monitoring/ngc_proof_persist.go for the on-disk format.
+	NGCProofPersistPath string
+	// DashboardMetricsScrapeSecret: when set, GET /api/metrics/prometheus accepts this via Bearer or
+	// X-CELLS-Metrics-Scrape-Secret header (legacy X-CELLSPLUS-Metrics-Scrape-Secret also accepted).
+	// Env: CELLS_DASHBOARD_METRICS_SCRAPE_SECRET (the pre-rebrand CELLSPLUS_DASHBOARD_METRICS_SCRAPE_SECRET
+	// env var is no longer read; pkg/envcompat is now a no-op trim helper after db9b590).
+	DashboardMetricsScrapeSecret string
+	// DashboardStrictAuth: DEPRECATED and no longer read for its original
+	// purpose. Protected dashboard routes now return 503 whenever the auth
+	// manager failed to initialise, unconditionally -- serving them
+	// unauthenticated was never a safe fallback, so it is no longer opt-out.
+	// The key is still accepted so deployments that set it keep parsing.
+	//
+	// Formerly: when true ([monitoring] strict_dashboard_auth or CELLS_DASHBOARD_STRICT_AUTH),
+	// JWT routes return 503 if auth manager failed to init; Prometheus still works if
+	// metrics_scrape_secret is set. (The pre-rebrand CELLSPLUS_DASHBOARD_STRICT_AUTH env var is no
+	// longer read; see pkg/envcompat godoc.)
+	DashboardStrictAuth bool
+
+	// API Server
+	APIPort        int
+	APIBindAddress string
+	TLSCertFile    string
+	TLSKeyFile     string
+	EnableTLS      bool
+	// ACME (Let's Encrypt) auto-provisioned TLS certificates.
+	// Set ACMEDomains to enable; takes precedence over TLSCertFile/TLSKeyFile.
+	ACMEDomains  []string
+	ACMEEmail    string
+	ACMECacheDir string
+	// Mutual TLS (mTLS) for node-to-node API authentication.
+	MTLSCACertFile   string
+	MTLSNodeCertFile string
+	MTLSNodeKeyFile  string
+	MTLSAutoGenerate bool // auto-generate CA + node cert if files don't exist
+	// APIRateLimitMaxRequests: max HTTP requests per client per APIRateLimitWindow (default 100/min). Health routes are exempt.
+	APIRateLimitMaxRequests int
+	APIRateLimitWindow      time.Duration
+
+	// Wallet
+	InitialBalance float64
+
+	// Governance
+	ProposalFile string
+
+	// RequireSignedVotes rejects inbound BFT consensus messages that carry
+	// no signature. Defaults to false so a mixed-version validator set can
+	// roll forward: signed builds emit authenticated votes immediately,
+	// and the operator enables rejection once every validator is upgraded.
+	// A present-but-invalid signature is always rejected regardless of this
+	// setting. Set via `[consensus] require_signed_votes` or
+	// CELLS_REQUIRE_SIGNED_VOTES.
+	//
+	// Leave this off only during a rollout: while it is false, an
+	// unauthenticated peer can still forge votes for any validator.
+	RequireSignedVotes bool
+
+	// SignedConsensusActivationHeight is the first block height at which
+	// unsigned votes, blocks, POL artifacts, and equivocation evidence are
+	// rejected. A shared future height lets upgraded nodes emit signatures
+	// before every validator begins enforcing them at the same point.
+	// It must be non-zero exactly when RequireSignedVotes is true.
+	SignedConsensusActivationHeight uint64
+
+	// TaskActionSignatureActivationHeight is the first height at which a task
+	// action must carry a signature ([consensus] or
+	// CELLS_TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT). Zero leaves the
+	// requirement off. See chain.VerifyTaskActionSignature.
+	TaskActionSignatureActivationHeight uint64
+
+	// TxContentRootActivationHeight is the first height whose block tx root
+	// commits transaction contents ([consensus] or
+	// CELLS_TX_CONTENT_ROOT_ACTIVATION_HEIGHT). Zero keeps the legacy ID-only
+	// root. Changing it changes block hashes; every node must agree.
+	TxContentRootActivationHeight uint64
+
+	// EnrollmentStateRootActivationHeight is the first height whose block state
+	// root commits mining enrollment/slashing side state ([consensus] or
+	// CELLS_ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT). Zero keeps the legacy
+	// account/task/stream/recovery root. Changing it changes block roots; every
+	// node must agree.
+	EnrollmentStateRootActivationHeight uint64
+
+	// PoEActivationHeight is the first height at which signed wallet
+	// transfers must satisfy the Proof-of-Entanglement parent rules
+	// ([consensus] poe_activation_height or CELLS_POE_ACTIVATION_HEIGHT).
+	// Zero keeps them off. See chain.SetPoEActivationHeight.
+	PoEActivationHeight uint64
+
+	// StreamEd25519RetirementHeight is the first height at which a CELL
+	// stream open (CELLS/streams/v1), which registers an Ed25519 session
+	// key, is refused ([consensus] stream_ed25519_retirement_height or
+	// CELLS_STREAM_ED25519_RETIREMENT_HEIGHT). Zero keeps the rule off. See
+	// chain.SetStreamEd25519RetirementHeight.
+	StreamEd25519RetirementHeight uint64
+
+	// CELLS20ActivationHeight is the first height at which CELLS-20 token
+	// transactions (CELLS/token/v1) are valid ([consensus]
+	// CELLS20_activation_height or CELLS_CELLS20_ACTIVATION_HEIGHT). Zero keeps
+	// them off. See chain.SetCELLS20ActivationHeight.
+	CELLS20ActivationHeight uint64
+
+	// ConsensusSignerKeyPath is the validator-only ML-DSA hot key used to
+	// authenticate consensus traffic. It is not a wallet and must never hold
+	// user or treasury funds. Empty resolves to a file under the node state
+	// directory in cmd/CELLS.
+	ConsensusSignerKeyPath string
+
+	// ForkDustHeight is reserved for the coordinated integer-dust accounting
+	// transition. Config parsing retains the field so operators can inspect old
+	// files, but Validate rejects every non-zero value until the deterministic
+	// capped-issuance transition and its governance manifest are implemented.
+	//
+	// Zero (the default) means never active, leaving the legacy float64
+	// behaviour bit-for-bit intact. This is a CONSENSUS parameter: every
+	// validator must configure the same height, and genesis must first be
+	// re-derived to the documented 90M cap with no genesis treasury
+	// (CELLS Genesis Policy v1.1) — the historical 1e15 CELL
+	// funder allocation is 1e23 dust, which overflows uint64 and will make
+	// the migration refuse to run.
+	//
+	// Set via `[consensus] fork_dust_height` or CELLS_FORK_DUST_HEIGHT.
+	ForkDustHeight uint64
+
+	// GovernanceAuthorities lists wallet addresses permitted to submit
+	// `CELLS/gov/v1` parameter-set transactions. Empty (the default) keeps
+	// on-chain governance disabled — the pre-governance posture in which
+	// SlashApplier reads static defaults forever. Populating it via
+	// `[governance] authorities` in the config file, or the
+	// CELLS_GOVERNANCE_AUTHORITIES env var (comma-separated), activates the
+	// governance arm wired in internal/v2wiring.
+	GovernanceAuthorities []string
+
+	// AuthorizedBlockProducers pins the producer IDs whose blocks this node will
+	// append from the `CELLS-blocks` gossip topic. Empty -- the default -- accepts
+	// any producer, which is the pre-existing behaviour and is why this defaults
+	// off rather than fail-closed: enabling it wrongly would stop the node
+	// following the chain.
+	//
+	// It matters because TryAppendExternalBlock authenticates the block but not
+	// the right to produce one: VerifyBlockSignature returns nil for an unsigned
+	// block below the signed-blocks activation height (the deployed posture), and
+	// is self-certifying when signed. Pin the operator's known producer, which is
+	// the same peer ID already used as the bootstrap peer.
+	//
+	// Set via `[consensus] authorized_block_producers` or
+	// CELLS_AUTHORIZED_BLOCK_PRODUCERS (comma-separated).
+	AuthorizedBlockProducers []string
+	// ProducerTransition supersedes the flat allowlist only when explicitly configured.
+	ProducerTransition *producerpolicy.Transition
+
+	// Performance
+	TransactionInterval     time.Duration
+	HealthCheckInterval     time.Duration
+	DemoTransactionsEnabled bool
+
+	// NGC sidecar: shared secret for POST /api/v1/monitoring/ngc-proof.
+	// Prefer env CELLS_NGC_INGEST_SECRET; CELLS_NGC_INGEST_SECRET is still accepted
+	// (deprecated; to be removed after the Major Update deprecation window).
+	NGCIngestSecret string
+
+	// NVIDIALockEnabled: when true, state-changing ledger API routes require a recent NGC proof
+	// with GPU attestation (gpu_fingerprint.available=true). Requires NGCIngestSecret to be set.
+	NvidiaLockEnabled bool
+	// NvidiaLockMaxProofAge: proofs older than this (from ingest time) do not satisfy the lock.
+	NvidiaLockMaxProofAge time.Duration
+	// NvidiaLockExpectedNodeID: when non-empty and nvidia_lock is on, ingested proofs must include
+	// JSON string CELLS_node_id (or legacy CELLS_node_id) equal to this value (set
+	// CELLS_NGC_PROOF_NODE_ID on the sidecar; CELLS_NGC_PROOF_NODE_ID is still accepted).
+	NvidiaLockExpectedNodeID string
+	// NvidiaLockProofHMACSecret: when non-empty and nvidia_lock is on, proofs must include a valid
+	// CELLS_proof_hmac (or legacy CELLS_proof_hmac) HMAC-SHA256 field.
+	NvidiaLockProofHMACSecret string
+	// NvidiaLockRequireIngestNonce: proofs must include a fresh server-issued CELLS_ingest_nonce (or
+	// legacy CELLS_ingest_nonce) from GET .../ngc-challenge; each nonce is single-use at ingest;
+	// each ingested proof satisfies at most one lock check (proof consumed).
+	NvidiaLockRequireIngestNonce bool
+	// NvidiaLockIngestNonceTTL: lifetime for issued nonces (default 10m when require is on).
+	NvidiaLockIngestNonceTTL time.Duration
+	// NvidiaLockGateP2P: when true (with nvidia_lock), drop libp2p-received transactions unless a qualifying ingested proof exists (non-consuming check; opt-in).
+	NvidiaLockGateP2P bool
+
+	// JWTHMACSecret: HMAC key for JWT and request-signing fallback when Dilithium/CGO is unavailable (non-CGO builds).
+	JWTHMACSecret string
+
+	// JWTHMACSecretSecondary: VERIFY-ONLY secondary HMAC key used during
+	// a key-rotation window (audit row rotation-01). When set, the
+	// AuthManager.ValidateToken + RequestSigner.VerifyRequest fallback
+	// paths try the primary key first and fall back to this secondary
+	// on mismatch, incrementing
+	// CELLS_security_jwt_secondary_key_hits_total /
+	// CELLS_security_request_signature_secondary_key_hits_total
+	// respectively. New tokens / signatures are ALWAYS produced with
+	// JWTHMACSecret (the primary) — the secondary is decommissioning-
+	// only. Leave empty when no rotation is in flight. Runbook:
+	// CELLS/docs/docs/runbooks/JWT_KEY_ROTATION.md.
+	JWTHMACSecretSecondary string
+
+	// AdminAPIRequireRole: when true, /api/admin/* requires JWT role "admin" (after AuthMiddleware).
+	AdminAPIRequireRole bool
+	// AdminAPIRequireMTLS: when true, /api/admin/* requires a verified TLS client certificate.
+	AdminAPIRequireMTLS bool
+
+	// AlertWebhookURL: optional webhook URL for the alerting subsystem (env CELLS_ALERT_WEBHOOK).
+	AlertWebhookURL string
+
+	// StrictProductionSecrets: when true ([api] strict_secrets or env CELLS_STRICT_SECRETS / legacy
+	// CELLS_STRICT_SECRETS), reject short or demo-like NGC/JWT/HMAC secrets at startup.
+	StrictProductionSecrets bool
+
+	// ---- Trust / attestation transparency (Major Update §8.5) ----
+	// These fields govern the optional /api/v1/trust/attestations/* surface and the
+	// widgets that consume it. They do NOT influence consensus — see
+	// docs/docs/NVIDIA_LOCK_CONSENSUS_SCOPE.md for the boundary.
+
+	// TrustEndpointsDisabled: when true, the trust endpoints return 404 and the
+	// aggregator is not wired. [trust] disabled / CELLS_TRUST_DISABLED.
+	TrustEndpointsDisabled bool
+	// TrustFreshWithin: how recent an NGC attestation must be to count as fresh
+	// in the X/Y transparency ratio. Zero → 15 m. [trust] fresh_within /
+	// CELLS_TRUST_FRESH_WITHIN.
+	TrustFreshWithin time.Duration
+	// TrustRefreshInterval: cadence of the background goroutine that rebuilds the
+	// aggregator cache. Zero → 10 s. [trust] refresh_interval /
+	// CELLS_TRUST_REFRESH_INTERVAL.
+	TrustRefreshInterval time.Duration
+	// TrustRegionHint: coarse region ("eu" / "us" / "apac" / "other" / "")
+	// served with the local node's row. [trust] region_hint / CELLS_TRUST_REGION.
+	TrustRegionHint string
+}
+
+// LoadConfig loads configuration from config file, environment variables, and defaults
+// Priority: Environment variables > Config file > Defaults
+func LoadConfig() (*Config, error) {
+	// Load .env file if it exists
+	_ = godotenv.Load()
+
+	// Try to load from config file first
+	cfg := &Config{}
+	configFile := getEnvString("CONFIG_FILE", "")
+
+	// If no config file specified, try common names. The post-rebrand CELLS.*
+	// names are preferred; the legacy CELLSplus.* names are still probed so
+	// existing deployments continue to work through the deprecation window.
+	if configFile == "" {
+		configFiles := []string{
+			"CELLS.yaml", "CELLS.yml", "CELLS.toml",
+			"CELLSplus.yaml", "CELLSplus.yml", "CELLSplus.toml",
+		}
+		for _, f := range configFiles {
+			if _, err := os.Stat(f); err == nil {
+				configFile = f
+				break
+			}
+		}
+	}
+
+	// Check if config file exists
+	if configFile != "" {
+		if _, err := os.Stat(configFile); err == nil {
+			if err := loadConfigFile(configFile, cfg); err != nil {
+				return nil, fmt.Errorf("failed to load config file %s: %w", configFile, err)
+			}
+			if abs, err := filepath.Abs(configFile); err == nil {
+				cfg.ConfigFileUsed = abs
+			} else {
+				cfg.ConfigFileUsed = filepath.Clean(configFile)
+			}
+		}
+	}
+
+	// Apply defaults for any unset values
+	applyDefaults(cfg)
+
+	// Override with environment variables (highest priority)
+	applyEnvOverrides(cfg)
+
+	// Validate configuration
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// LoadConfigFile loads one TOML or YAML configuration file as LoadConfig maps
+// it, with the defaults, and validates it, but without the environment
+// overrides and without a .env file: the result is what the file itself
+// configures. Tools that check or rewrite a node's file use it
+// (cmd/CELLS-handover).
+func LoadConfigFile(path string) (*Config, error) {
+	cfg := &Config{}
+	if err := loadConfigFile(path, cfg); err != nil {
+		return nil, fmt.Errorf("failed to load config file %s: %w", path, err)
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		cfg.ConfigFileUsed = abs
+	} else {
+		cfg.ConfigFileUsed = filepath.Clean(path)
+	}
+	applyDefaults(cfg)
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	return cfg, nil
+}
+
+// loadConfigFile loads configuration from TOML or YAML file
+func loadConfigFile(path string, cfg *Config) error {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch ext {
+	case ".toml":
+		var tomlCfg ConfigTOML
+		if _, err := toml.DecodeFile(path, &tomlCfg); err != nil {
+			return fmt.Errorf("failed to decode TOML: %w", err)
+		}
+		// Map TOML structure to Config
+		if r, err := ParseNodeRole(tomlCfg.Node.Role); err == nil {
+			cfg.NodeRole = r
+		} else {
+			return fmt.Errorf("invalid [node] role: %w", err)
+		}
+		cfg.MiningEnabled = tomlCfg.Node.MiningEnabled
+		cfg.RequireMiningOperatorSignatures = tomlCfg.Node.RequireMiningOperatorSignatures
+		cfg.MiningOperatorPublicKeyRetentionHeight = tomlCfg.Node.MiningOperatorPublicKeyRetentionHeight
+		cfg.NetworkPort = tomlCfg.Network.Port
+		cfg.NetworkBindAddress = strings.TrimSpace(tomlCfg.Network.BindAddress)
+		cfg.BootstrapPeers = tomlCfg.Network.BootstrapPeers
+		cfg.SubmeshConfigPath = strings.TrimSpace(tomlCfg.Network.SubmeshConfig)
+		cfg.NetworkHostKeyPath = strings.TrimSpace(tomlCfg.Network.HostKeyPath)
+		if lim, err := tomlCfg.Network.P2PLimitsTOML.toConfig(); err != nil {
+			return err
+		} else {
+			cfg.P2PLimits = lim
+		}
+		if br, err := tomlCfg.Network.BridgeRelayTOML.toConfig(); err != nil {
+			return err
+		} else {
+			cfg.BridgeRelay = br
+		}
+		cfg.PrivateP2P = tomlCfg.Network.PrivateP2PTOML.toConfig()
+		cfg.SnapshotBootstrap = tomlCfg.SnapshotBootstrap.toConfig()
+		cfg.StorageType = tomlCfg.Storage.Type
+		cfg.SQLitePath = tomlCfg.Storage.SQLitePath
+		cfg.ScyllaHosts = tomlCfg.Storage.ScyllaHosts
+		cfg.ScyllaKeyspace = tomlCfg.Storage.ScyllaKeyspace
+		cfg.DashboardPort = tomlCfg.Monitoring.DashboardPort
+		cfg.DashboardBindAddress = strings.TrimSpace(tomlCfg.Monitoring.DashboardBindAddress)
+		cfg.LogViewerPort = tomlCfg.Monitoring.LogViewerPort
+		cfg.LogFile = tomlCfg.Monitoring.LogFile
+		cfg.LogLevel = tomlCfg.Monitoring.LogLevel
+		cfg.DashboardMetricsScrapeSecret = tomlCfg.Monitoring.MetricsScrapeSecret
+		cfg.DashboardStrictAuth = tomlCfg.Monitoring.StrictDashboardAuth
+		cfg.NGCProofPersistPath = strings.TrimSpace(tomlCfg.Monitoring.NGCProofPersistPath)
+		cfg.APIPort = tomlCfg.API.Port
+		cfg.APIBindAddress = strings.TrimSpace(tomlCfg.API.BindAddress)
+		cfg.EnableTLS = tomlCfg.API.EnableTLS
+		cfg.TLSCertFile = tomlCfg.API.TLSCertFile
+		cfg.TLSKeyFile = tomlCfg.API.TLSKeyFile
+		cfg.NvidiaLockEnabled = tomlCfg.API.NvidiaLock
+		if tomlCfg.API.NvidiaLockMaxProofAge != "" {
+			if d, err := time.ParseDuration(tomlCfg.API.NvidiaLockMaxProofAge); err == nil {
+				cfg.NvidiaLockMaxProofAge = d
+			}
+		}
+		cfg.NvidiaLockExpectedNodeID = tomlCfg.API.NvidiaLockExpectedNodeID
+		cfg.NvidiaLockProofHMACSecret = tomlCfg.API.NvidiaLockProofHMACSecret
+		cfg.NvidiaLockRequireIngestNonce = tomlCfg.API.NvidiaLockRequireIngestNonce
+		cfg.NvidiaLockGateP2P = tomlCfg.API.NvidiaLockGateP2P
+		if tomlCfg.API.NvidiaLockIngestNonceTTL != "" {
+			if d, err := time.ParseDuration(tomlCfg.API.NvidiaLockIngestNonceTTL); err == nil {
+				cfg.NvidiaLockIngestNonceTTL = d
+			}
+		}
+		cfg.JWTHMACSecret = tomlCfg.API.JWTHMACSecret
+		cfg.StrictProductionSecrets = tomlCfg.API.StrictProductionSecrets
+		if tomlCfg.API.RateLimitMaxRequests > 0 {
+			cfg.APIRateLimitMaxRequests = tomlCfg.API.RateLimitMaxRequests
+		}
+		if tomlCfg.API.RateLimitWindow != "" {
+			if d, err := time.ParseDuration(tomlCfg.API.RateLimitWindow); err == nil {
+				cfg.APIRateLimitWindow = d
+			}
+		}
+		cfg.InitialBalance = tomlCfg.Wallet.InitialBalance
+		cfg.ProposalFile = tomlCfg.Governance.ProposalFile
+		cfg.GovernanceAuthorities = tomlCfg.Governance.Authorities
+		cfg.AuthorizedBlockProducers = tomlCfg.Consensus.AuthorizedBlockProducers
+		cfg.ProducerTransition = tomlCfg.Consensus.ProducerTransition
+		cfg.RequireSignedVotes = tomlCfg.Consensus.RequireSignedVotes
+		cfg.SignedConsensusActivationHeight = tomlCfg.Consensus.SignedMessageActivationHeight
+		cfg.TaskActionSignatureActivationHeight = tomlCfg.Consensus.TaskActionSignatureActivationHeight
+		cfg.TxContentRootActivationHeight = tomlCfg.Consensus.TxContentRootActivationHeight
+		cfg.EnrollmentStateRootActivationHeight = tomlCfg.Consensus.EnrollmentStateRootActivationHeight
+		cfg.PoEActivationHeight = tomlCfg.Consensus.PoEActivationHeight
+		cfg.StreamEd25519RetirementHeight = tomlCfg.Consensus.StreamEd25519RetirementHeight
+		cfg.CELLS20ActivationHeight = tomlCfg.Consensus.CELLS20ActivationHeight
+		cfg.ConsensusSignerKeyPath = strings.TrimSpace(tomlCfg.Consensus.SignerKeyPath)
+		cfg.ForkDustHeight = tomlCfg.Consensus.ForkDustHeight
+		if tomlCfg.Performance.TransactionInterval != "" {
+			if d, err := time.ParseDuration(tomlCfg.Performance.TransactionInterval); err == nil {
+				cfg.TransactionInterval = d
+			}
+		}
+		if tomlCfg.Performance.HealthCheckInterval != "" {
+			if d, err := time.ParseDuration(tomlCfg.Performance.HealthCheckInterval); err == nil {
+				cfg.HealthCheckInterval = d
+			}
+		}
+		cfg.DemoTransactionsEnabled = tomlCfg.Performance.DemoTransactions
+		cfg.TrustEndpointsDisabled = tomlCfg.Trust.Disabled
+		if tomlCfg.Trust.FreshWithin != "" {
+			if d, err := time.ParseDuration(tomlCfg.Trust.FreshWithin); err == nil {
+				cfg.TrustFreshWithin = d
+			}
+		}
+		if tomlCfg.Trust.RefreshInterval != "" {
+			if d, err := time.ParseDuration(tomlCfg.Trust.RefreshInterval); err == nil {
+				cfg.TrustRefreshInterval = d
+			}
+		}
+		cfg.TrustRegionHint = strings.TrimSpace(tomlCfg.Trust.RegionHint)
+	case ".yaml", ".yml":
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("failed to read YAML file: %w", err)
+		}
+		var yamlCfg ConfigTOML
+		if err := yaml.Unmarshal(data, &yamlCfg); err != nil {
+			return fmt.Errorf("failed to decode YAML: %w", err)
+		}
+		// Map YAML structure to Config (same as TOML)
+		if r, err := ParseNodeRole(yamlCfg.Node.Role); err == nil {
+			cfg.NodeRole = r
+		} else {
+			return fmt.Errorf("invalid node.role: %w", err)
+		}
+		cfg.MiningEnabled = yamlCfg.Node.MiningEnabled
+		cfg.RequireMiningOperatorSignatures = yamlCfg.Node.RequireMiningOperatorSignatures
+		cfg.MiningOperatorPublicKeyRetentionHeight = yamlCfg.Node.MiningOperatorPublicKeyRetentionHeight
+		cfg.NetworkPort = yamlCfg.Network.Port
+		cfg.NetworkBindAddress = strings.TrimSpace(yamlCfg.Network.BindAddress)
+		cfg.BootstrapPeers = yamlCfg.Network.BootstrapPeers
+		cfg.SubmeshConfigPath = strings.TrimSpace(yamlCfg.Network.SubmeshConfig)
+		cfg.NetworkHostKeyPath = strings.TrimSpace(yamlCfg.Network.HostKeyPath)
+		if lim, err := yamlCfg.Network.P2PLimitsTOML.toConfig(); err != nil {
+			return err
+		} else {
+			cfg.P2PLimits = lim
+		}
+		if br, err := yamlCfg.Network.BridgeRelayTOML.toConfig(); err != nil {
+			return err
+		} else {
+			cfg.BridgeRelay = br
+		}
+		cfg.PrivateP2P = yamlCfg.Network.PrivateP2PTOML.toConfig()
+		cfg.SnapshotBootstrap = yamlCfg.SnapshotBootstrap.toConfig()
+		cfg.StorageType = yamlCfg.Storage.Type
+		cfg.SQLitePath = yamlCfg.Storage.SQLitePath
+		cfg.ScyllaHosts = yamlCfg.Storage.ScyllaHosts
+		cfg.ScyllaKeyspace = yamlCfg.Storage.ScyllaKeyspace
+		cfg.ScyllaUsername = yamlCfg.Storage.ScyllaUsername
+		cfg.ScyllaPassword = yamlCfg.Storage.ScyllaPassword
+		cfg.ScyllaTLSCaPath = yamlCfg.Storage.ScyllaTLSCaPath
+		cfg.ScyllaTLSCertPath = yamlCfg.Storage.ScyllaTLSCertPath
+		cfg.ScyllaTLSKeyPath = yamlCfg.Storage.ScyllaTLSKeyPath
+		cfg.ScyllaTLSInsecureSkipVerify = yamlCfg.Storage.ScyllaTLSInsecureSkipVerify
+		cfg.DashboardPort = yamlCfg.Monitoring.DashboardPort
+		cfg.DashboardBindAddress = strings.TrimSpace(yamlCfg.Monitoring.DashboardBindAddress)
+		cfg.LogViewerPort = yamlCfg.Monitoring.LogViewerPort
+		cfg.LogFile = yamlCfg.Monitoring.LogFile
+		cfg.LogLevel = yamlCfg.Monitoring.LogLevel
+		cfg.DashboardMetricsScrapeSecret = yamlCfg.Monitoring.MetricsScrapeSecret
+		cfg.DashboardStrictAuth = yamlCfg.Monitoring.StrictDashboardAuth
+		cfg.NGCProofPersistPath = strings.TrimSpace(yamlCfg.Monitoring.NGCProofPersistPath)
+		cfg.APIPort = yamlCfg.API.Port
+		cfg.APIBindAddress = strings.TrimSpace(yamlCfg.API.BindAddress)
+		cfg.EnableTLS = yamlCfg.API.EnableTLS
+		cfg.TLSCertFile = yamlCfg.API.TLSCertFile
+		cfg.TLSKeyFile = yamlCfg.API.TLSKeyFile
+		cfg.NvidiaLockEnabled = yamlCfg.API.NvidiaLock
+		if yamlCfg.API.NvidiaLockMaxProofAge != "" {
+			if d, err := time.ParseDuration(yamlCfg.API.NvidiaLockMaxProofAge); err == nil {
+				cfg.NvidiaLockMaxProofAge = d
+			}
+		}
+		cfg.NvidiaLockExpectedNodeID = yamlCfg.API.NvidiaLockExpectedNodeID
+		cfg.NvidiaLockProofHMACSecret = yamlCfg.API.NvidiaLockProofHMACSecret
+		cfg.NvidiaLockRequireIngestNonce = yamlCfg.API.NvidiaLockRequireIngestNonce
+		cfg.NvidiaLockGateP2P = yamlCfg.API.NvidiaLockGateP2P
+		if yamlCfg.API.NvidiaLockIngestNonceTTL != "" {
+			if d, err := time.ParseDuration(yamlCfg.API.NvidiaLockIngestNonceTTL); err == nil {
+				cfg.NvidiaLockIngestNonceTTL = d
+			}
+		}
+		cfg.JWTHMACSecret = yamlCfg.API.JWTHMACSecret
+		cfg.StrictProductionSecrets = yamlCfg.API.StrictProductionSecrets
+		if yamlCfg.API.RateLimitMaxRequests > 0 {
+			cfg.APIRateLimitMaxRequests = yamlCfg.API.RateLimitMaxRequests
+		}
+		if yamlCfg.API.RateLimitWindow != "" {
+			if d, err := time.ParseDuration(yamlCfg.API.RateLimitWindow); err == nil {
+				cfg.APIRateLimitWindow = d
+			}
+		}
+		cfg.InitialBalance = yamlCfg.Wallet.InitialBalance
+		cfg.ProposalFile = yamlCfg.Governance.ProposalFile
+		cfg.GovernanceAuthorities = yamlCfg.Governance.Authorities
+		cfg.AuthorizedBlockProducers = yamlCfg.Consensus.AuthorizedBlockProducers
+		cfg.ProducerTransition = yamlCfg.Consensus.ProducerTransition
+		cfg.RequireSignedVotes = yamlCfg.Consensus.RequireSignedVotes
+		cfg.SignedConsensusActivationHeight = yamlCfg.Consensus.SignedMessageActivationHeight
+		cfg.TaskActionSignatureActivationHeight = yamlCfg.Consensus.TaskActionSignatureActivationHeight
+		cfg.TxContentRootActivationHeight = yamlCfg.Consensus.TxContentRootActivationHeight
+		cfg.EnrollmentStateRootActivationHeight = yamlCfg.Consensus.EnrollmentStateRootActivationHeight
+		cfg.PoEActivationHeight = yamlCfg.Consensus.PoEActivationHeight
+		cfg.StreamEd25519RetirementHeight = yamlCfg.Consensus.StreamEd25519RetirementHeight
+		cfg.CELLS20ActivationHeight = yamlCfg.Consensus.CELLS20ActivationHeight
+		cfg.ConsensusSignerKeyPath = strings.TrimSpace(yamlCfg.Consensus.SignerKeyPath)
+		cfg.ForkDustHeight = yamlCfg.Consensus.ForkDustHeight
+		if yamlCfg.Performance.TransactionInterval != "" {
+			if d, err := time.ParseDuration(yamlCfg.Performance.TransactionInterval); err == nil {
+				cfg.TransactionInterval = d
+			}
+		}
+		cfg.DemoTransactionsEnabled = yamlCfg.Performance.DemoTransactions
+		cfg.TrustEndpointsDisabled = yamlCfg.Trust.Disabled
+		if yamlCfg.Trust.FreshWithin != "" {
+			if d, err := time.ParseDuration(yamlCfg.Trust.FreshWithin); err == nil {
+				cfg.TrustFreshWithin = d
+			}
+		}
+		if yamlCfg.Trust.RefreshInterval != "" {
+			if d, err := time.ParseDuration(yamlCfg.Trust.RefreshInterval); err == nil {
+				cfg.TrustRefreshInterval = d
+			}
+		}
+		cfg.TrustRegionHint = strings.TrimSpace(yamlCfg.Trust.RegionHint)
+		if yamlCfg.Performance.HealthCheckInterval != "" {
+			if d, err := time.ParseDuration(yamlCfg.Performance.HealthCheckInterval); err == nil {
+				cfg.HealthCheckInterval = d
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported config file format: %s (supported: .toml, .yaml, .yml)", ext)
+	}
+
+	return nil
+}
+
+// applyDefaults sets default values for unset configuration fields
+func applyDefaults(cfg *Config) {
+	if cfg.NodeRole == "" {
+		cfg.NodeRole = NodeRoleValidator
+	}
+	if cfg.NetworkPort == 0 {
+		cfg.NetworkPort = 4001
+	}
+	if cfg.BootstrapPeers == nil {
+		cfg.BootstrapPeers = []string{}
+	}
+	if cfg.GovernanceAuthorities == nil {
+		cfg.GovernanceAuthorities = []string{}
+	}
+	if cfg.AuthorizedBlockProducers == nil {
+		cfg.AuthorizedBlockProducers = []string{}
+	}
+	if cfg.StorageType == "" {
+		cfg.StorageType = "sqlite"
+	}
+	if cfg.SQLitePath == "" {
+		// Default filename: prefer CELLS.db for new deployments, but if a pre-rebrand
+		// CELLSplus.db exists in the CWD and no CELLS.db exists yet, continue to use it
+		// so existing operators aren't silently switched to a fresh empty database.
+		if _, err := os.Stat("CELLS.db"); err == nil {
+			cfg.SQLitePath = "CELLS.db"
+		} else if _, err := os.Stat("CELLSplus.db"); err == nil {
+			cfg.SQLitePath = "CELLSplus.db"
+		} else {
+			cfg.SQLitePath = "CELLS.db"
+		}
+	}
+	if cfg.ScyllaHosts == nil {
+		cfg.ScyllaHosts = []string{"127.0.0.1"}
+	}
+	if cfg.ScyllaKeyspace == "" {
+		cfg.ScyllaKeyspace = "CELLS"
+	}
+	if cfg.DashboardPort == 0 {
+		cfg.DashboardPort = 8081
+	}
+	if cfg.LogViewerPort == 0 {
+		// Default below APIPort so both can run without binding the same port (Dockerfile EXPOSE 9000).
+		cfg.LogViewerPort = 9000
+	}
+	if cfg.LogFile == "" {
+		// As with SQLitePath, default to CELLS.log but keep appending to a pre-existing
+		// CELLSplus.log if that's where operators have historical events already.
+		if _, err := os.Stat("CELLS.log"); err == nil {
+			cfg.LogFile = "CELLS.log"
+		} else if _, err := os.Stat("CELLSplus.log"); err == nil {
+			cfg.LogFile = "CELLSplus.log"
+		} else {
+			cfg.LogFile = "CELLS.log"
+		}
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "INFO"
+	}
+	if cfg.APIPort == 0 {
+		cfg.APIPort = 8080 // Default API HTTP port for development
+	}
+	if cfg.TLSCertFile == "" {
+		cfg.TLSCertFile = ""
+	}
+	if cfg.TLSKeyFile == "" {
+		cfg.TLSKeyFile = ""
+	}
+	// TLS defaults to false (HTTP) for easier development
+	// Set enable_tls: true in config or ENABLE_TLS=true env var to enable HTTPS
+	if cfg.EnableTLS {
+		// Keep TLS enabled if explicitly set
+	} else {
+		cfg.EnableTLS = false // Default to HTTP
+	}
+	if cfg.InitialBalance == 0 {
+		cfg.InitialBalance = 1000.0
+	}
+	if cfg.ProposalFile == "" {
+		cfg.ProposalFile = "proposals.json"
+	}
+	if cfg.TransactionInterval == 0 {
+		cfg.TransactionInterval = 30 * time.Second
+	}
+	if cfg.HealthCheckInterval == 0 {
+		cfg.HealthCheckInterval = 30 * time.Second
+	}
+	if cfg.NvidiaLockMaxProofAge == 0 {
+		cfg.NvidiaLockMaxProofAge = 15 * time.Minute
+	}
+	if cfg.NvidiaLockRequireIngestNonce && cfg.NvidiaLockIngestNonceTTL == 0 {
+		cfg.NvidiaLockIngestNonceTTL = 10 * time.Minute
+	}
+	if cfg.APIRateLimitMaxRequests <= 0 {
+		cfg.APIRateLimitMaxRequests = 100
+	}
+	if cfg.APIRateLimitWindow <= 0 {
+		cfg.APIRateLimitWindow = time.Minute
+	}
+	if cfg.TrustFreshWithin <= 0 {
+		cfg.TrustFreshWithin = 15 * time.Minute
+	}
+	if cfg.TrustRefreshInterval <= 0 {
+		cfg.TrustRefreshInterval = 10 * time.Second
+	}
+}
+
+// applyEnvOverrides applies environment variable overrides (highest priority)
+func applyEnvOverrides(cfg *Config) {
+	if val := strings.TrimSpace(envPreferred("CELLS_NODE_ROLE", "CELLS_NODE_ROLE")); val != "" {
+		if r, err := ParseNodeRole(val); err == nil {
+			cfg.NodeRole = r
+		}
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_MINING_ENABLED", "CELLS_MINING_ENABLED")); val != "" {
+		cfg.MiningEnabled = envcompat.Truthy("CELLS_MINING_ENABLED", "CELLS_MINING_ENABLED")
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_REQUIRE_MINING_OPERATOR_SIGNATURES", "CELLS_REQUIRE_MINING_OPERATOR_SIGNATURES")); val != "" {
+		cfg.RequireMiningOperatorSignatures = envcompat.Truthy("CELLS_REQUIRE_MINING_OPERATOR_SIGNATURES", "CELLS_REQUIRE_MINING_OPERATOR_SIGNATURES")
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_MINING_OPERATOR_PUBLIC_KEY_RETENTION_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.MiningOperatorPublicKeyRetentionHeight = h
+		}
+	}
+	if val := getEnvString("NETWORK_PORT", ""); val != "" {
+		cfg.NetworkPort = getEnvInt("NETWORK_PORT", cfg.NetworkPort)
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_NETWORK_BIND_ADDRESS", "CELLS_NETWORK_BIND_ADDRESS")); val != "" {
+		cfg.NetworkBindAddress = val
+	}
+	if val := getEnvString("BOOTSTRAP_PEERS", ""); val != "" {
+		cfg.BootstrapPeers = getEnvStringSlice("BOOTSTRAP_PEERS", cfg.BootstrapPeers)
+	}
+	if val := getEnvString("CELLS_GOVERNANCE_AUTHORITIES", ""); val != "" {
+		cfg.GovernanceAuthorities = getEnvStringSlice("CELLS_GOVERNANCE_AUTHORITIES", cfg.GovernanceAuthorities)
+	}
+	if val := getEnvString("CELLS_AUTHORIZED_BLOCK_PRODUCERS", ""); val != "" {
+		cfg.AuthorizedBlockProducers = getEnvStringSlice("CELLS_AUTHORIZED_BLOCK_PRODUCERS", cfg.AuthorizedBlockProducers)
+	}
+	if v := getEnvString("CELLS_FORK_DUST_HEIGHT", ""); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.ForkDustHeight = h
+		}
+	}
+	if getEnvString("CELLS_REQUIRE_SIGNED_VOTES", "") != "" {
+		cfg.RequireSignedVotes = envcompat.Truthy("CELLS_REQUIRE_SIGNED_VOTES", "CELLS_REQUIRE_SIGNED_VOTES")
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_SIGNED_MESSAGE_ACTIVATION_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.SignedConsensusActivationHeight = h
+		}
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_TASK_ACTION_SIGNATURE_ACTIVATION_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.TaskActionSignatureActivationHeight = h
+		}
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_TX_CONTENT_ROOT_ACTIVATION_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.TxContentRootActivationHeight = h
+		}
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_ENROLLMENT_STATE_ROOT_ACTIVATION_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.EnrollmentStateRootActivationHeight = h
+		}
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_POE_ACTIVATION_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.PoEActivationHeight = h
+		}
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_STREAM_ED25519_RETIREMENT_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.StreamEd25519RetirementHeight = h
+		}
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_CELLS20_ACTIVATION_HEIGHT", "")); v != "" {
+		if h, err := strconv.ParseUint(v, 10, 64); err == nil {
+			cfg.CELLS20ActivationHeight = h
+		}
+	}
+	if v := strings.TrimSpace(getEnvString("CELLS_CONSENSUS_SIGNER_KEY_PATH", "")); v != "" {
+		cfg.ConsensusSignerKeyPath = v
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_NETWORK_HOST_KEY_PATH", "CELLS_NETWORK_HOST_KEY_PATH")); val != "" {
+		cfg.NetworkHostKeyPath = val
+	}
+	applyP2PLimitsEnv(&cfg.P2PLimits)
+	applyBridgeRelayEnv(&cfg.BridgeRelay)
+	applyPrivateP2PEnv(&cfg.PrivateP2P)
+	applySnapshotBootstrapEnv(&cfg.SnapshotBootstrap)
+	if val := strings.TrimSpace(envPreferred("CELLS_NGC_PROOF_PERSIST_PATH", "CELLS_NGC_PROOF_PERSIST_PATH")); val != "" {
+		cfg.NGCProofPersistPath = val
+	}
+	if val := getEnvString("STORAGE_TYPE", ""); val != "" {
+		cfg.StorageType = val
+	}
+	if val := getEnvString("SQLITE_PATH", ""); val != "" {
+		cfg.SQLitePath = val
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_USER_STORE_PATH", "CELLS_USER_STORE_PATH")); val != "" {
+		cfg.UserStorePath = val
+	}
+	if val := getEnvString("SCYLLA_HOSTS", ""); val != "" {
+		cfg.ScyllaHosts = getEnvStringSlice("SCYLLA_HOSTS", cfg.ScyllaHosts)
+	}
+	if val := getEnvString("SCYLLA_KEYSPACE", ""); val != "" {
+		cfg.ScyllaKeyspace = val
+	}
+	if val := getEnvString("SCYLLA_USERNAME", ""); val != "" {
+		cfg.ScyllaUsername = val
+	}
+	if val := getEnvString("SCYLLA_PASSWORD", ""); val != "" {
+		cfg.ScyllaPassword = val
+	}
+	if val := getEnvString("SCYLLA_TLS_CA_PATH", ""); val != "" {
+		cfg.ScyllaTLSCaPath = val
+	}
+	if val := getEnvString("SCYLLA_TLS_CERT_PATH", ""); val != "" {
+		cfg.ScyllaTLSCertPath = val
+	}
+	if val := getEnvString("SCYLLA_TLS_KEY_PATH", ""); val != "" {
+		cfg.ScyllaTLSKeyPath = val
+	}
+	if val := getEnvString("SCYLLA_TLS_INSECURE_SKIP_VERIFY", ""); val != "" {
+		cfg.ScyllaTLSInsecureSkipVerify = val == "true" || val == "1" || strings.EqualFold(val, "yes")
+	}
+	if val := getEnvString("DASHBOARD_PORT", ""); val != "" {
+		cfg.DashboardPort = getEnvInt("DASHBOARD_PORT", cfg.DashboardPort)
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_DASHBOARD_BIND_ADDRESS", "CELLS_DASHBOARD_BIND_ADDRESS")); val != "" {
+		cfg.DashboardBindAddress = val
+	}
+	if val := getEnvString("LOG_VIEWER_PORT", ""); val != "" {
+		cfg.LogViewerPort = getEnvInt("LOG_VIEWER_PORT", cfg.LogViewerPort)
+	}
+	if val := getEnvString("LOG_FILE", ""); val != "" {
+		cfg.LogFile = val
+	}
+	if val := getEnvString("LOG_LEVEL", ""); val != "" {
+		cfg.LogLevel = val
+	}
+	if val := envPreferred("CELLS_DASHBOARD_METRICS_SCRAPE_SECRET", "CELLS_DASHBOARD_METRICS_SCRAPE_SECRET"); val != "" {
+		cfg.DashboardMetricsScrapeSecret = val
+	}
+	if val := envPreferred("CELLS_DASHBOARD_STRICT_AUTH", "CELLS_DASHBOARD_STRICT_AUTH"); val != "" {
+		cfg.DashboardStrictAuth = val == "true" || val == "1" || strings.EqualFold(val, "yes")
+	}
+	if val := envPreferred("CELLS_ADMIN_REQUIRE_ROLE", "CELLS_ADMIN_REQUIRE_ROLE"); val != "" {
+		cfg.AdminAPIRequireRole = val == "true" || val == "1" || strings.EqualFold(val, "yes")
+	}
+	if val := envPreferred("CELLS_ADMIN_REQUIRE_MTLS", "CELLS_ADMIN_REQUIRE_MTLS"); val != "" {
+		cfg.AdminAPIRequireMTLS = val == "true" || val == "1" || strings.EqualFold(val, "yes")
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_SUBMESH_CONFIG", "CELLS_SUBMESH_CONFIG")); val != "" {
+		cfg.SubmeshConfigPath = val
+	}
+	if val := getEnvString("API_PORT", ""); val != "" {
+		cfg.APIPort = getEnvInt("API_PORT", cfg.APIPort)
+	}
+	if val := strings.TrimSpace(envPreferred("CELLS_API_BIND_ADDRESS", "CELLS_API_BIND_ADDRESS")); val != "" {
+		cfg.APIBindAddress = val
+	}
+	if val := envPreferred("CELLS_API_RATE_LIMIT_MAX", "CELLS_API_RATE_LIMIT_MAX"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			cfg.APIRateLimitMaxRequests = n
+		}
+	} else if val := getEnvString("API_RATE_LIMIT_MAX", ""); val != "" {
+		cfg.APIRateLimitMaxRequests = getEnvInt("API_RATE_LIMIT_MAX", cfg.APIRateLimitMaxRequests)
+	}
+	if val := envPreferred("CELLS_API_RATE_LIMIT_WINDOW", "CELLS_API_RATE_LIMIT_WINDOW"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.APIRateLimitWindow = d
+		}
+	} else if val := getEnvString("API_RATE_LIMIT_WINDOW", ""); val != "" {
+		cfg.APIRateLimitWindow = getEnvDuration("API_RATE_LIMIT_WINDOW", cfg.APIRateLimitWindow)
+	}
+	if val := getEnvString("TLS_CERT_FILE", ""); val != "" {
+		cfg.TLSCertFile = val
+	}
+	if val := getEnvString("TLS_KEY_FILE", ""); val != "" {
+		cfg.TLSKeyFile = val
+	}
+	if val := getEnvString("ENABLE_TLS", ""); val != "" {
+		cfg.EnableTLS = val == "true"
+	}
+	if val := getEnvString("ACME_DOMAINS", ""); val != "" {
+		parts := strings.Split(val, ",")
+		for _, p := range parts {
+			if d := strings.TrimSpace(p); d != "" {
+				cfg.ACMEDomains = append(cfg.ACMEDomains, d)
+			}
+		}
+	}
+	if val := getEnvString("ACME_EMAIL", ""); val != "" {
+		cfg.ACMEEmail = val
+	}
+	if val := getEnvString("ACME_CACHE_DIR", ""); val != "" {
+		cfg.ACMECacheDir = val
+	}
+	if val := getEnvString("MTLS_CA_CERT", ""); val != "" {
+		cfg.MTLSCACertFile = val
+	}
+	if val := getEnvString("MTLS_NODE_CERT", ""); val != "" {
+		cfg.MTLSNodeCertFile = val
+	}
+	if val := getEnvString("MTLS_NODE_KEY", ""); val != "" {
+		cfg.MTLSNodeKeyFile = val
+	}
+	if val := getEnvString("MTLS_AUTO_GENERATE", ""); val == "true" {
+		cfg.MTLSAutoGenerate = true
+	}
+	if val := getEnvString("INITIAL_BALANCE", ""); val != "" {
+		cfg.InitialBalance = getEnvFloat("INITIAL_BALANCE", cfg.InitialBalance)
+	}
+	if val := getEnvString("PROPOSAL_FILE", ""); val != "" {
+		cfg.ProposalFile = val
+	}
+	if val := getEnvString("TRANSACTION_INTERVAL", ""); val != "" {
+		cfg.TransactionInterval = getEnvDuration("TRANSACTION_INTERVAL", cfg.TransactionInterval)
+	}
+	if val := strings.TrimSpace(getEnvString("CELLS_DEMO_TRANSACTIONS", "")); val != "" {
+		cfg.DemoTransactionsEnabled = val == "true" || val == "1" || strings.EqualFold(val, "yes")
+	}
+	if val := getEnvString("HEALTH_CHECK_INTERVAL", ""); val != "" {
+		cfg.HealthCheckInterval = getEnvDuration("HEALTH_CHECK_INTERVAL", cfg.HealthCheckInterval)
+	}
+	if val := envPreferred("CELLS_NGC_INGEST_SECRET", "CELLS_NGC_INGEST_SECRET"); val != "" {
+		cfg.NGCIngestSecret = val
+	}
+	if val := envPreferred("CELLS_NVIDIA_LOCK", "CELLS_NVIDIA_LOCK"); val != "" {
+		cfg.NvidiaLockEnabled = val == "true" || val == "1"
+	}
+	if val := envPreferred("CELLS_NVIDIA_LOCK_MAX_PROOF_AGE", "CELLS_NVIDIA_LOCK_MAX_PROOF_AGE"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.NvidiaLockMaxProofAge = d
+		}
+	}
+	if val := envPreferred("CELLS_NVIDIA_LOCK_EXPECTED_NODE_ID", "CELLS_NVIDIA_LOCK_EXPECTED_NODE_ID"); val != "" {
+		cfg.NvidiaLockExpectedNodeID = val
+	}
+	if val := envPreferred("CELLS_NVIDIA_LOCK_PROOF_HMAC_SECRET", "CELLS_NVIDIA_LOCK_PROOF_HMAC_SECRET"); val != "" {
+		cfg.NvidiaLockProofHMACSecret = val
+	}
+	if val := envPreferred("CELLS_JWT_HMAC_SECRET", "CELLS_JWT_HMAC_SECRET"); val != "" {
+		cfg.JWTHMACSecret = val
+	}
+	// Optional VERIFY-ONLY secondary key for the rotation window.
+	// Env var only — there is intentionally no TOML/YAML field for the
+	// secondary because the rotation window is operational (deploy +
+	// restart driven), not part of the long-lived service config.
+	if val := envPreferred("CELLS_JWT_HMAC_SECRET_SECONDARY", "CELLS_JWT_HMAC_SECRET_SECONDARY"); val != "" {
+		cfg.JWTHMACSecretSecondary = val
+	}
+	if val := envPreferred("CELLS_NVIDIA_LOCK_REQUIRE_INGEST_NONCE", "CELLS_NVIDIA_LOCK_REQUIRE_INGEST_NONCE"); val != "" {
+		cfg.NvidiaLockRequireIngestNonce = val == "true" || val == "1"
+	}
+	if val := envPreferred("CELLS_NVIDIA_LOCK_INGEST_NONCE_TTL", "CELLS_NVIDIA_LOCK_INGEST_NONCE_TTL"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.NvidiaLockIngestNonceTTL = d
+		}
+	}
+	if val := envPreferred("CELLS_NVIDIA_LOCK_GATE_P2P", "CELLS_NVIDIA_LOCK_GATE_P2P"); val != "" {
+		cfg.NvidiaLockGateP2P = val == "true" || val == "1"
+	}
+	if val := envPreferred("CELLS_STRICT_SECRETS", "CELLS_STRICT_SECRETS"); val != "" {
+		cfg.StrictProductionSecrets = val == "true" || val == "1" || strings.EqualFold(val, "yes")
+	}
+	if val := getEnvString("CELLS_ALERT_WEBHOOK", ""); val != "" {
+		cfg.AlertWebhookURL = val
+	}
+
+	if val := envPreferred("CELLS_TRUST_DISABLED", "CELLS_TRUST_DISABLED"); val != "" {
+		cfg.TrustEndpointsDisabled = val == "true" || val == "1" || strings.EqualFold(val, "yes")
+	}
+	if val := envPreferred("CELLS_TRUST_FRESH_WITHIN", "CELLS_TRUST_FRESH_WITHIN"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.TrustFreshWithin = d
+		}
+	}
+	if val := envPreferred("CELLS_TRUST_REFRESH_INTERVAL", "CELLS_TRUST_REFRESH_INTERVAL"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.TrustRefreshInterval = d
+		}
+	}
+	if val := envPreferred("CELLS_TRUST_REGION", "CELLS_TRUST_REGION"); val != "" {
+		cfg.TrustRegionHint = strings.TrimSpace(val)
+	}
+}
+
+// ResolvedSubmeshConfigPath returns the filesystem path to the optional submesh profile (relative paths are resolved against the main config file directory when known).
+func (c *Config) ResolvedSubmeshConfigPath() string {
+	p := strings.TrimSpace(c.SubmeshConfigPath)
+	if p == "" {
+		return ""
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	if c.ConfigFileUsed != "" {
+		return filepath.Join(filepath.Dir(c.ConfigFileUsed), p)
+	}
+	return filepath.Clean(p)
+}
+
+// Validate validates the configuration
+func (c *Config) Validate() error {
+	if err := c.ProducerTransition.Validate(); err != nil {
+		return err
+	}
+	if c.NodeRole == "" {
+		c.NodeRole = NodeRoleValidator
+	}
+	if !c.NodeRole.IsValid() {
+		return fmt.Errorf("invalid node.role: %q (valid: %q, %q; env CELLS_NODE_ROLE)", c.NodeRole, NodeRoleValidator, NodeRoleMiner)
+	}
+	if c.NodeRole.IsValidator() && c.MiningEnabled {
+		return fmt.Errorf("node.role=%q but mining_enabled=true: validators must not mine. Set node.role=%q (env CELLS_NODE_ROLE=miner) to run as a miner, or clear mining_enabled", c.NodeRole, NodeRoleMiner)
+	}
+	if c.NodeRole.IsMiner() && !c.MiningEnabled {
+		return fmt.Errorf("node.role=%q but mining_enabled=false: miner role requires mining_enabled=true (env CELLS_MINING_ENABLED=true)", c.NodeRole)
+	}
+	if c.ForkDustHeight != 0 {
+		return fmt.Errorf(
+			"consensus fork_dust_height=%d is not activation-ready: leave it at 0 until the synthetic funder is replaced by a persisted capped-issuance ledger and validators approve one reconciled migration manifest",
+			c.ForkDustHeight,
+		)
+	}
+	if c.RequireSignedVotes && c.SignedConsensusActivationHeight == 0 {
+		return fmt.Errorf("consensus require_signed_votes=true requires a non-zero signed_message_activation_height shared by every validator")
+	}
+	if !c.RequireSignedVotes && c.SignedConsensusActivationHeight != 0 {
+		return fmt.Errorf("consensus signed_message_activation_height=%d is set while require_signed_votes=false; either enable coordinated enforcement or clear the height", c.SignedConsensusActivationHeight)
+	}
+	if c.RequireMiningOperatorSignatures && c.MiningOperatorPublicKeyRetentionHeight == 0 {
+		return fmt.Errorf("node require_mining_operator_signatures=true requires non-zero mining_operator_public_key_retention_height shared by every validator")
+	}
+
+	if c.NetworkPort < 1 || c.NetworkPort > 65535 {
+		return fmt.Errorf("invalid network port: %d", c.NetworkPort)
+	}
+	if err := c.P2PLimits.Validate(); err != nil {
+		return err
+	}
+	if err := c.BridgeRelay.Validate(c.ConsensusSignerKeyPath); err != nil {
+		return err
+	}
+	if err := c.PrivateP2P.Validate(c.NetworkBindAddress, c.BootstrapPeers); err != nil {
+		return err
+	}
+	if err := c.SnapshotBootstrap.Validate(); err != nil {
+		return err
+	}
+
+	if c.DashboardPort < 1 || c.DashboardPort > 65535 {
+		return fmt.Errorf("invalid dashboard port: %d", c.DashboardPort)
+	}
+
+	if c.LogViewerPort < 1 || c.LogViewerPort > 65535 {
+		return fmt.Errorf("invalid log viewer port: %d", c.LogViewerPort)
+	}
+
+	if c.APIPort < 1 || c.APIPort > 65535 {
+		return fmt.Errorf("invalid API port: %d", c.APIPort)
+	}
+
+	mr := c.APIRateLimitMaxRequests
+	if mr <= 0 {
+		mr = 100
+	}
+	rw := c.APIRateLimitWindow
+	if rw <= 0 {
+		rw = time.Minute
+	}
+	if mr < 1 || mr > 10_000_000 {
+		return fmt.Errorf("invalid API rate_limit_max_requests: %d (allowed 1..10000000)", c.APIRateLimitMaxRequests)
+	}
+	if rw < time.Second || rw > 24*time.Hour {
+		return fmt.Errorf("invalid API rate_limit_window: %v (allowed 1s..24h)", c.APIRateLimitWindow)
+	}
+
+	if c.StorageType != "sqlite" && c.StorageType != "scylla" && c.StorageType != "file" {
+		return fmt.Errorf("invalid storage type: %s (must be 'sqlite', 'scylla', or 'file')", c.StorageType)
+	}
+
+	if c.InitialBalance < 0 {
+		return fmt.Errorf("initial balance cannot be negative: %f", c.InitialBalance)
+	}
+
+	if rp := c.ResolvedSubmeshConfigPath(); rp != "" {
+		if _, err := os.Stat(rp); err != nil {
+			return fmt.Errorf("submesh_config: cannot access %q: %w", rp, err)
+		}
+	}
+
+	if c.NvidiaLockEnabled {
+		if c.NGCIngestSecret == "" {
+			return fmt.Errorf("nvidia_lock is enabled but NGC ingest secret is empty; set CELLS_NGC_INGEST_SECRET so the node can receive GPU proof bundles")
+		}
+		if c.NvidiaLockMaxProofAge <= 0 {
+			return fmt.Errorf("nvidia_lock_max_proof_age must be positive")
+		}
+	}
+	if strings.TrimSpace(c.NvidiaLockProofHMACSecret) != "" && !c.NvidiaLockEnabled {
+		return fmt.Errorf("nvidia_lock_proof_hmac_secret is set but nvidia_lock is disabled; enable nvidia_lock or clear the HMAC secret")
+	}
+	if c.NvidiaLockGateP2P && !c.NvidiaLockEnabled {
+		return fmt.Errorf("nvidia_lock_gate_p2p requires nvidia_lock enabled")
+	}
+	if c.NvidiaLockRequireIngestNonce {
+		if !c.NvidiaLockEnabled {
+			return fmt.Errorf("nvidia_lock_require_ingest_nonce requires nvidia_lock enabled")
+		}
+		if strings.TrimSpace(c.NvidiaLockProofHMACSecret) == "" {
+			return fmt.Errorf("nvidia_lock_require_ingest_nonce requires nvidia_lock_proof_hmac_secret (HMAC v2 binds the nonce into the bundle)")
+		}
+		if c.NvidiaLockIngestNonceTTL <= 0 {
+			return fmt.Errorf("nvidia_lock_ingest_nonce_ttl must be positive when ingest nonce is required")
+		}
+	}
+
+	if c.StrictProductionSecrets {
+		if err := validateProductionSecret("CELLS_NGC_INGEST_SECRET", c.NGCIngestSecret); err != nil {
+			return err
+		}
+		if err := validateProductionSecret("nvidia_lock_proof_hmac_secret", c.NvidiaLockProofHMACSecret); err != nil {
+			return err
+		}
+		if err := validateProductionSecret("CELLS_JWT_HMAC_SECRET", c.JWTHMACSecret); err != nil {
+			return err
+		}
+		if err := validateProductionSecret("CELLS_DASHBOARD_METRICS_SCRAPE_SECRET", c.DashboardMetricsScrapeSecret); err != nil {
+			return err
+		}
+		if c.NodeRole.IsValidator() && authorizedBlockProducerCount(c.AuthorizedBlockProducers) == 0 {
+			return fmt.Errorf("consensus authorized_block_producers must include at least one pinned producer when strict_secrets=true for a validator")
+		}
+	}
+
+	return nil
+}
+
+func authorizedBlockProducerCount(producers []string) int {
+	count := 0
+	for _, producer := range producers {
+		if strings.TrimSpace(producer) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func validateProductionSecret(label, value string) error {
+	s := strings.TrimSpace(value)
+	if s == "" {
+		return nil
+	}
+	if len(s) < 16 {
+		return fmt.Errorf("%s: when CELLS_STRICT_SECRETS is enabled, secrets must be at least 16 characters", label)
+	}
+	lower := strings.ToLower(s)
+	// Block obvious demo placeholder even if padded to pass length.
+	if strings.HasPrefix(lower, "charming123") {
+		return fmt.Errorf("%s: when CELLS_STRICT_SECRETS is enabled, secret appears weak or demo-like", label)
+	}
+	return nil
+}
+
+// UseScylla returns true if ScyllaDB should be used
+func (c *Config) UseScylla() bool {
+	return c.StorageType == "scylla" || os.Getenv("USE_SCYLLA") == "true"
+}
+
+// Helper functions
+
+func getEnvString(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatValue, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvStringSlice(key string, defaultValue []string) []string {
+	if value := os.Getenv(key); value != "" {
+		// Simple comma-separated parsing
+		parts := []string{}
+		for _, part := range splitString(value, ",") {
+			if trimmed := trimString(part); trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+		if len(parts) > 0 {
+			return parts
+		}
+	}
+	return defaultValue
+}
+
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return defaultValue
+}
+
+// Simple string helpers (avoid importing strings package for minimal dependencies)
+func splitString(s, sep string) []string {
+	parts := []string{}
+	current := ""
+	for _, char := range s {
+		if string(char) == sep {
+			if current != "" {
+				parts = append(parts, current)
+				current = ""
+			}
+		} else {
+			current += string(char)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return parts
+}
+
+func trimString(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
