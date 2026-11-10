@@ -67,14 +67,12 @@ Deferred mining bond functionality, where available.
 
 The mining system is designed around scheduled mining periods rather than an unrestricted continuous reward model.
 
-For detailed instructions, see the GPU Mining Guide.
-
 ## Technical Specifications
 Parameter	Specification
 Project Name	Quantum-Cells
 Native Currency	CELL
-Blockchain Type	Experimental cryptocurrency network
-Consensus Architecture	Proof-of-Entanglement
+Blockchain Type	Experimental Cryptocurrency Network
+Consensus Architecture	Proof-of-Entanglement (PoE)
 Mining Model	GPU Proof-of-Work
 Supported GPU Vendor	NVIDIA
 Digital Signatures	ML-DSA-87
@@ -85,12 +83,6 @@ Decimal Precision	8
 Initial Block Reward	3.56490987 CELL
 Halving Interval	4 years
 Mining Software	Quantum-Cells Hive
-Network Status	Public Pilot / Pre-Mainnet
-Tokenomics
-
-Quantum-Cells follows a mining-based coin distribution model.
-
-The project is designed without traditional fundraising allocations.
 
 ## Supply Distribution
 Category	Allocation
